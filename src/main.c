@@ -9,6 +9,7 @@
 #include "trophies.h"
 #include "vs.h"
 #include "rlgl.h"
+#include "audio_worker.h"
 
 static Scene scene;
 static char **main_argv;
@@ -86,12 +87,9 @@ int vs_finish_mode(void) {
     // Vita: di serie 3 (rt + swap). Senza, lo schermo a volte leggeva la vista di gioco (rt) o il frame (swap) prima che la
     // GPU li finisse: lampo nero in basso (le ultime tessere, ancora pulite a nero). Provato da Federico 2026-10-25.
     // Costo misurato con Pasqualina dopo la raylib senza MSAA: rt ~0,5 ms, swap ~1,5 ms a frame.
-#ifdef __vita__
-    const int def = 2;  // 2026-11-01: il lampo era lo scambio prima della fine della GPU (provato da Federico: swap 0 lampi,
-                        // off 2-31); rt costava ~9 ms e non serviva. Tre viste a turno in game_draw: 17,5 ms invece di 19,5
-#else
+    // Vita: off, so the GPU works during the update of the next frame (benchmark: 49 fps, with swap 37 fps). Black
+    // flashes come back only above about 70 fps, and the game is capped at 60 fps. VS_FINISH=swap gives the old behavior.
     const int def = 0;
-#endif
     if (m < 0) { const char *e = getenv("VS_FINISH"); m = !e ? def : !strcmp(e, "rt") ? 1 : !strcmp(e, "swap") ? 2 : !strcmp(e, "off") ? 0 : !strcmp(e, "ab") ? 4 : 3; }
     if (m == 4) return ((int)(GetTime() / 10) & 1) ? 3 : 1;  // VS_FINISH=ab: rt e both a turno ogni 10 s (misura in una partita)
     return m;
@@ -182,7 +180,7 @@ int main(int argc, char **argv) {
         if (eq) *eq = 0, setenv(l, eq + 1, 1);
     }
     if (env) UnloadFileText(env);
-    if (!getenv("VS_MUTE")) InitAudioDevice();  // VS_MUTE: prove automatiche senza audio
+    if (!getenv("VS_MUTE")) InitAudioDevice(), aw_start();  // VS_MUTE: prove automatiche senza audio. aw_start: Vita audio threads
     if (!data_get("characters")) {
         // Senza dati non c'e' gioco: si spiega come prepararli invece di chiudere in silenzio.
         while (!WindowShouldClose()) {

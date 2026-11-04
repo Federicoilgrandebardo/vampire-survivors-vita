@@ -255,7 +255,7 @@ void camera_follow(const Sprite *target);
 void scene_update_list(float delta);  // UpdateList: preUpdate degli sprite (animazioni)
 void scene_render(Shader fill);
 extern int prof_children, prof_custom, prof_offscreen, prof_breaks, prof_tiles;
-extern float game_view_w, game_view_h;
+extern float render_zoom;  // 0 < render_zoom <= 1; set by the game before scene_render
 void scene_render_one(Sprite *s, Shader fill);
 extern int scene_fillActive;
 void physics_drawDebug(void);  // World.drawDebug: corpi attivi  // un solo sprite con la pipeline normale

@@ -13,6 +13,7 @@
 
 #include "phaser.h"
 #include "rlgl.h"
+#include "audio_worker.h"
 
 // Tutto cio' che la partita alloca passa da gmem e si libera a game_start (cache e risorse raylib escluse)
 #include "saveimport.h"
@@ -248,8 +249,10 @@ struct Enemy {  // 0x1166a
     Sprite *ringSprite;          // i boss del finale: l'anello dell'urlo (DeathScream)
 };
 
+typedef struct EnemyTpl EnemyTpl;  // the data of the type, read one time from enemies.json (see EnemyTpl_make)
 struct EnemyPool {  // 0xd1a1
     const char *enemyType;
+    EnemyTpl *tpl;
     Enemy **stored, **spawned;
     int n_stored, n_spawned, cap, enabled, upperLimit, isUncapped;
 };
@@ -809,7 +812,13 @@ static const struct { const char *key, *file; } SOUND_FILES[] = {
 };
 #define N_SOUND_FILES (int)(sizeof(SOUND_FILES) / sizeof(*SOUND_FILES))
 #define SOUND_ALIASES 8  // istanze contemporanee dello stesso effetto (WebAudio non ha limite: oltre si riusa la piu' vecchia)
-static struct { Sound base, alias[SOUND_ALIASES]; int loaded, next, instances; } SoundLib[N_SOUND_FILES > 0 ? N_SOUND_FILES : 1];
+// pending: the loader thread of the Vita loads it (audio_worker.c). play*: the first PlaySound, done when the load ends.
+static struct {
+    Sound base, alias[SOUND_ALIASES];
+    int loaded, next, instances, pending, playPending;
+    float playVolume, playPitch;
+    double playAt;
+} SoundLib[N_SOUND_FILES > 0 ? N_SOUND_FILES : 1];
 static struct { Music music; int idx, playing, loop; float volume, currentVolume, fadeFrom, fadeTo, fadeT, fadeDur; } BGM = { .idx = -1 };
 static float SoundsVolume = 1, MusicVolume = 1, SFXVolumeFactor = 1;  // PlayerOptions (default: audio attivo) e Core.SFXVolumeFactor
 
@@ -818,6 +827,46 @@ static int Sound_index(const char *key) {
     return -1;
 }
 static void Sound_instancesDown(void *ctx) { SoundLib[(intptr_t)ctx].instances--; }
+// Every music stream opens and closes here. On the Vita the music thread updates the open streams (audio_worker.c):
+// a stream must not be in the thread's list while it is replaced or unloaded.
+// Music_open does not track: the caller calls aw_music_track after Play and Seek, so the thread fills the buffers
+// from the correct position.
+static void Music_open(Music *dst, const char *path) {
+    aw_music_untrack(dst);
+    *dst = LoadMusicStream(path);
+}
+static void Music_close(Music *m) {
+    aw_music_untrack(m);
+    UnloadMusicStream(*m);
+}
+// Vita: the sound thread sets the volume, because SetMusicVolume waits for the mixer (fades: every frame)
+static void Music_volume(Music *m, float v) {
+    if (!aw_music_volume(m, v)) SetMusicVolume(*m, v);
+}
+static void Music_update(Music *m) {
+    if (!aw_threaded()) UpdateMusicStream(*m);  // Vita: the music thread does it
+}
+#define SOUND_LATE_S 0.25  // a sound that loads in the background plays only if its load ends within this time
+static void Sound_start(int i, float v, float pitch) {
+    Sound *s = &SoundLib[i].alias[SoundLib[i].next++ % SOUND_ALIASES];
+    if (aw_sfx_play(*s, v, pitch)) return;  // Vita: the sound thread does the raylib calls (audio_worker.c)
+    SetSoundVolume(*s, v);
+    SetSoundPitch(*s, pitch);
+    PlaySound(*s);
+}
+// Vita: the sounds that the loader thread finished. Called once per frame by Sound_Update.
+static void Sound_pollLoads(void) {
+    int i;
+    Sound s;
+    double ms;
+    while (aw_sound_poll(&i, &s, &ms)) {
+        SoundLib[i].base = s, SoundLib[i].loaded = 1, SoundLib[i].pending = 0;
+        for (int a = 0; a < SOUND_ALIASES && s.frameCount; a++) SoundLib[i].alias[a] = LoadSoundAlias(s);
+        if (SoundLib[i].playPending && s.frameCount && GetTime() - SoundLib[i].playAt < SOUND_LATE_S)
+            Sound_start(i, SoundLib[i].playVolume, SoundLib[i].playPitch);
+        SoundLib[i].playPending = 0;
+    }
+}
 // SoundManager.PlaySound(key, config, delay, maxInstances): volume <= 0 = config senza volume
 static void Sound_PlaySound(const char *key, float volume, float rate, float detune, float delay, int maxInstances) {
     if (SoundsVolume == 0 || !IsAudioDeviceReady()) return;
@@ -828,20 +877,24 @@ static void Sound_PlaySound(const char *key, float volume, float rate, float det
         time_addEvent(delay, 0, 0, Sound_instancesDown, (void *)(intptr_t)i);
         SoundLib[i].instances++;
     }
+    float v = volume > 0 ? volume * 0.5f : 0.1f;
+    v *= SoundsVolume * SFXVolumeFactor;
+    float pitch = (rate > 0 ? rate : 1) * powf(2, detune / 1200);  // WebAudio: playbackRate * 2^(detune/1200)
     if (!SoundLib[i].loaded) {
-        SoundLib[i].loaded = 1;
         char rel[128];
         snprintf(rel, sizeof(rel), "sfx/%s", SOUND_FILES[i].file);
+        // Vita: the loader thread loads it, and Sound_pollLoads plays it a few frames later
+        if (SoundLib[i].pending || aw_sound_request(i, vs_path(rel))) {
+            SoundLib[i].pending = 1, SoundLib[i].playPending = 1;
+            SoundLib[i].playVolume = v, SoundLib[i].playPitch = pitch, SoundLib[i].playAt = GetTime();
+            return;
+        }
+        SoundLib[i].loaded = 1;
         SoundLib[i].base = LoadSound(vs_path(rel));
         for (int a = 0; a < SOUND_ALIASES && SoundLib[i].base.frameCount; a++) SoundLib[i].alias[a] = LoadSoundAlias(SoundLib[i].base);
     }
     if (!SoundLib[i].base.frameCount) return;
-    float v = volume > 0 ? volume * 0.5f : 0.1f;
-    v *= SoundsVolume * SFXVolumeFactor;
-    Sound *s = &SoundLib[i].alias[SoundLib[i].next++ % SOUND_ALIASES];
-    SetSoundVolume(*s, v);
-    SetSoundPitch(*s, (rate > 0 ? rate : 1) * powf(2, detune / 1200));  // WebAudio: playbackRate * 2^(detune/1200)
-    PlaySound(*s);
+    Sound_start(i, v, pitch);
 }
 static void Sound_PlaySimple(const char *key, float volume) { Sound_PlaySound(key, volume, 1, 0, 0, 0); }
 // La PreloadScene carica tutto all'avvio; qui solo gli effetti frequenti, gli altri al primo uso (memoria della Vita)
@@ -852,7 +905,7 @@ static void Sound_Preload(void) {
     SoundsVolume = 0;  // carica senza suonare
     for (size_t k = 0; k < sizeof(keys) / sizeof(*keys); k++) {
         int i = Sound_index(keys[k]);
-        if (i < 0 || SoundLib[i].loaded) continue;
+        if (i < 0 || SoundLib[i].loaded || SoundLib[i].pending) continue;
         SoundLib[i].loaded = 1;
         char rel[128];
         snprintf(rel, sizeof(rel), "sfx/%s", SOUND_FILES[i].file);
@@ -867,15 +920,16 @@ static void Sound_PlaySeek(const char *key, float volume, float seek) {
     if (SoundsVolume == 0 || !IsAudioDeviceReady()) return;
     int i = Sound_index(key);
     if (i < 0) return;
-    if (SeekSfx.on) UnloadMusicStream(SeekSfx.m), SeekSfx.on = 0;
+    if (SeekSfx.on) Music_close(&SeekSfx.m), SeekSfx.on = 0;
     char rel[128];
     snprintf(rel, sizeof(rel), "sfx/%s", SOUND_FILES[i].file);
-    SeekSfx.m = LoadMusicStream(vs_path(rel));
+    Music_open(&SeekSfx.m, vs_path(rel));
     if (!SeekSfx.m.frameCount) return;
     SeekSfx.m.looping = 0;
-    SetMusicVolume(SeekSfx.m, (volume > 0 ? volume * 0.5f : 0.1f) * SoundsVolume * SFXVolumeFactor);
+    Music_volume(&SeekSfx.m, (volume > 0 ? volume * 0.5f : 0.1f) * SoundsVolume * SFXVolumeFactor);
     PlayMusicStream(SeekSfx.m);
-    SeekMusicStream(SeekSfx.m, seek);
+    aw_music_seek(&SeekSfx.m, seek);
+    aw_music_track(&SeekSfx.m);
     SeekSfx.on = 1, SeekSfx.idx = i;
 }
 // PlaySound(key, { loop: true }): un flusso a parte (il vento di Gallo Tower), fermato da StopSound o dalla partita nuova
@@ -884,23 +938,26 @@ static void Sound_PlayLoop(const char *key, float volume) {
     if (SoundsVolume == 0 || !IsAudioDeviceReady()) return;
     int i = Sound_index(key);
     if (i < 0) return;
-    if (LoopSfx.on) UnloadMusicStream(LoopSfx.m), LoopSfx.on = 0;
+    if (LoopSfx.on) Music_close(&LoopSfx.m), LoopSfx.on = 0;
     char rel[128];
     snprintf(rel, sizeof(rel), "sfx/%s", SOUND_FILES[i].file);
-    LoopSfx.m = LoadMusicStream(vs_path(rel));
+    Music_open(&LoopSfx.m, vs_path(rel));
     if (!LoopSfx.m.frameCount) return;
     LoopSfx.m.looping = 1;
-    SetMusicVolume(LoopSfx.m, fminf(1, volume * 0.5f * SoundsVolume * SFXVolumeFactor));
+    Music_volume(&LoopSfx.m, fminf(1, volume * 0.5f * SoundsVolume * SFXVolumeFactor));
     PlayMusicStream(LoopSfx.m);
+    aw_music_track(&LoopSfx.m);
     LoopSfx.on = 1, LoopSfx.idx = i;
 }
-static void Sound_LoopVolume(float v) { if (LoopSfx.on) SetMusicVolume(LoopSfx.m, v); }  // sound.volume = v (Sketamari)
+static void Sound_LoopVolume(float v) { if (LoopSfx.on) Music_volume(&LoopSfx.m, v); }  // sound.volume = v (Sketamari)
 static void Sound_StopSound(const char *key) {  // stopByKey
     int i = Sound_index(key);
-    if (i >= 0 && LoopSfx.on && LoopSfx.idx == i) UnloadMusicStream(LoopSfx.m), LoopSfx.on = 0;
+    if (i >= 0 && LoopSfx.on && LoopSfx.idx == i) Music_close(&LoopSfx.m), LoopSfx.on = 0;
+    if (i >= 0) SoundLib[i].playPending = 0;  // a sound still loading on the Vita does not start later
     if (i < 0 || !SoundLib[i].loaded) return;
-    for (int a = 0; a < SOUND_ALIASES; a++) StopSound(SoundLib[i].alias[a]);
-    if (SeekSfx.on && SeekSfx.idx == i) UnloadMusicStream(SeekSfx.m), SeekSfx.on = 0;
+    for (int a = 0; a < SOUND_ALIASES; a++)
+        if (!aw_sfx_stop(SoundLib[i].alias[a])) StopSound(SoundLib[i].alias[a]);
+    if (SeekSfx.on && SeekSfx.idx == i) Music_close(&SeekSfx.m), SeekSfx.on = 0;
 }
 // PlayMusic(key, { volume, loop }): musica in streaming; rate/detune delle mod di stage: Foresta senza
 static void Sound_PlayMusic(const char *key, float volume, int loop) {
@@ -908,10 +965,10 @@ static void Sound_PlayMusic(const char *key, float volume, int loop) {
     int i = Sound_index(key);
     if (i < 0) return;
     if (BGM.idx != i) {
-        if (BGM.idx >= 0) UnloadMusicStream(BGM.music);
+        if (BGM.idx >= 0) Music_close(&BGM.music);
         char rel[128];
         snprintf(rel, sizeof(rel), "sfx/%s", SOUND_FILES[i].file);
-        BGM.music = LoadMusicStream(vs_path(rel));
+        Music_open(&BGM.music, vs_path(rel));
         BGM.idx = i;
     }
     if (!BGM.music.frameCount) return;
@@ -920,11 +977,12 @@ static void Sound_PlayMusic(const char *key, float volume, int loop) {
     BGM.currentVolume = volume;
     BGM.volume = volume * MusicVolume;
     BGM.fadeDur = 0;
-    SetMusicVolume(BGM.music, BGM.volume);
+    Music_volume(&BGM.music, BGM.volume);
     PlayMusicStream(BGM.music);
+    aw_music_track(&BGM.music);
     BGM.playing = 1;
 }
-static void Sound_StopMusic(void) { if (BGM.playing) { StopMusicStream(BGM.music); BGM.playing = 0; } }
+static void Sound_StopMusic(void) { if (BGM.playing) { aw_music_stop(&BGM.music); BGM.playing = 0; } }
 static const char *po_str(const char *k);
 static void Sound_PlayMusic(const char *key, float volume, int loop);
 // Sound.SetupAndPlayBGM_Banger: la musica scelta (SelectedBGM) con le mod Hyper/Forsaken di music.json
@@ -943,25 +1001,26 @@ static void Sound_FadeMusic(float volume, float ms) {
     float target = volume * MusicVolume;
     if (MusicVolume == 0) target = 0, ms = 0;
     if (ms > 0) { BGM.fadeFrom = BGM.volume, BGM.fadeTo = target, BGM.fadeT = 0, BGM.fadeDur = ms; }
-    else { BGM.volume = target; BGM.fadeDur = 0; SetMusicVolume(BGM.music, BGM.volume); }
+    else { BGM.volume = target; BGM.fadeDur = 0; Music_volume(&BGM.music, BGM.volume); }
 }
 static void (*Sound_tickHook)(float delta);  // DirecterManager: timer e musiche delle fasi a tempo reale
 static void Sound_Update(float delta) {  // la musica va avanti anche con la scena in pausa (level-up, forziere)
+    Sound_pollLoads();
     if (Sound_tickHook) Sound_tickHook(delta);
     if (SeekSfx.on) {
-        UpdateMusicStream(SeekSfx.m);
-        if (!IsMusicStreamPlaying(SeekSfx.m)) UnloadMusicStream(SeekSfx.m), SeekSfx.on = 0;
+        Music_update(&SeekSfx.m);
+        if (!IsMusicStreamPlaying(SeekSfx.m)) Music_close(&SeekSfx.m), SeekSfx.on = 0;
     }
-    if (LoopSfx.on) UpdateMusicStream(LoopSfx.m);
+    if (LoopSfx.on) Music_update(&LoopSfx.m);
     if (!BGM.playing) return;
     if (BGM.fadeDur > 0) {
         BGM.fadeT += delta;
         float k = BGM.fadeT >= BGM.fadeDur ? 1 : BGM.fadeT / BGM.fadeDur;
         BGM.volume = BGM.fadeFrom + (BGM.fadeTo - BGM.fadeFrom) * k;
-        SetMusicVolume(BGM.music, BGM.volume);
+        Music_volume(&BGM.music, BGM.volume);
         if (k >= 1) BGM.fadeDur = 0;
     }
-    UpdateMusicStream(BGM.music);
+    Music_update(&BGM.music);
 }
 
 // ============================================================================
@@ -4038,8 +4097,15 @@ static void base_EnemyOnRecycle(Enemy *e) {
     e->isDespawning = 0;
 }
 
+// Enemies come from one block made at the start of a run, so a wave does not allocate and clear about 600 KB in one
+// frame (286 enemies at minute 23). The block is part of the run memory (gmem): game_start frees it. No code frees one
+// enemy. After the block, each enemy has its own calloc, as before.
+#define ENEMY_SLAB 400
+static Enemy *EnemySlab;
+static int EnemySlab_used;
+static void EnemySlab_reserve(void) { EnemySlab = calloc(ENEMY_SLAB, sizeof(Enemy)), EnemySlab_used = 0; }
 static Enemy *Enemy_new(EnemyPool *pool, const char *type) {  // constructor
-    Enemy *e = calloc(1, sizeof(Enemy));
+    Enemy *e = EnemySlab && EnemySlab_used < ENEMY_SLAB ? &EnemySlab[EnemySlab_used++] : calloc(1, sizeof(Enemy));
     sprite_init(&e->s, NULL, 0, 0);
     e->s.owner = e;
     e->vt = enemy_vt(type);
@@ -4072,7 +4138,142 @@ static Enemy *Enemy_new(EnemyPool *pool, const char *type) {  // constructor
     return e;
 }
 
+// The data of an enemy type, read one time for each pool. Before, each new enemy read enemies.json again: about 25
+// lookups and the frame names of its animations. The minute-23 wave makes 286 enemies in one frame: 51 ms on the Vita.
+// Enemy_Init uses the template, and it calls frand at the same points and in the same order as the JSON path.
+#define TPL_NAMES 8
+struct EnemyTpl {
+    int ok;  // 0: the JSON path (no data, or no frame names, or too many)
+    int hasMaxSpeed;
+    float speed, maxSpeed, maxHp, power, knockback, maxKnockback, deathKB, res_Rosary, feverValue, res_Freeze, res_Corridor,
+        res_Debuffs, xp, moreX, moreY, alpha, scale, colliderRadius, colliderOffsetX, colliderOffsetY;
+    int hasColliderOverride, idleFrameCount, passThroughWalls, HPxLevel, FixedDirection, Medusa, SelfDestruct;
+    unsigned saveTint;
+    int nNames;
+    struct { const Frame *frame; Animation die, idle; } names[TPL_NAMES];  // one for each frame name (RND.pick)
+};
+static EnemyTpl *EnemyTpl_make(const char *type) {
+    EnemyTpl *t = calloc(1, sizeof(EnemyTpl));
+    cJSON *d = cJSON_GetArrayItem(cJSON_GetObjectItem(data_get("enemies"), type), 0);
+    cJSON *names = cJSON_GetObjectItem(d, "frameNames");
+    t->nNames = cJSON_GetArraySize(names);
+    if (!d || t->nNames < 1 || t->nNames > TPL_NAMES) return t;
+    t->hasMaxSpeed = has(d, "maxSpeed");
+    t->speed = num(d, "speed", 0), t->maxSpeed = num(d, "maxSpeed", 0);
+    t->maxHp = num(d, "maxHp", 0);
+    t->power = num(d, "power", 0);
+    t->knockback = num(d, "knockback", 0);
+    t->maxKnockback = num(d, "maxKnockback", 0);
+    t->deathKB = num(d, "deathKB", 0);
+    t->res_Rosary = num(d, "res_Rosary", 0);
+    t->feverValue = orv(d, "feverValue", 1);
+    t->res_Freeze = num(d, "res_Freeze", 0);
+    t->res_Corridor = num(d, "res_Corridor", 0);
+    t->res_Debuffs = num(d, "res_Debuffs", 0);
+    t->xp = num(d, "xp", 0);
+    t->moreX = num(d, "moreX", 0);
+    t->moreY = num(d, "moreY", 0);
+    t->alpha = orv(d, "alpha", 1);
+    t->scale = orv(d, "scale", 1);
+    cJSON *co = cJSON_GetObjectItem(d, "colliderOverride");
+    if (co) {
+        t->hasColliderOverride = 1;
+        t->colliderRadius = num(co, "radius", 0);
+        t->colliderOffsetX = num(co, "offsetX", 0);
+        t->colliderOffsetY = num(co, "offsetY", 0);
+    }
+    t->idleFrameCount = (int)num(d, "idleFrameCount", 0);
+    t->passThroughWalls = cJSON_IsTrue(cJSON_GetObjectItem(d, "passThroughWalls"));
+    t->saveTint = has(d, "tint") ? (unsigned)num(d, "tint", 0xffffff) : 0xffffff;
+    cJSON *sk;
+    cJSON_ArrayForEach(sk, cJSON_GetObjectItem(d, "skills")) {
+        int s = (int)cJSON_GetNumberValue(sk);
+        if (s == 0) t->HPxLevel = 1;
+        if (s == 1) t->FixedDirection = 1;
+        if (s == 3) t->Medusa = 1;
+        if (s == 2) t->SelfDestruct = 1;
+    }
+    const char *tex = str(d, "textureName");
+    int end = (int)num(d, "end", 0);
+    for (int k = 0; k < t->nNames; k++) {  // the same steps as Enemy_Init for each possible name
+        const char *name = cJSON_GetStringValue(cJSON_GetArrayItem(names, k));
+        if (!name) return t;
+        t->names[k].frame = frame_get(tex, name);
+        char prefix[96];
+        snprintf(prefix, sizeof(prefix), "%s", name);
+        char *q = strstr(prefix, "0.png");
+        if (q) *q = 0;
+        Animation *die = &t->names[k].die, *idle = &t->names[k].idle;
+        die->n = anims_generateFrameNames(tex, prefix, 0, end, 0, die->frames, ANIM_MAX_FRAMES);
+        die->frameRate = 0x18;
+        die->msPerFrame = 1000.0f / die->frameRate;
+        die->repeat = 0;
+        if (t->idleFrameCount) {
+            char ip[100];
+            snprintf(ip, sizeof(ip), "%si", prefix);
+            idle->n = anims_generateFrameNames(tex, ip, 1, t->idleFrameCount, 2, idle->frames, ANIM_MAX_FRAMES);
+            idle->frameRate = 8;
+            idle->msPerFrame = 1000.0f / 8;
+            idle->repeat = -1;
+        }
+    }
+    t->ok = 1;
+    return t;
+}
+static void Enemy_InitJSON(Enemy *e, float x, float y);
 static void Enemy_Init(Enemy *e, float x, float y) {
+    EnemyPool *p = e->pool;
+    if (p && !p->tpl) p->tpl = EnemyTpl_make(p->enemyType);
+    const EnemyTpl *t = p ? p->tpl : NULL;
+    if (!t || !t->ok || strcmp(p->enemyType, e->enemyType)) { Enemy_InitJSON(e, x, y); return; }
+    float sp = t->hasMaxSpeed ? frand() * (t->maxSpeed - t->speed) + t->speed : t->speed;  // frand 1 (as in the JSON path)
+    e->dataMaxHp = e->maxHp = t->maxHp;
+    e->power = t->power;
+    e->knockback = t->knockback;
+    e->maxKnockback = t->maxKnockback;
+    e->deathKB = t->deathKB;
+    e->res_Rosary = t->res_Rosary;
+    e->feverValue = t->feverValue;
+    e->res_Freeze = t->res_Freeze;
+    e->res_Corridor = t->res_Corridor;
+    e->res_Debuffs = t->res_Debuffs;
+    e->xp = t->xp;
+    e->speed = e->defaultSpeed = sp;
+    e->moreX = t->moreX;
+    e->moreY = t->moreY;
+    e->s.alpha = t->alpha;
+    e->scaleMul = t->scale;
+    if (t->hasColliderOverride) {
+        e->hasColliderOverride = 1;
+        e->colliderRadius = t->colliderRadius;
+        e->colliderOffsetX = t->colliderOffsetX;
+        e->colliderOffsetY = t->colliderOffsetY;
+    }
+    e->idleFrameCount = t->idleFrameCount;
+    e->passThroughWalls = t->passThroughWalls;
+    e->saveTint = t->saveTint;
+    if (t->HPxLevel) e->HPxLevel = 1;
+    if (t->FixedDirection) e->FixedDirection = 1;
+    if (t->Medusa) { e->Medusa = 1; e->medusaElapsed = 2 * frand(); }  // frand 2 (one skill 3 at most in the data)
+    if (t->SelfDestruct) {
+        e->SelfDestruct = 1;
+        sprite_init(&e->alertSprite, frame_get("vfx", "sPFX_ring_64.png"), 0, 0);
+        e->alertSprite.visible = 0, e->alertSprite.blendAdd = 1;
+        sprite_setOrigin(&e->alertSprite, 0.5f, 0.75f), sprite_setTint(&e->alertSprite, 0xff0000);
+    }
+    int k = (int)floorf(frand() * t->nNames);  // frand 3: RND.pick of the frame name
+    sprite_setFrame(&e->s, t->names[k].frame);
+    e->die = t->names[k].die;
+    if (e->idleFrameCount) e->idle = t->names[k].idle;
+    e->s.onAnimationComplete = Enemy_OnDeathAnimationComplete;
+    e->defaultName = e->s.frame;
+    e->s.x = x;
+    e->s.y = y;
+    physics_existing(&e->s);
+    Enemy_OnRecycle(e);
+    e->moveTweenIndex = (int)floorf(frand() * n_TweenAngles);
+}
+static void Enemy_InitJSON(Enemy *e, float x, float y) {
     cJSON *d = cJSON_GetArrayItem(cJSON_GetObjectItem(data_get("enemies"), e->enemyType), 0);
     float sp = has(d, "maxSpeed") ? frand() * (num(d, "maxSpeed", 0) - num(d, "speed", 0)) + num(d, "speed", 0) : num(d, "speed", 0);
     e->dataMaxHp = e->maxHp = num(d, "maxHp", 0);
@@ -17031,7 +17232,7 @@ static void Library_BigSpoop(void) {
     Lib.sDarkness.scaleX = (game_width + 0x14) / 160.0f, Lib.sDarkness.scaleY = (game_height + 0x14) / 100.0f;
     children_add(&Lib.sDarkness);
     Sound_StopMusic();
-    if (LoopSfx.on) StopMusicStream(LoopSfx.m), LoopSfx.on = 0;  // sound.stopAll
+    if (LoopSfx.on) aw_music_stop(&LoopSfx.m), LoopSfx.on = 0;  // sound.stopAll
     Lib.saveDMG = po_is("DamageNumbersEnabled"), Lib.hasSaved = 1;
     snprintf(Lib.saveBGM, sizeof(Lib.saveBGM), "%s", po_str("SelectedBGM") ? po_str("SelectedBGM") : "");
     snprintf(Lib.saveBGMMod, sizeof(Lib.saveBGMMod), "%s", po_str("SelectedBGMMod") ? po_str("SelectedBGMMod") : "");
@@ -19340,14 +19541,15 @@ enum { DMT_PHASE0, DMT_MID, DMT_LAST };
 static int DM_play(const char *key, int loop, float fromVol) {
     int k = -1;
     for (int i = 0; i < 3; i++) if (!DM.ch[i].on) { k = i; break; }
-    if (k < 0) k = (DM.cur + 1) % 3, StopMusicStream(DM.ch[k].m), UnloadMusicStream(DM.ch[k].m);
+    if (k < 0) k = (DM.cur + 1) % 3, aw_music_stop(&DM.ch[k].m), Music_close(&DM.ch[k].m);
     int si = Sound_index(key);
     if (si < 0 || !IsAudioDeviceReady()) return -1;
-    DM.ch[k].m = LoadMusicStream(vs_path(TextFormat("sfx/%s", SOUND_FILES[si].file)));
+    Music_open(&DM.ch[k].m, vs_path(TextFormat("sfx/%s", SOUND_FILES[si].file)));
     DM.ch[k].m.looping = loop;
     DM.ch[k].on = 1, DM.ch[k].stopAtEnd = 0, DM.ch[k].vol = fromVol, DM.ch[k].dur = 0;
-    SetMusicVolume(DM.ch[k].m, fromVol);
+    Music_volume(&DM.ch[k].m, fromVol);
     PlayMusicStream(DM.ch[k].m);
+    aw_music_track(&DM.ch[k].m);
     return DM.cur = k;
 }
 static void DM_fade(int k, float to, float dur, int stop) {
@@ -19395,18 +19597,18 @@ static void DM_Tick(float delta) {  // tempo reale: timer e dissolvenze (Circ.ea
             DM.ch[k].t += delta;
             float p = fminf(1, DM.ch[k].t / DM.ch[k].dur), e = 1 - sqrtf(1 - p * p);
             DM.ch[k].vol = DM.ch[k].from + (DM.ch[k].to - DM.ch[k].from) * e;
-            SetMusicVolume(DM.ch[k].m, DM.ch[k].vol);
+            Music_volume(&DM.ch[k].m, DM.ch[k].vol);
             if (p >= 1) {
                 DM.ch[k].dur = 0;
-                if (DM.ch[k].stopAtEnd) { StopMusicStream(DM.ch[k].m), UnloadMusicStream(DM.ch[k].m), DM.ch[k].on = 0; continue; }
+                if (DM.ch[k].stopAtEnd) { aw_music_stop(&DM.ch[k].m), Music_close(&DM.ch[k].m), DM.ch[k].on = 0; continue; }
             }
         }
-        UpdateMusicStream(DM.ch[k].m);
-        if (!DM.ch[k].m.looping && !IsMusicStreamPlaying(DM.ch[k].m)) UnloadMusicStream(DM.ch[k].m), DM.ch[k].on = 0;
+        Music_update(&DM.ch[k].m);
+        if (!DM.ch[k].m.looping && !IsMusicStreamPlaying(DM.ch[k].m)) Music_close(&DM.ch[k].m), DM.ch[k].on = 0;
     }
 }
 static void DM_Cleanup(void) {
-    for (int k = 0; k < 3; k++) if (DM.ch[k].on) StopMusicStream(DM.ch[k].m), UnloadMusicStream(DM.ch[k].m), DM.ch[k].on = 0;
+    for (int k = 0; k < 3; k++) if (DM.ch[k].on) aw_music_stop(&DM.ch[k].m), Music_close(&DM.ch[k].m), DM.ch[k].on = 0;
     DM_RemoveTimers();
     DM.active = 0;
 }
@@ -31747,7 +31949,7 @@ static void Opt_apply(OptRow *r) {  // le change* delle pagine
         if (!strcmp(r->key, "SoundsVolume")) SoundsVolume = r->value;
         else {  // changeBGM: Sound.UpdateMusicVolume(CurrentBGM, value)
             MusicVolume = r->value;
-            if (BGM.playing) BGM.volume = BGM.currentVolume * MusicVolume, BGM.fadeDur = 0, SetMusicVolume(BGM.music, BGM.volume);
+            if (BGM.playing) BGM.volume = BGM.currentVolume * MusicVolume, BGM.fadeDur = 0, Music_volume(&BGM.music, BGM.volume);
         }
     } else if (r->kind == OPT_BG) {  // changeDISABLEBG: disableMovingBackground rimette sempre disableMovingBG a true (sic)
         FB_disableMovingBG = r->value != 0;
@@ -32040,9 +32242,9 @@ static void RC_deleteNow(int which) {
         vs_reload();
         return;
     }
-    if (BGM.idx >= 0) UnloadMusicStream(BGM.music), BGM.idx = -1;  // i file aperti non si possono cancellare
-    if (SeekSfx.on) UnloadMusicStream(SeekSfx.m), SeekSfx.on = 0;
-    if (LoopSfx.on) UnloadMusicStream(LoopSfx.m), LoopSfx.on = 0;
+    if (BGM.idx >= 0) Music_close(&BGM.music), BGM.idx = -1;  // i file aperti non si possono cancellare
+    if (SeekSfx.on) Music_close(&SeekSfx.m), SeekSfx.on = 0;
+    if (LoopSfx.on) Music_close(&LoopSfx.m), LoopSfx.on = 0;
     vs_delete_all_and_exit();
 }
 static void RC_onDelete(void *c) {
@@ -33830,7 +34032,7 @@ void game_start(const char *character) {
     camera_followOffsetX = 0, FrameFreeze_ms = 0;
     Lights.on = 0, Lights.n = 0;  // le luci di candela si assegnano solo dopo Lights_Init dello stage nuovo
     FishEye.on = 0, FishEye.intensity = 0;
-    if (LoopSfx.on) UnloadMusicStream(LoopSfx.m), LoopSfx.on = 0;  // fancyBG.OnDestroy: StopSound(Wind)
+    if (LoopSfx.on) Music_close(&LoopSfx.m), LoopSfx.on = 0;  // fancyBG.OnDestroy: StopSound(Wind)
     time_reset();
     tweens_reset();
     physics_reset();
@@ -33856,6 +34058,7 @@ void game_start(const char *character) {
     memset(&LUF, 0, sizeof(LUF));
     laurel = NULL;
     n_TweenAngles = 0;
+    EnemySlab_reserve();  // after gmem_reset: the enemies of this run
     run_ms = 0;
     _lastVelocity = (Vector2){ 0, 0 };
     // CharacterSelection: SelectedCharacter e l'arma di partenza vista (la scelta dello stage arriva con F3.1; sviluppo: VS_STAGE=LIBRARY)
@@ -34072,6 +34275,7 @@ void game_draw(void) {
     if (nofill < 0) nofill = getenv("VS_NOFILL") != NULL;
     int zoomOut = camera_zoom < 1;  // zoom indietro (fase 5 della Machine): tutta la scena scalata attorno al centro, HUD compreso come in Phaser
     if (zoomOut) rlPushMatrix(), rlTranslatef(0.5f * game_width, 0.5f * game_height, 0), rlScalef(camera_zoom, camera_zoom, 1), rlTranslatef(-0.5f * game_width, -0.5f * game_height, 0);
+    render_zoom = zoomOut ? camera_zoom : 1;
     scene_render(nofill ? (Shader){ 0 } : fill_shader);  // la mappa (TilingTileset) e' nella lista di disegno, depth -2000..1995
     if (zoomOut) rlPopMatrix();
     if (getenv("VS_BODIES")) {

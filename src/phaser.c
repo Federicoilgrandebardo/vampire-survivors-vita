@@ -1090,7 +1090,10 @@ static int intersects(Body *b1, Body *b2) {
     if (!b1->isCircle && !b2->isCircle)
         return !(body_right(b1) <= b2->position.x || body_bottom(b1) <= b2->position.y || b1->position.x >= body_right(b2) || b1->position.y >= body_bottom(b2));
     if (b1->isCircle) {
-        if (b2->isCircle) return dist(b1->center.x, b1->center.y, b2->center.x, b2->center.y) <= b1->halfWidth + b2->halfWidth;
+        if (b2->isCircle) {  // squared: no sqrtf for each pair of the crowd (both sides are >= 0)
+            float dx = b1->center.x - b2->center.x, dy = b1->center.y - b2->center.y, r = b1->halfWidth + b2->halfWidth;
+            return dx * dx + dy * dy <= r * r;
+        }
         return circleBodyIntersects(b1, b2);
     }
     return circleBodyIntersects(b2, b1);
@@ -1325,6 +1328,93 @@ static void collideSpriteVsTilemapLayer(Sprite *s, TilemapLayer *l, Collider *c)
         }
 }
 
+// Grid of the members of one list, for array colliders (each bullet against all enemies). A member goes into every cell
+// that its body touches, so bodies of all sizes are found (the grids above assume bodies smaller than one cell).
+// The grid only selects candidates: separate() still decides each pair, and the pairs come out in list order.
+#define LG_ENTRIES 32768
+#define LG_MAX_CELLS 256  // a body that covers more cells uses the loop over all pairs
+static int lg_head[GRID_BUCKETS], lg_next[LG_ENTRIES], lg_item[LG_ENTRIES], lg_n, lg_count, lg_stamp[MAX_BODIES], lg_mark;
+static Sprite *lg_spr[MAX_BODIES];  // the members when the grid was made (a callback can change the list)
+static const SpriteList *lg_list;
+static unsigned lg_ver, world_ver;  // world_ver changes when bodies can move: a new step, a collider that separates
+
+static int body_cells(const Body *b, int *x0, int *y0, int *x1, int *y1) {
+    *x0 = cell_of(b->position.x), *y0 = cell_of(b->position.y), *x1 = cell_of(body_right(b)), *y1 = cell_of(body_bottom(b));
+    return (*x1 - *x0 + 1) * (*y1 - *y0 + 1);
+}
+static int lg_build(SpriteList *l) {
+    if (lg_list == l && lg_ver == world_ver) return 1;
+    lg_list = NULL;
+    if (l->n > MAX_BODIES) return 0;
+    for (int i = 0; i < GRID_BUCKETS; i++) lg_head[i] = -1;
+    lg_n = 0;
+    for (int j = 0; j < l->n; j++) {
+        Sprite *s = lg_spr[j] = l->items[j];
+        if (!s->hasBody) continue;
+        int x0, y0, x1, y1;
+        if (body_cells(&s->body, &x0, &y0, &x1, &y1) > LG_MAX_CELLS) return 0;
+        for (int cy = y0; cy <= y1; cy++)
+            for (int cx = x0; cx <= x1; cx++) {
+                if (lg_n == LG_ENTRIES) return 0;
+                int k = bucket(cx, cy);
+                lg_item[lg_n] = j, lg_next[lg_n] = lg_head[k], lg_head[k] = lg_n++;
+            }
+    }
+    for (int j = 0; j < l->n; j++) lg_stamp[j] = 0;
+    lg_mark = 0, lg_count = l->n;
+    lg_list = l, lg_ver = world_ver;
+    return 1;
+}
+// Members whose box touches the box of a (a superset of the pairs that intersect), index > after, in list order.
+// Returns -1 if a is too large for a grid search.
+static int lg_query(const Body *a, int after, int *out, int max) {
+    int x0, y0, x1, y1, n = 0;
+    if (body_cells(a, &x0, &y0, &x1, &y1) > LG_MAX_CELLS) return -1;
+    lg_mark++;
+    for (int cy = y0; cy <= y1; cy++)
+        for (int cx = x0; cx <= x1; cx++)
+            for (int e = lg_head[bucket(cx, cy)]; e >= 0; e = lg_next[e]) {
+                int j = lg_item[e];
+                if (j <= after || lg_stamp[j] == lg_mark) continue;
+                lg_stamp[j] = lg_mark;
+                const Body *b = &lg_spr[j]->body;
+                if (body_right(b) < a->position.x || b->position.x > body_right(a) || body_bottom(b) < a->position.y || b->position.y > body_bottom(a)) continue;
+                if (n == max) return -1;
+                int k = n++;
+                while (k > 0 && out[k - 1] > j) out[k] = out[k - 1], k--;  // insertion sort: list order
+                out[k] = j;
+            }
+    return n;
+}
+// The loop over all pairs, with the grid of list b. Same pairs in the same order as collider_update's loop below,
+// including its behavior when a callback removes the current sprite of list a: the next sprite of a continues
+// with the members of b after the current one.
+static int collide_arrays_grid(Collider *c) {
+    SpriteList *a = c->object1, *b = c->object2;
+    if (!c->overlapOnly || !b->bit || a->n < 2 || a->n * b->n < 128 || !lg_build(b)) return 0;
+    static int cand[MAX_BODIES];
+    for (int i = 0; i < a->n; i++) {
+        int after = -1;
+        for (;;) {
+            Sprite *s1 = a->items[i];
+            int n = s1->hasBody ? lg_query(&s1->body, after, cand, MAX_BODIES) : 0, moved = 0;
+            if (n < 0) {  // too large: every member after 'after'
+                n = 0;
+                for (int j = after + 1; j < lg_count; j++) cand[n++] = j;
+            }
+            for (int k = 0; k < n; k++) {
+                Sprite *s2 = lg_spr[cand[k]];
+                if (!(s2->groups & b->bit) || !s2->hasBody) continue;  // left the list in a callback
+                if (separate(&s1->body, &s2->body, 1) && c->collideCallback) c->collideCallback(c->ctx, s1, s2);
+                if (i >= a->n) return 1;
+                if (a->items[i] != s1) { after = cand[k], moved = 1; break; }
+            }
+            if (!moved) break;
+        }
+    }
+    return 1;
+}
+
 // World.collideObjects: array contro array (Group senza physicsType = children.entries)
 static void collider_update(Collider *c) {
     if (c->kind == COLLIDE_TILEMAP) {  // collideGroupVsTilemapLayer / collideSpriteVsTilemapLayer
@@ -1338,9 +1428,11 @@ static void collider_update(Collider *c) {
     if (c->kind == COLLIDE_GROUP_SELF) {  // collideGroupVsGroup(g, g): ogni figlio contro il gruppo
         SpriteList *g = c->object1;
         if (g->n <= MAX_BODIES) { collideGroupSelfGrid(g, c); return; }
+        tree_load();  // only this path reads the grid of all bodies
         for (int i = 0; i < g->n; i++) collideSpriteVsGroup(g->items[i], g, c);
         return;
     }
+    if (collide_arrays_grid(c)) return;
     SpriteList *a = c->object1, *b = c->object2;
     for (int i = 0; i < a->n; i++)
         for (int j = 0; j < b->n; j++) {
@@ -1352,20 +1444,19 @@ static void collider_update(Collider *c) {
 }
 
 #include <time.h>
-static double cp_t[64], cp_tree; static int cp_n, cp_na[64], cp_nb[64];
+static double cp_t[64]; static int cp_n, cp_na[64], cp_nb[64];
 static double cp_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
 int phys_runs;  // VS_LOGPROF: passaggi di run_colliders (uno per passo di fisica)
 static void run_colliders(void) {
     phys_runs++;
     static int on = -1; if (on < 0) on = getenv("VS_COLPROF") != NULL;
-    double t0 = on ? cp_now() : 0;
-    tree_load();
-    if (on) cp_tree += cp_now() - t0;
+    world_ver++;  // the bodies moved in this step: grids from the last step are old
     for (int i = 0; i < n_colliders; i++)
         if (colliders[i]->active) {
             Collider *c = colliders[i];
             double t = on ? cp_now() : 0;
             collider_update(c);
+            if (!c->overlapOnly || c->kind != COLLIDE_ARRAYS) world_ver++;  // it can separate (move) bodies
             if (on && i < 64) cp_t[i] += cp_now() - t, cp_na[i] = c->object1 ? c->object1->n : 0, cp_nb[i] = c->object2 ? c->object2->n : 0;
         }
     if (on && ++cp_n == 600) {
@@ -1375,10 +1466,9 @@ static void run_colliders(void) {
 #else
         FILE *o = stderr;
 #endif
-        fprintf(o, "COLPROF tree %.3f ms/chiamata\n", cp_tree / cp_n);
         for (int i = 0; i < n_colliders && i < 64; i++) if (cp_t[i] / cp_n > 0.002) fprintf(o, "COLPROF #%d kind %d %dx%d %.3f ms/chiamata\n", i, colliders[i]->kind, cp_na[i], cp_nb[i], cp_t[i] / cp_n);
         if (o != stderr) fclose(o);
-        memset(cp_t, 0, sizeof(cp_t)), cp_tree = 0, cp_n = 0;
+        memset(cp_t, 0, sizeof(cp_t)), cp_n = 0;
     }
 }
 
@@ -1447,10 +1537,42 @@ void list_free(SpriteList *l) { gmem_free(l->items); *l = (SpriteList){ 0 }; }
 
 static SpriteList children;  // scene.children + updateList
 int prof_children, prof_custom, prof_offscreen, prof_breaks, prof_tiles;  // VS_PROF, ultimo scene_render
-float game_view_w = 730, game_view_h = 456;  // per il conteggio fuori schermo
-void children_add(Sprite *s) { if (!s->onDisplayList) { list_add(&children, s); s->onDisplayList = 1; } }
-void children_remove(Sprite *s) { if (s->onDisplayList) { list_remove(&children, s); s->onDisplayList = 0; } }
-void children_reset(void) { children = (SpriteList){ 0 }; }  // il buffer e' della partita: lo libera gmem_reset
+float render_zoom = 1;  // scene_render: the camera zoom when it is below 1 (zoom-out), for the visible area
+static float cullL, cullT, cullR, cullB;  // visible area in view coordinates while scene_render runs (cullOn)
+static int cullOn;
+// The draw order of the last frame, with the insertion number of each sprite (seq). It changes together with
+// 'children': same sprites, and seq increases in the order of the list.
+typedef struct { Sprite *s; unsigned seq; } ZEntry;
+static ZEntry *zs;
+static int zn, zcap;
+static unsigned zseq;
+static void z_push(Sprite *s) {
+    if (zn == zcap) zcap = zcap ? zcap * 2 : 256, zs = realloc(zs, zcap * sizeof(ZEntry));
+    zs[zn++] = (ZEntry){ s, ++zseq };
+}
+static void z_remove(Sprite *s) {
+    for (int i = 0; i < zn; i++)
+        if (zs[i].s == s) { memmove(&zs[i], &zs[i + 1], (zn - i - 1) * sizeof(ZEntry)); zn--; return; }
+}
+static void z_rebuild(void) {  // only if the two lists do not agree: new numbers in list order
+    zn = 0;
+    for (int i = 0; i < children.n; i++) z_push(children.items[i]);
+}
+void children_add(Sprite *s) {
+    if (s->onDisplayList) return;
+    int n0 = children.n;
+    list_add(&children, s);
+    s->onDisplayList = 1;
+    if (children.n > n0) z_push(s);
+}
+void children_remove(Sprite *s) {
+    if (!s->onDisplayList) return;
+    int n0 = children.n;
+    list_remove(&children, s);
+    s->onDisplayList = 0;
+    if (children.n < n0) z_remove(s);
+}
+void children_reset(void) { children = (SpriteList){ 0 }; zn = 0; }  // il buffer e' della partita: lo libera gmem_reset
 
 // UpdateList.sceneUpdate -> Sprite.preUpdate -> anims.update
 void sprite_animsUpdate(Sprite *s, float delta) { anims_update(s, delta); }  // figli di un Container (fuori dalla lista)
@@ -1505,23 +1627,21 @@ void scene_render_one(Sprite *s, Shader fill) {
 
 void scene_render(Shader fill) {
     double dp_start = GetTime();
-    static Sprite **sorted, **tmp;
+    static Sprite **sorted;
     static int cap;
-    if (children.n > cap) { cap = children.n * 2; sorted = realloc(sorted, cap * sizeof(Sprite *)), tmp = realloc(tmp, cap * sizeof(Sprite *)); }
-    // ordinamento stabile: a parita' di depth vale l'ordine di inserimento. Merge sort dal basso: si riparte ogni frame
-    // dall'ordine di inserimento, e l'insertion sort di prima con ~700 oggetti costava fino a 4,6 ms sulla Vita
-    for (int i = 0; i < children.n; i++) sorted[i] = children.items[i];
-    Sprite **src = sorted, **dst = tmp;
-    for (int w = 1; w < children.n; w *= 2) {
-        for (int lo = 0; lo < children.n; lo += 2 * w) {
-            int mid = lo + w < children.n ? lo + w : children.n, hi = lo + 2 * w < children.n ? lo + 2 * w : children.n, a = lo, b = mid, o = lo;
-            while (a < mid && b < hi) dst[o++] = src[b]->depth < src[a]->depth ? src[b++] : src[a++];  // a parita' vince il primo: stabile
-            while (a < mid) dst[o++] = src[a++];
-            while (b < hi) dst[o++] = src[b++];
-        }
-        Sprite **t = src; src = dst, dst = t;
+    if (children.n > cap) { cap = children.n * 2; sorted = realloc(sorted, cap * sizeof(Sprite *)); }
+    // Stable order: by depth, and by insertion order for the same depth (key: depth, seq). The key is unique, so every
+    // sort gives the same order. The insertion sort starts from the order of the last frame: enemy depths change a
+    // little each frame, so the list is almost sorted. (From the insertion order, it cost up to 4.6 ms on the Vita.)
+    if (zn != children.n) z_rebuild();
+    for (int i = 1; i < zn; i++) {
+        ZEntry e = zs[i];
+        double d = e.s->depth;
+        int j = i - 1;
+        while (j >= 0 && (zs[j].s->depth > d || (zs[j].s->depth == d && zs[j].seq > e.seq))) zs[j + 1] = zs[j], j--;
+        zs[j + 1] = e;
     }
-    if (src != sorted) memcpy(sorted, src, children.n * sizeof(Sprite *));
+    for (int i = 0; i < zn; i++) sorted[i] = zs[i].s;
     static int skip_draw = -1;  // VS_SKIPDRAW=tiles,pfx,custom,sprites: categorie da non disegnare (misure sulla Vita)
     if (skip_draw < 0) {
         const char *e = getenv("VS_SKIPDRAW");
@@ -1538,6 +1658,10 @@ void scene_render(Shader fill) {
     unsigned lastTex = 0;
     int lastAdd = -1;
     prof_children = children.n, prof_custom = prof_offscreen = prof_breaks = prof_tiles = 0;
+    // Visible area of the game view. A zoom-out (render_zoom < 1) scales the view around its center and shows more.
+    const float zx = 0.5f * game_width * (1 / render_zoom - 1), zy = 0.5f * game_height * (1 / render_zoom - 1);
+    const float viewL = -zx, viewT = -zy, viewR = game_width + zx, viewB = game_height + zy;
+    cullL = viewL, cullT = viewT, cullR = viewR, cullB = viewB, cullOn = 1;  // also for manager_draw, during this pass only
     if (fill.id) BeginShaderMode(fill), scene_fillActive = 1;  // senza segno (u < 2) e' lo shader di default
     for (int i = 0; i < children.n; i++) {
         Sprite *s = sorted[i];
@@ -1553,15 +1677,17 @@ void scene_render(Shader fill) {
         if (skip_draw & 8) continue;
         if (s->frame && s->visible && s->alpha > 0) {  // VS_PROF: fuori schermo e interruzioni del batch (texture o miscela)
             const Frame *f = s->frame;
+            // r: the farthest point of the frame from its origin, with rotation (diagonal <= 1.415 x the longer side)
             float cx = s->scrollFactor0 ? 0 : camera_scrollX, cy = s->scrollFactor0 ? 0 : camera_scrollY, x = s->x - cx, y = s->y - cy,
-                  r = fmaxf(f->sw * fabsf(s->scaleX), f->sh * fabsf(s->scaleY));
-            if (x < -r || y < -r || x > game_view_w + r || y > game_view_h + r) prof_offscreen++;
+                  r = 1.5f * fmaxf(f->sw * fabsf(s->scaleX), f->sh * fabsf(s->scaleY));
+            if (x < viewL - r || y < viewT - r || x > viewR + r || y > viewB + r) { prof_offscreen++; continue; }  // not visible: no quad
             if (f->tex->id != lastTex || s->blendAdd != lastAdd || s->tintFill) prof_breaks++;
             lastTex = f->tex->id, lastAdd = s->blendAdd;
         }
         scene_render_one(s, fill);
     }
     if (fill.id) EndShaderMode(), scene_fillActive = 0;
+    cullOn = 0;
     DP(5);  // chiude l'ultima categoria (5 resta vuota qui: in game_draw e' il resto del disegno)
 #undef DP
 }
@@ -1715,6 +1841,10 @@ static void manager_draw(Sprite *s) {
             Color c = { (p->tint >> 16) & 255, (p->tint >> 8) & 255, p->tint & 255, (unsigned char)(255 * fmaxf(0, fminf(1, p->alpha))) };
             float lx = -f->sw * 0.5f + f->ox, ly = -f->sh * 0.5f + f->oy;
             float sx = m->scrollFactor0 ? 0 : camera_scrollX, sy = m->scrollFactor0 ? 0 : camera_scrollY;
+            if (cullOn) {  // same test as scene_render: no quad for a particle outside the view
+                float x = p->x - sx, y = p->y - sy, r = 1.5f * fmaxf(f->sw * fabsf(p->scale), f->sh * fabsf(p->scaleY));
+                if (x < cullL - r || y < cullT - r || x > cullR + r || y > cullB + r) continue;
+            }
             Rectangle dst = { roundf(p->x - sx), roundf(p->y - sy), f->w * p->scale, f->h * p->scaleY };
             DrawTexturePro(*f->tex, (Rectangle){ f->x, f->y, f->w, f->h }, dst, (Vector2){ -lx * p->scale, -ly * p->scaleY }, p->angle, c);
         }

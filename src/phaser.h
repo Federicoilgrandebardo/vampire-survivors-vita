@@ -84,6 +84,8 @@ TweenRef tweens_add(TweenConfig c);
 float Ease_BounceOut(float v);  // src/math/easing
 float Ease_SineInOut(float v);
 float Ease_ExpoOut(float v);
+float Ease_ExpoIn(float v);
+float Ease_QuintOut(float v);
 float Ease_BackOut(float v);
 float Ease_SineOut(float v);
 Tween *tween_get(TweenRef r);
@@ -305,6 +307,8 @@ typedef struct ParticleManager {  // ParticleEmitterManager: un game object dell
     int nemit, scrollFactor0;  // setScrollFactor(0): coordinate di schermo (scene UI)
     int hasWell;               // createGravityWell: un solo pozzo
     float wellX, wellY, wellPower, wellEpsilon;  // _power = power * gravity, _epsilon = epsilon^2
+    int hasWell2;              // W_Spellstrom: un secondo pozzo, stessi power ed epsilon
+    float well2X, well2Y;
 } ParticleManager;
 ParticleManager *particles_add(void);  // scene.add.particles
 ParticleEmitter *particles_createEmitter(ParticleManager *m, EmitterConfig c);

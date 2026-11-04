@@ -196,6 +196,8 @@ float Ease_SineInOut(float v) { return 0.5f * (1 - cosf(PI * v)); }
 float Ease_SineOut(float v) { return sinf(v * PI / 2); }  // src/math/easing/sine/Out.js
 float Ease_BackOut(float v) { v -= 1; return v * v * ((1.70158f + 1) * v + 1.70158f) + 1; }  // src/math/easing/back/Out.js (overshoot 1.70158)
 float Ease_ExpoOut(float v) { return v == 1 ? 1 : 1 - powf(2, -10 * v); }  // src/math/easing/expo/Out.js
+float Ease_ExpoIn(float v) { return powf(2, 10 * (v - 1)) - 0.001f; }  // src/math/easing/expo/In.js
+float Ease_QuintOut(float v) { v -= 1; return v * v * v * v * v + 1; }  // src/math/easing/quintic/Out.js
 
 // TweenManager.add -> createTweenData
 TweenRef tweens_add(TweenConfig c) {
@@ -946,10 +948,11 @@ static void tilemapLayer_draw(Sprite *s) {
 // ============================================================================
 #define OVERLAP_BIAS 4
 #define MAX_BODIES 8192
-#define MAX_COLLIDERS 64
 static Sprite *bodies[MAX_BODIES];  // world.bodies (Set, ordine di inserimento)
 static int n_bodies;
-static Collider colliders[MAX_COLLIDERS];
+// world.colliders, senza tetto come l'originale. Blocchi mai spostati: Core e le armi tengono i puntatori e un callback puo' aggiungere collider durante run_colliders
+static Collider **colliders;
+static int cap_colliders;
 // physics.overlapCirc(x, y, r, true, false).length: OverlapRect sui corpi attivi, poi CircleToCircle / CircleToRectangle
 int physics_overlapCirc(float x, float y, float r) {
     int n = 0;
@@ -993,8 +996,16 @@ void physics_existing(Sprite *s) {
 }
 
 static Collider *add_collider(SpriteList *a, SpriteList *b, ColliderKind k, PairCallback cb, void *ctx, int overlapOnly) {
-    if (n_colliders >= MAX_COLLIDERS) return NULL;
-    Collider *c = &colliders[n_colliders++];
+    if (n_colliders == cap_colliders) {
+        int cap = cap_colliders ? cap_colliders * 2 : 64;
+        Collider **t = realloc(colliders, cap * sizeof(*t));
+        if (t) colliders = t;
+        Collider *block = t ? malloc((cap - cap_colliders) * sizeof(Collider)) : NULL;
+        if (!block) { fprintf(stderr, "add_collider: memoria esaurita a %d collider\n", n_colliders); return NULL; }
+        for (int i = cap_colliders; i < cap; i++) colliders[i] = &block[i - cap_colliders];
+        cap_colliders = cap;
+    }
+    Collider *c = colliders[n_colliders++];
     *c = (Collider){ .object1 = a, .object2 = b, .kind = k, .collideCallback = cb, .ctx = ctx, .overlapOnly = overlapOnly, .active = 1 };
     return c;
 }
@@ -1351,10 +1362,11 @@ static void run_colliders(void) {
     tree_load();
     if (on) cp_tree += cp_now() - t0;
     for (int i = 0; i < n_colliders; i++)
-        if (colliders[i].active) {
+        if (colliders[i]->active) {
+            Collider *c = colliders[i];
             double t = on ? cp_now() : 0;
-            collider_update(&colliders[i]);
-            if (on && i < 64) cp_t[i] += cp_now() - t, cp_na[i] = colliders[i].object1 ? colliders[i].object1->n : 0, cp_nb[i] = colliders[i].object2 ? colliders[i].object2->n : 0;
+            collider_update(c);
+            if (on && i < 64) cp_t[i] += cp_now() - t, cp_na[i] = c->object1 ? c->object1->n : 0, cp_nb[i] = c->object2 ? c->object2->n : 0;
         }
     if (on && ++cp_n == 600) {
 #ifdef __vita__
@@ -1364,7 +1376,7 @@ static void run_colliders(void) {
         FILE *o = stderr;
 #endif
         fprintf(o, "COLPROF tree %.3f ms/chiamata\n", cp_tree / cp_n);
-        for (int i = 0; i < n_colliders && i < 64; i++) if (cp_t[i] / cp_n > 0.002) fprintf(o, "COLPROF #%d kind %d %dx%d %.3f ms/chiamata\n", i, colliders[i].kind, cp_na[i], cp_nb[i], cp_t[i] / cp_n);
+        for (int i = 0; i < n_colliders && i < 64; i++) if (cp_t[i] / cp_n > 0.002) fprintf(o, "COLPROF #%d kind %d %dx%d %.3f ms/chiamata\n", i, colliders[i]->kind, cp_na[i], cp_nb[i], cp_t[i] / cp_n);
         if (o != stderr) fclose(o);
         memset(cp_t, 0, sizeof(cp_t)), cp_tree = 0, cp_n = 0;
     }
@@ -1478,7 +1490,7 @@ void scene_render_one(Sprite *s, Shader fill) {
     float sx = fabsf(s->scaleX), sy = fabsf(s->scaleY);
     float cx = s->scrollFactor0 ? 0 : camera_scrollX, cy = s->scrollFactor0 ? 0 : camera_scrollY;
     Rectangle dst = { roundf(s->x - cx), roundf(s->y - cy), f->w * sx, f->h * sy };
-    Color c = { (s->tint >> 16) & 255, (s->tint >> 8) & 255, s->tint & 255, (unsigned char)(255 * s->alpha) };
+    Color c = { (s->tint >> 16) & 255, (s->tint >> 8) & 255, s->tint & 255, (unsigned char)(255 * fminf(1, fmaxf(0, s->alpha))) };  // Phaser: setAlpha limita a 0..1
     // tintFill: lo shader di riempimento riconosce u >= 2 (u + 4) e riempie col colore. Dentro scene_render lo shader
     // resta attivo per tutta la lista: cambiarlo per ogni sprite svuotava il batch due volte, e su vitaGL ogni svuotamento
     // copia l'intero VBO in memoria nuova (quad bianchi e lampi neri con molti nemici colpiti insieme)
@@ -1650,6 +1662,16 @@ static void manager_preUpdate(ParticleManager *m, float delta) {
             if (e->c.hasTintEnd) p->tint = (unsigned)(e->c.tint + ((double)e->c.tintEnd - e->c.tint) * t);
             if (m->hasWell) {  // GravityWell.update (processors)
                 float dx = m->wellX - p->x, dy = m->wellY - p->y, dSq = dx * dx + dy * dy;
+                if (dSq != 0) {
+                    float d = sqrtf(dSq);
+                    if (dSq < m->wellEpsilon) dSq = m->wellEpsilon;
+                    float f = m->wellPower * delta / (dSq * d) * 100;
+                    p->vx += dx * f;
+                    p->vy += dy * f;
+                }
+            }
+            if (m->hasWell2) {
+                float dx = m->well2X - p->x, dy = m->well2Y - p->y, dSq = dx * dx + dy * dy;
                 if (dSq != 0) {
                     float d = sqrtf(dSq);
                     if (dSq < m->wellEpsilon) dSq = m->wellEpsilon;

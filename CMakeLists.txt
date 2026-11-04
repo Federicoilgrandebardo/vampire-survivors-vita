@@ -11,7 +11,8 @@ include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "Vampire Survivors")
 set(VITA_TITLEID  "VSPH00001")
-set(VITA_VERSION  "00.90")
+set(VITA_VERSION  "01.00")
+set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O3 -fno-lto")
 
@@ -26,7 +27,7 @@ target_link_libraries(${PROJECT_NAME}
     SceAudio_stub SceAudioIn_stub SceAvPlayer_stub SceSysmodule_stub SceGxm_stub SceCommonDialog_stub
     SceIme_stub SceAppMgr_stub SceAppUtil_stub SceFiber_stub ScePower_stub SceHid_stub
     ScePvf_stub ScePgf_stub SceIofilemgr_stub SceProcessmgr_stub SceRtc_stub SceFios2_stub
-    SceVshBridge_stub ScePromoterUtil_stub SceKernelDmacMgr_stub SceNet_stub SceNetCtl_stub
+    SceVshBridge_stub ScePromoterUtil_stub SceKernelDmacMgr_stub SceNet_stub SceNpTrophy_stub SceNetCtl_stub
     m pthread stdc++ z
 )
 
@@ -36,6 +37,8 @@ vita_create_self(eboot.bin ${PROJECT_NAME} UNSAFE)
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
     VERSION ${VITA_VERSION}
     NAME ${VITA_APP_NAME}
+    FILE sce_sys/trophy/VSPH00001_00/TROPHY.TRP  sce_sys/trophy/VSPH00001_00/TROPHY.TRP
+    FILE sce_sys/trophy/VSPH00001_01/TROPHY.TRP  sce_sys/trophy/VSPH00001_01/TROPHY.TRP
     FILE sce_sys/icon0.png                       sce_sys/icon0.png
     FILE sce_sys/pic0.png                        sce_sys/pic0.png
     FILE sce_sys/livearea/contents/bg.png        sce_sys/livearea/contents/bg.png

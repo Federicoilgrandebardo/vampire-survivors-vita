@@ -97,7 +97,19 @@ def steam_libraries(root):
 
 
 def renderer_dir(game):
-    return Path(game) / "resources" / "app" / ".webpack" / "renderer"
+    """The game's web files: resources/ on Windows and Linux, inside the .app on a native Mac install."""
+    game = Path(game)
+    for base in [game / "resources", *sorted(game.glob("*.app/Contents/Resources"))]:
+        r = base / "app" / ".webpack" / "renderer"
+        if r.is_dir():
+            return r
+    return game / "resources" / "app" / ".webpack" / "renderer"
+
+
+def game_folder(path):
+    """The install folder for a path the user typed or chose; on a Mac they may pick the .app itself."""
+    p = Path(path).expanduser()
+    return p.parent if p.suffix == ".app" else p
 
 
 def game_kind(game):
@@ -151,6 +163,34 @@ def extract_tables(game, out, log=print):
     log("  data tables: %d files" % len(res["files"]))
 
 
+DLC_TABLES = {"weapon_data": "weapons", "character_data": "characters", "stage_data": "stages", "enemy_data": "enemies",
+              "secret_data": "secrets", "achievement_data": "achievements", "music_data": "music",
+              "limitbreak_data": "weapons_limitbreak"}
+
+
+def merge_dlc(game, out, log=print):
+    """What the game's DLCLoader does at start-up: for each DLC folder, tables merged with the base entries winning, files copied."""
+    game, out, dlcs = Path(game), Path(out), []
+    for manifest in sorted(game.glob("*/manifest.json")):
+        root, m = manifest.parent, json.loads(manifest.read_text(encoding="utf-8"))
+        if not m.get("dlc_type"):
+            continue
+        for field, table in DLC_TABLES.items():
+            path = out / "data" / (table + ".json")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for entry in m.get(field, []):
+                add = json.loads((root / entry["path"].replace(".js", ".json")).read_text(encoding="utf-8"))
+                for k, v in add.items():
+                    data.setdefault(k, v)
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8", newline="\n")
+        for d in ("img", "sfx", "tilesets"):
+            if (root / "assets" / d).is_dir():
+                shutil.copytree(root / "assets" / d, out / d, dirs_exist_ok=True)
+        dlcs.append(m["dlc_type"])
+    (out / "data" / "dlc.json").write_text(json.dumps(dlcs), encoding="utf-8", newline="\n")
+    log("  DLC: %s" % (", ".join(dlcs) or "none"))
+
+
 def encode_videos(game, out, log=print):
     import imageio_ffmpeg
     ff = imageio_ffmpeg.get_ffmpeg_exe()
@@ -179,6 +219,7 @@ def prepare(game, out, log=print):
         shutil.rmtree(out / d, ignore_errors=True)
         shutil.copytree(assets / d, out / d)
     log("  images, tilesets, sounds, fonts and translations copied")
+    merge_dlc(game, out, log)
     encode_videos(game, out / "video", log)
 
 
@@ -366,17 +407,23 @@ def run_gui():
     ttk.Label(frm, text="1.  Your copy of Vampire Survivors", font=bold).grid(row=0, column=0, columnspan=3, sticky="w")
     game = tk.StringVar()
     game_note = tk.StringVar()
-    ttk.Label(frm, textvariable=game, width=62).grid(row=1, column=0, columnspan=2, sticky="w", padx=(18, 0), pady=(4, 0))
+    box = ttk.Combobox(frm, textvariable=game, width=60)
+    box.grid(row=1, column=0, columnspan=2, sticky="we", padx=(18, 8), pady=(4, 0))
     ttk.Label(frm, textvariable=game_note, foreground="#555", wraplength=520, justify="left").grid(
         row=2, column=0, columnspan=3, sticky="w", padx=(18, 0))
 
-    def show_game(path):
-        game.set(str(path) if path else "Not found automatically.")
-        kind = game_kind(path) if path else None
+    def note_game(*_):
+        text = game.get().strip()
+        kind = game_kind(game_folder(text)) if text else None
         game_note.set({"phaser": "Recognised: Phaser build (old-engine).", "unity": BRANCH_HELP}.get(
-            kind, "Choose the game folder (the one with resources/ inside)."))
+            kind, "Not found: type the path or press Choose, and pick the Vampire Survivors folder."))
 
+    def show_game(path):
+        game.set(str(path) if path else "")
+
+    game.trace_add("write", note_game)
     games = find_games()
+    box["values"] = [str(g) for g, _ in games]
     best = next((g for g, k in games if k == "phaser"), games[0][0] if games else None)
     show_game(best)
 
@@ -443,7 +490,7 @@ def run_gui():
                 sink.close()
 
     def start():
-        g = Path(game.get())
+        g = game_folder(game.get().strip())
         if game_kind(g) != "phaser":
             messagebox.showerror("Vampire Survivors", game_note.get())
             return

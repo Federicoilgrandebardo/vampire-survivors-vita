@@ -72,6 +72,8 @@ void Lang_init(void);                 // Lang.init: lingua salvata, del sistema 
 void Lang_setLangCode(const char *code);
 const char *Lang_getLangCode(void);
 void vs_load_font(void);              // vs_font per la lingua corrente (ANY, KO e gli ideogrammi della console)
+void Trophies_sync(void);
+void vs_delete_all_and_exit(void);  // cancella la cartella dei dati e chiude il gioco
 void vs_reload(void);                // window.location.reload: il gioco riparte da capo
 const char *Lang_codeAt(int i);       // langKeys.json, NULL oltre la fine
 const char *Lang_native(const char *code);

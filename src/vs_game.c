@@ -15,6 +15,8 @@
 #include "rlgl.h"
 
 // Tutto cio' che la partita alloca passa da gmem e si libera a game_start (cache e risorse raylib escluse)
+#include "saveimport.h"
+#include "trophies.h"
 #define calloc gmem_calloc
 #define realloc gmem_realloc
 #define malloc(s) gmem_realloc(NULL, s)
@@ -159,8 +161,16 @@ struct Player {  // 0x869f
     int noHurt;  // plsNoHurt (Tatanka): particelle bianche e morte a fantasma
     int cantRetaliate;  // Scorej: !canRetaliate (parte vero)
     int isMorphed;      // Cavallo / Mortaccio dal livello 80 con la loro reliquia
+    // Menya (0x15a3e), MegaMenya (0x2eb8), Syuuto (0xbc52), Onna (0x548e)
+    float MightBonus, MoveBonus, CooldownBonus, CurseBonus, EnemiesTS;
+    int MorphedTimes, finalMorphedTimes, hasSecondAnim, firingIndex, megaDead;
+    const void *lastAnimFrame, *onnaFrames[6];
     Animation walk2;
     Sprite head;        // Mortaccio: la testa dello scheletro gigante
+    float armorBonus, armorTime, ElapsedGFBonusTime;  // Maruto (0x2470), Luminaire (0xb1f1)
+    int timesRevived, hasBonus;
+    Animation meleeA;  // meleeA o rangedA, dipende dal personaggio (Foscari)
+    int hasMeleeA, hasRangedA;
     int isDead, level, isAnimForced, canFlipX, flipper, HasWalkingAnimation, _invul, IsSlow, receivingDamage,
         isLastBreathEnabled, hasLastBreath, maxHistory, historyIndex;
     Vector2 lastFacedDirection, posHistory[0x12d];  // SetMaxHistory: 3 di solito, 300 oltre il bordo di Green Acres
@@ -218,7 +228,7 @@ struct Enemy {  // 0x1166a
     const Frame *defaultName;
     unsigned saveTint;
     Animation die, idle;
-    Timer _blinkTimeout, FreezeTimer, divineBloodlineDamageTimer;
+    Timer _blinkTimeout, FreezeTimer, divineBloodlineDamageTimer, shieldTimer;
     int canBeDamagedByBloodline;
     // EnemySkill.SelfDestruct: vicino al giocatore lampeggia (alertSprite) e dopo 2 s esplode (Core.MakeExplosion(moreX, moreY))
     int SelfDestruct, isSelfDestructionTriggered;
@@ -296,6 +306,34 @@ struct Weapon {  // 0xe49a
     float lastReceivedDamage, invRadius;
     int canPlayInversionVFX;
     Sprite inverse;
+    TweenRef ringTween, ringTween2;  // W_MirageRobe: l'anello (in image)
+    int hasRingTween, hasRingTween2;
+    const float *fireAngles;  // W_NightSword (0x1368): spade in sequenza, la sesta di chiusura solo con canFinish
+    int retaliationOnly;
+    float retaliationDelay;
+    Sprite orbs[24];  // W_Bocce (0x113e4): sfera a schermo (image) e otto sfere che orbitano; W_FourSeasons (8), W_FourSeasons2 (24)
+    int nOrbs, canSpin;
+    float orbAngles[25], orbMul[9], bocceTint;
+    // W_Spellstring / W_Spellstream / W_Spellstrike / W_Spellstrom (0x142c3, 0x7d8a, 0xc553, 0xe817)
+    // W_Sword / W_Legionnaire, W_FlashArrow / W_Millionaire, W_ShadowServant, W_Prismatic / W_Luminaire, W_Party
+    int firingCounter, canDoFinisher, canRetaliate, retalNext, snakeKind, firstArcana, colorIndex, frontFiring, fireType;
+    BulletPool *retaliationPool, *finisherPool, *legionnairePool;
+    Timer RetaliationTimer, MeleeAnimEvent, RangedAnimEvent;
+    ParticleEmitter *SmokeEmitter;
+    float CoinsQueue, CoinsTime;
+    TweenRef millTween[2];
+    Rectangle lumRect;
+    Vector2 *wellSrc, wellPos[2];  // sources: NULL = il giocatore; Spellstrom le da' i due pozzi
+    int sourceIndex, doingSingularity, singularityTimes, skipEmitUpdate;
+    float spellY, stormRadius, angleValue, singularityTime, stormK;
+    Weapon *Weapon_String, *Weapon_Stream, *Weapon_Strike;
+    ParticleManager *stormPfx;
+    ParticleEmitter *stormE1, *stormE2, *circleE;
+    const char *lbKeys[16];  // accumulatedLimitBreaks: le chiavi, per CopyAccumulatedLimitBreaks
+    int nLbKeys;
+    Vector2 seasonPos[5];  // W_FourSeasons: gli angoli dello schermo
+    const Frame *seasonFrame[5];  // la RenderTexture con l'animazione: qui il fotogramma corrente (frameRef)
+    float seasonClock;
     float recoveredHP, recoveredCalculated, imageScale, innerScale, innerDuration, vfxTime;
     ParticleManager *vortexPfx;
     // W_Pentagram (0x17906) / W_Sire (0x1ed3): simbolo in una RenderTexture spezzata da rexShatterImage
@@ -335,7 +373,7 @@ struct Weapon {  // 0xe49a
     float goldChance;  // W_Grangatti (0xa914)
     const char *SFXARRAY[120];
     int randomIndex, plusMinusIndex, sfxIndex;
-    BulletPool *secondaryPool, *scratchPool, *scufflePool;
+    BulletPool *secondaryPool, *scratchPool, *scufflePool, *redPool;  // redPool: W_SummonNight2
     // W_Lancet (0x16b3a) / W_Corridor (0x7819)
     int ticks;
     Vector2 lancetTargets[12];
@@ -401,6 +439,36 @@ struct Bullet {  // 0xa14d
     unsigned color;
     float save_vel_x, save_vel_y, trailAlpha;
     Sprite trail;
+    // B_SilverWind (0xbd7c): le linee della scia, ognuna sfuma per conto suo
+    struct WindLine *lines;
+    int linesHead, linesN, IsInStartingPosition, canUpdateTrail, hasPrevPos;
+    float fnTime, linesClock;
+    Vector2 prevPos;
+    // B_MirageRobe (0x5246)
+    float mirageHits;
+    int hasFadeOut;
+    // B_Spellstring (0x91a5), B_Spellstream (0x15475), B_Spellstrike (0x4990)
+    int updateLoops, expired;
+    float angleLerp, deceleration;
+    Vector2 startingPoint;
+    // B_Sword, B_ShadowServant, B_PrismaticMissile, B_Party
+    float detuneMul, selfGravity, bounceValue, clearObjectTime, angleIncrement;
+    int canClearObjectsHit, hasHitFirstEnemy, isExploding;
+    ParticleEmitter *pfxEmitterB;
+    struct PartyData *party;
+    // B_FourSeasons (0xcc71) / B_FourSeasons2 (0x9a27)
+    Sprite kanji, lightning;
+    ParticleManager *SeasonPfx[5];
+    ParticleEmitter *SeasonEmit[5];
+    int season;
+    TweenRef fsTween[6];
+    float kanjiTint, lightningTint;
+    // B_SummonNight (0x14b69) / B_SummonNight2 (0x87c2)
+    ParticleManager *PfxBack;
+    Sprite fang;
+    TweenRef fangTween, fangTweenOut;
+    int hasFangTween, hasFangTweenOut;
+    float reach;
     // B_Lightning (0xce4a): RibbonTrail orizzontale di 16 punti (Lightning3.png) e il lampo a terra
     Vector2 ropePts[32];
     Sprite flash, flash2;  // B_Loop: graphics e graphics2
@@ -523,6 +591,7 @@ struct Pickup {  // 0x166d5 (+ sottoclassi: 0x50ae Gem, 0x8af Treasure)
     Sprite s;
     float DEFAULT_SPEED, radius, speed, time, value, feverMS;
     int goToPlayer, isStationary, disableGet, isCullable, isTeleportOnCull, isGem;
+    int quiet;  // Silver Wind: volume 0.1 invece di 0.35; come nell'originale resta nel pool
     const char *itemType, *frameName;
     Vector2 currentDirection;
     TweenRef vacuumTween;
@@ -624,6 +693,9 @@ typedef struct FancyBG {
     int (*HasMovingBG)(void);       // hasMovingBG: la levetta dello sfondo in movimento nelle opzioni della pausa
     void (*DisableMovingBackground)(void);
 } FancyBG;
+static int HasHardBounds;  // MainScene.HasHardBounds; RemoveHardBounds = azzerarlo a inizio partita
+static Rectangle HardBounds;  // width e height sono i massimi, non le misure (sic)
+static void Core_SetHardBounds(float x, float y, float w, float h) { HardBounds = (Rectangle){ x, y, w, h }, HasHardBounds = 1; }
 static int FB_disableMovingBG;  // fancyBG.disableMovingBG
 
 static struct {  // 0x5103: Core
@@ -691,7 +763,13 @@ static const struct { const char *key, *file; } SOUND_FILES[] = {
     { "TheEndMain", "bgm_TheEndMain.ogg" }, { "TheEndIndeed", "bgm_proooot.ogg" }, { "BGM_Spoopy", "bgm_elrond_spoopy.ogg" },
     { "BGM_Flame", "bgm_elrond_flame.ogg" }, { "BGM_Bridge", "bgm_elrond_bridge.ogg" }, { "BGM_Foscari_KAZ", "bgm_elrond_foscariK.ogg" },
     { "BGM_Magic_KAZ", "bgm_elrond_magicK.ogg" }, { "BGM_War_KAZ", "bgm_elrond_warK.ogg" },
-    { "BGM_Deception_KAZ", "bgm_elrond_deceptionK.ogg" }, { "ClickIn", "sfx_sounds_pause7_in.ogg" },
+    { "BGM_Deception_KAZ", "bgm_elrond_deceptionK.ogg" },
+    { "BMG_Moonspell", "bgm_moonspell_theme.ogg" }, { "BGM_Silver", "bgm_elrond_miang.ogg" }, { "BGM_FourSeasons", "bgm_elrond_kachara.ogg" },  // manifest dei DLC
+    { "BGM_Night1", "bgm_elrond_night1.ogg" }, { "BGM_Night2", "bgm_elrond_night2.ogg" }, { "BGM_Mirage", "bgm_elrond_mirage.ogg" },
+    { "BGM_Foscari", "bgm_elrond_foscari.ogg" }, { "BGM_Foscari2", "bgm_elrond_foscari2.ogg" }, { "BGM_Magic", "bgm_elrond_magic.ogg" },
+    { "BGM_War", "bgm_elrond_war.ogg" }, { "BGM_Deception", "bgm_elrond_deception.ogg" }, { "BGM_Genevieve", "bgm_elrond_genevieve.ogg" },
+    { "BGM_Luminaire", "bgm_elrond_luminaire.ogg" }, { "BGM_HB", "bgm_elrond_hb.ogg" },
+    { "ClickIn", "sfx_sounds_pause7_in.ogg" },
     { "ClickOut", "sfx_sounds_pause7_out.ogg" }, { "MagicMissile", "sfx_projectile_magic.ogg" }, { "Whip", "sfx_sounds_impact15_2.ogg" },
     { "Shot", "sfx_projectile.ogg" }, { "Lightning", "sfx_lightningimpact.ogg" }, { "Lightning2", "sfx_lightningimpact.ogg" },
     { "Holywater", "sfx_frostimpact.ogg" }, { "Hit", "sfx_enemyHit.ogg" }, { "LittleHit", "sfx_digit.ogg" },
@@ -967,6 +1045,11 @@ static void arr_sort_uniq(const char *k) {  // this.X = this.X.sort().filter((v,
 
 static void AchievementManager_RestoreAchievementUnlocks(void);
 
+static int DLC_Has(const char *d) {  // 0x1679c: data/dlc.json scritto dal tool (DLC.Register). Senza DLC le sue voci mancano dai dati
+    cJSON *v;
+    cJSON_ArrayForEach(v, data_get("dlc")) if (!strcmp(v->valuestring, d)) return 1;
+    return 0;
+}
 static void PlayerOptions_apply(void) {
     cJSON *t, *v;
     char b[16];
@@ -981,6 +1064,8 @@ static void PlayerOptions_apply(void) {
     cJSON_ArrayForEach(v, po("UnlockedCharacters")) if ((t = tbl0("characters", key_of(v, b)))) obj_set(t, "hidden", cJSON_CreateFalse());
     cJSON_ArrayForEach(v, po("UnlockedStages")) if ((t = tbl0("stages", key_of(v, b)))) obj_set(t, "unlocked", cJSON_CreateTrue()), obj_set(t, "hidden", cJSON_CreateFalse());
     if (!po_has("UnlockedStages", "FOREST")) po_push("UnlockedStages", "FOREST");
+    if (DLC_Has("Moonspell") && !po_has("UnlockedStages", "MOONSPELL")) po_push("UnlockedStages", "MOONSPELL");  // loadComplete 0x1559b
+    if (DLC_Has("Foscari") && !po_has("UnlockedStages", "FOSCARI")) po_push("UnlockedStages", "FOSCARI");
     arr_sort_uniq("UnlockedStages");
     cJSON_ArrayForEach(v, po("UnlockedHypers")) if ((t = tbl0("stages", key_of(v, b)))) obj_set(cJSON_GetObjectItem(t, "hyper"), "unlocked", cJSON_CreateTrue());
     arr_sort_uniq("UnlockedHypers");
@@ -1041,6 +1126,9 @@ static void SaveSystem_ApplyLoadedSave(const char *txt) {
     cJSON *j = cJSON_Parse(txt), *v;
     cJSON_ArrayForEach(v, j) if (po(v->string)) po_put(v->string, cJSON_Duplicate(v, 1));
     cJSON_Delete(j);
+    // Vita: un salvataggio della versione attuale puo' avere selezionato cio' che qui non esiste (DLC, stage nuovi)
+    if (!tbl0("characters", cJSON_GetStringValue(po("SelectedCharacter")))) po_sets("SelectedCharacter", "ANTONIO");
+    if (!cJSON_GetObjectItem(data_get("stages"), cJSON_GetStringValue(po("SelectedStage")))) po_sets("SelectedStage", "FOREST");
     PlayerOptions_apply();
 }
 enum { SAVE_DEFAULT, SAVE_BACKUP, SAVE_STASH };
@@ -1061,6 +1149,10 @@ static int SaveSystem_LoadType(int type) {  // Load / LoadBackup: restituisce se
     if (s && SaveSystem_IsChecksumValid(s)) SaveSystem_ApplyLoadedSave(s);
     vs_free(s);
     return s != NULL;
+}
+void Trophies_sync(void) {  // achievement gia' ottenuti, anche da un salvataggio importato
+    cJSON *a;
+    cJSON_ArrayForEach(a, data_get("achievements")) if (cJSON_IsTrue(cJSON_GetObjectItem(a, "achieved"))) trophies_unlock(a->string);
 }
 static void SaveSystem_RestoreBackup(void) {  // LoadBackup, Save, window.location.reload
     SaveSystem_LoadType(SAVE_BACKUP);
@@ -1765,10 +1857,9 @@ static TilingTileset *TilingTileset_new(const char *stageType, float sizeX, floa
         physics_addColliderLayer(&Core.EnemyGroup, walls);
         physics_addColliderLayer(&Core.EnemyGroup, obstacle);
         if (n_CollisionLayers + 3 <= 16) CollisionLayers[n_CollisionLayers++] = walls, CollisionLayers[n_CollisionLayers++] = obstacle, CollisionLayers[n_CollisionLayers++] = playerWall;
-        // tileset.tint (non invertita): c'e' solo in Astral Stair e vale 0xfffffff, cioe' bianco: nessun effetto
-        if (t->inverted) {  // maps[i].layers.forEach(tilemapLayer.forEachTile(tile.tint = inverse.tint || bianco))
+        if (t->inverted || num(ts, "tint", 0)) {  // maps[i].layers.forEach(tilemapLayer.forEachTile(tile.tint = tileset.tint, o inverse.tint || bianco))
             cJSON *inv = cJSON_GetObjectItem(sdata, "inverse");
-            unsigned tint = inv ? (unsigned)num(inv, "tint", 0) : 0xffffff;
+            unsigned tint = !t->inverted ? (unsigned)num(ts, "tint", 0) & 0xffffff : inv ? (unsigned)num(inv, "tint", 0) : 0xffffff;
             TilemapLayer *all[6 + sizeof(c->layers) / sizeof(c->layers[0])] = { walls, playerWall, obstacle, shadows, c->ShadowDecalsLayer, c->SpawnerLayer };
             int na = 6;
             for (int k = 0; k < c->n; k++) all[na++] = c->layers[k];
@@ -1853,11 +1944,13 @@ static void Arcanas_TriggerAstronomia(Weapon *w);
 static void Arcanas_TriggerGemCannon(float value, const Frame *frame);
 static int Arcanas_has(int t) { return t >= 0 && t < 22 && Arcanas.active[t]; }  // ActiveArcanas.indexOf(t) > -1
 static float Player_PCurse(Player *p) { return p->curse * Arcanas.wickedSeason.curse; }
+static void Foscari_dev(void *ctx);
+static void Foscari_MakeLevelOne(Player *p), Foscari_LevelUp(Player *p), Foscari_Update(Player *p, float delta), Foscari_OnLastBreath(Player *p), Foscari_AfterFullInit(Player *p), Lum_Revive(Player *p);
 static float Player_PGrowth(Player *p) { return p->growth * Arcanas.wickedSeason.growth; }
 static float Player_PLuck(Player *p) { return p->luck * Arcanas.wickedSeason.luck; }
 static float Player_PGreed(Player *p) { return p->greed * Arcanas.wickedSeason.greed; }
 static int Player_is(Player *p, const char *t);
-static float Player_PArmor(Player *p) { return Player_is(p, "PANINI") ? p->armor : fminf(0x32, p->armor); }  // 0x8ad5: senza tetto
+static float Player_PArmor(Player *p) { return Player_is(p, "PANINI") ? p->armor : fminf(0x32, p->armor + (Player_is(p, "VICTOR") ? p->armorBonus : 0)); }  // 0x8ad5: senza tetto
 
 static void Player_setIsInvul(Player *p, int v) {
     if (p->_invul != v) {
@@ -1879,6 +1972,7 @@ static void Player_OnGetDamaged_base(Player *p, unsigned tint, float dur, int sh
 static void Scorej_canRetaliate(void *ctx);
 static void Weapon_Fire(Weapon *w);
 static void Player_OnGetDamaged(Player *p, unsigned tint, float dur, int showPfx) {
+    if (Player_is(p, "VICTOR") && !p->receivingDamage) p->armorBonus += 1, p->armorTime = fmaxf(0, p->armorTime - 0x3e8);  // 0x2470: AddArmor dopo super
     if (Player_is(p, "SIGMA")) {  // 0xa802: niente lampo di colore; scintille dal petto, senza pavimento nuovo
         if (p->receivingDamage) return;
         p->_blinkTimeout = time_addEvent(dur, 0, 0, Player_blinkEnd, p);
@@ -1957,8 +2051,19 @@ static void Sigma_OnDeath(Player *p) {  // 0xa802: si allarga, poi una colonna d
     time_addEvent(0x2ee, 0, 0, Player_pfxStop, p);
     time_addEvent(0x4e2, 0, 0, SceneManager_AfterDeath, NULL);
 }
+static void MegaMenya_victory(void *ctx) { (void)ctx; Sound_PlaySound("Victory2", 2, 1, 0, 0, 0); }
 static void Player_OnDeath(Player *p) {
     if (Player_is(p, "SIGMA")) { Sigma_OnDeath(p); return; }
+    if (Player_is(p, "MEGAMENYA")) {  // 0x2eb8: si comprime e scoppia in verticale
+        time_removeEvent(p->_blinkTimeout);
+        tween_pause(p->wiggleTween);
+        sprite_setTintFill(&p->s, 0xbbffff);
+        tweens_add((TweenConfig){ .props = { { &p->s.scaleX, NULL, 2 }, { &p->s.scaleY, NULL, 0.5f } }, .nprops = 2, .duration = 0x2ee });
+        tweens_add((TweenConfig){ .props = { { &p->s.scaleX, NULL, 0 }, { &p->s.scaleY, NULL, 8 } }, .nprops = 2, .duration = 0x64, .delay = 0x2ee });
+        time_addEvent(0x2ee, 0, 0, MegaMenya_victory, NULL);
+        time_addEvent(0x4e2, 0, 0, SceneManager_AfterDeath, NULL);
+        return;
+    }
     Player_PlayDeadAnimation(p);
     time_addEvent(0xfa, 0, 0, Player_pfxStop, p);
     time_addEvent(0x4e2, 0, 0, SceneManager_AfterDeath, NULL);
@@ -1986,6 +2091,7 @@ static void PlayerEvents_emit(int ev) {
     for (int i = 0; i < n_PlayerEvents[ev]; i++) PlayerEvents[ev][i].fn(PlayerEvents[ev][i].ctx);
 }
 static int Player_GetDamaged(Player *p, float amount) {
+    if (Player_is(p, "MEGAMENYA")) Player_setIsInvul(p, 1);  // 0x2eb8: IsInvul prima di super
     if (getenv("VS_GOD")) return 0;  // sviluppo: il giocatore non prende danno
     if (p->receivingDamage) return 0;
     if (p->_invul) return 0;
@@ -1998,7 +2104,7 @@ static int Player_GetDamaged(Player *p, float amount) {
     if (p->armor > 0 && (amount -= p->armor) < 1) amount = 1;
     p->hp -= amount;
     if (p->hp <= 0) {
-        if (p->isLastBreathEnabled && p->hasLastBreath) { p->hp = 0; p->hasLastBreath = 0; }
+        if (p->isLastBreathEnabled && p->hasLastBreath) { p->hp = 0; p->hasLastBreath = 0; Foscari_OnLastBreath(p); }
         else { p->hp = 0; Player_Die(p); }  // Core.GameOver(): vuoto
     } else {
         Player_OnGetDamaged(p, 0xff0000, 0x78, 1);
@@ -2012,6 +2118,17 @@ static void Core_ShowDamageAt(float x, float y, float amount);
 static void Core_ShowRecoveryAt(float x, float y, float amount);
 static void Player_RecoverHp(Player *p, float v, int show, int regenScale) {
     if (p->isDead) return;
+    if (Player_is(p, "MIANG")) {  // 0x13111: la Ripresa moltiplica ogni cura; oltre il massimo sale il massimo
+        v *= 1 + p->regen;
+        if (Arcanas_has(6)) v *= 2, Arcanas_TriggerSarabande(v);
+        if (p->onHPRecovery) p->onHPRecovery->recoveredHP += v;
+        p->hp += v;
+        if (p->hp > p->maxHp) p->hp = p->maxHp, p->maxHp += 0.2f;
+        PlayerUI_Update();
+        if (v < 0x2328) PlayerOptions_AddHeal(v);
+        if (show) Core_ShowRecoveryAt(Core.Player->s.x, Core.Player->s.y, v);
+        return;
+    }
     v *= regenScale ? 1 + p->regen : 1;
     if (Arcanas_has(6)) v *= 2, Arcanas_TriggerSarabande(v);  // Sarabande of Healing: cura doppia e anello che ferisce
     float h = fminf(p->maxHp - p->hp, v);
@@ -2182,6 +2299,120 @@ static void Mortaccio_Morph(Player *p) {
     p->amount += 1, p->armor += 2, p->maxHp += 0x64, p->hp = p->maxHp;
 }
 // MARIA/TATANKA (0x17995): skin di Halloween solo con IsHalloween (Spell segreta); TATANKA nel Core: onCaneOverlapsEnemy scarta i nemici isStatic (nessuno nella Foresta)
+// --- DLC Moonspell: Menya, Syuuto, Onna, MegaMenya ------------------------------------------------------------------
+static void Core_RosaryDamageEx(int vfx);
+static Weapon *Core_AddHiddenWeapon(const char *type);
+static void Core_RemoveHiddenWeapon(const char *type);
+static Weapon *Core_GetHiddenWeapon(const char *type);
+static void W_NightSword_SetAsRetaliatoryOnly(Weapon *w);
+static void Weapon_LevelUpNow(Weapon *w);
+static void Player_MakeWalk2(Player *p, const char *character) {  // generateFrameNames coi dati del personaggio morfato + anims.create('walk2')
+    cJSON *d = tbl0("characters", character);
+    if (p->hasSecondAnim || !d) return;
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "%s", str(d, "spriteName"));
+    char *e = strstr(prefix, "01.png");
+    if (e) *e = 0;
+    sprite_setFrame(&p->s, frame_get(str(d, "textureName"), str(d, "spriteName")));
+    make_anim(&p->walk2, str(d, "textureName"), prefix, 1, (int)num(d, "walkingFrames", 0), 2, num(d, "walkFrameRate", 0) ? num(d, "walkFrameRate", 0) : 8, -1);
+    p->hasSecondAnim = 1;
+}
+static void Menya_CalculateTreshold(Player *p) {
+    static const int T[8] = { 0x1f4, 0x3e8, 0x7d0, 0xbb8, 0x1388, 0x1b58, 0x2710, 0x3a98 };
+    if (p->MorphedTimes >= 8) p->EnemiesTS = p->finalMorphedTimes * 0x2710, p->finalMorphedTimes++;
+    else p->EnemiesTS = T[p->MorphedTimes];
+}
+static void Menya_Unmorph(void *ctx) {
+    Player *p = ctx;
+    p->cooldown -= p->CooldownBonus, p->moveSpeed -= p->MoveBonus, p->power -= p->MightBonus, p->curse -= p->CurseBonus;
+    anims_play(&p->s, &p->walk, 0);
+    p->isMorphed = 0;
+    Core_RemoveHiddenWeapon("BOCCE");
+}
+static void Menya_Morph(Player *p) {
+    if (p->isMorphed) return;
+    Sound_PlaySound("Morph", 1, 0.5f, 0, 0x7d0, 1);
+    Sound_PlaySound("Rosary", 1.5f, 1, 0, 0x7d0, 1);
+    MorphVFX_PlaySparkle();
+    Core_RosaryDamageEx(0);
+    Core_AddHiddenWeapon("BOCCE");
+    p->isMorphed = 1;
+    p->MorphedTimes++;
+    Menya_CalculateTreshold(p);
+    Player_MakeWalk2(p, "MEGAMENYA");
+    anims_play(&p->s, &p->walk2, 0);
+    p->CooldownBonus = -0.2f, p->MoveBonus = fmaxf(0, 2 - p->moveSpeed), p->MightBonus = 2, p->CurseBonus = 0.5f;
+    p->cooldown += p->CooldownBonus, p->moveSpeed += p->MoveBonus, p->power += p->MightBonus, p->curse += p->CurseBonus;
+    Player_SetInvulForMilliSeconds(p, 0x7530);
+    p->s.tintFill = 0, p->s.tint = 0xffffff;  // restoreTint
+    time_addEvent(0x7530, 0, 0, Menya_Unmorph, p);
+}
+static void Syuuto_Morph(Player *p) {
+    if (p->isMorphed) return;
+    Sound_PlaySound("Morph", 1, 0.5f, 0, 0x7d0, 1);
+    Sound_PlaySound("Bangu", 1, 1, 0, 0x7d0, 1);
+    p->isMorphed = 1;
+    MorphVFX_PlaySparkle();
+    int i;
+    for (i = 0; i < p->n_onEveryLevelUp; i++) if (!strcmp(p->onEveryLevelUp[i].k, "power")) break;
+    if (i < p->n_onEveryLevelUp) p->onEveryLevelUp[i].v += 0.01f;
+    else if (p->n_onEveryLevelUp < 24) p->onEveryLevelUp[p->n_onEveryLevelUp].k = "power", p->onEveryLevelUp[p->n_onEveryLevelUp++].v = 0.01f;
+    Player_MakeWalk2(p, "MEGASYUUTO");
+    anims_play(&p->s, &p->walk2, 0);
+    p->armor += 2, p->area += 0.3f, p->speed += 0.3f, p->moveSpeed += 0.4f, p->maxHp += 0x64;
+    Player_SetInvulForMilliSeconds(p, 0x64);
+}
+static void Character_LevelHiddenWeapon(Player *p, const char *type) {  // un livello dell'arma nascosta ogni dieci del personaggio, fino all'ottavo
+    Weapon *w = Core_GetHiddenWeapon(type);
+    if (w && w->level < (int)floorf(p->level / 10.0f) && w->level < 8) Weapon_LevelUpNow(w);
+}
+static struct { Sprite spark, ring; float x, y; TweenRef ringTween, sparkTween; } OnnaVfx;
+static void Onna_follow(void *ctx) {
+    Player *p = ctx;
+    OnnaVfx.spark.x = OnnaVfx.ring.x = p->s.x, OnnaVfx.spark.y = OnnaVfx.ring.y = p->s.y - 0x14;
+}
+static void Onna_done(void *ctx) { (void)ctx; OnnaVfx.ring.alpha = OnnaVfx.spark.alpha = 0; }
+static void Onna_MakeLevelOne(Player *p) {
+    for (int i = 0; i < 6; i++) p->onnaFrames[i] = frame_get("moonspellChars", TextFormat("onna_%02d.png", 3 * (i + 1)));
+    sprite_init(&OnnaVfx.spark, frame_get("vfx", "blurredSharpStar.png"), p->s.x, p->s.y), OnnaVfx.spark.alpha = 0, sprite_setScale(&OnnaVfx.spark, 0), OnnaVfx.spark.blendAdd = 1, OnnaVfx.spark.depth = -1;
+    sprite_init(&OnnaVfx.ring, frame_get("vfx", "sPFX_ring_64.png"), p->s.x, p->s.y), OnnaVfx.ring.alpha = 0, sprite_setScale(&OnnaVfx.ring, 0), OnnaVfx.ring.blendAdd = 1, OnnaVfx.ring.depth = -1;
+    children_add(&OnnaVfx.spark), children_add(&OnnaVfx.ring);
+    OnnaVfx.ringTween = OnnaVfx.sparkTween = (TweenRef){ -1, 0 };
+}
+static void Onna_FireWeapons(Player *p) {  // le armi sparano solo sui passi dell'animazione, una alla volta
+    Weapon *list[16];
+    int n = 0;
+    for (int i = 0; i < Core.n_weapons; i++) if (!Core.Weapons[i]->isPowerUp) list[n++] = Core.Weapons[i];
+    for (int i = 0; i < n; i++) time_removeEvent(list[i]->firingTimer);  // RemoveFiringTimer
+    if (++p->firingIndex >= n) p->firingIndex = 0;
+    if (n) Weapon_Fire(list[p->firingIndex]);
+    tween_stop(OnnaVfx.ringTween);
+    sprite_setScale(&OnnaVfx.ring, 0), OnnaVfx.ring.alpha = 1;
+    OnnaVfx.ringTween = tweens_add((TweenConfig){ .props = { { &OnnaVfx.ring.scaleX, &OnnaVfx.ring.scaleY, 1.5f }, { &OnnaVfx.ring.alpha, NULL, 0.1f } }, .nprops = 2, .duration = 0xfa, .ease = Ease_SineInOut });
+    tween_stop(OnnaVfx.sparkTween);
+    sprite_setScale(&OnnaVfx.spark, 0), OnnaVfx.spark.alpha = 1, OnnaVfx.spark.angle = 0;
+    OnnaVfx.sparkTween = tweens_add((TweenConfig){ .props = { { &OnnaVfx.spark.scaleX, &OnnaVfx.spark.scaleY, 2 }, { &OnnaVfx.spark.alpha, NULL, 0.5f }, { &OnnaVfx.spark.angle, NULL, 0xb4 } }, .nprops = 3,
+                                                   .duration = 0xfa, .ease = Ease_SineInOut, .onUpdate = Onna_follow, .onComplete = Onna_done, .ctx = p });
+}
+static void Onna_LevelUp(Player *p) {  // la camminata, e quindi il fuoco, accelera con la velocita'
+    float m = p->moveSpeed, fps = m >= 1.6f ? 9 : m >= 1.5f ? 8 : m >= 1.4f ? 7 : m >= 1.3f ? 6 : m >= 1.2f ? 5 : 4;
+    p->walk.frameRate = fps, p->walk.msPerFrame = 1000 / fps;
+    anims_play(&p->s, &p->walk, 0);
+}
+static void Character_Update(Player *p) {  // Update dopo super delle classi del DLC
+    if (Player_is(p, "MENYA")) {
+        if (Core.kills > p->EnemiesTS || (getenv("VS_MORPH") && !p->MorphedTimes)) Menya_Morph(p);  // RunEnemies; VS_MORPH: sviluppo
+    } else if (Player_is(p, "ONNA")) {
+        const void *f = p->s.frame;  // ANIMATION_UPDATE
+        if (f != p->lastAnimFrame) {
+            p->lastAnimFrame = f;
+            for (int i = 0; i < 6; i++) if (f == p->onnaFrames[i]) Onna_FireWeapons(p);
+        }
+    } else if (Player_is(p, "MEGAMENYA") && !p->megaDead && Core.SurvivedSeconds >= Core.Stage->StageModifiers.TimeLimit) {
+        p->megaDead = 1;  // l'originale la richiama a ogni fotogramma oltre il limite: qui una volta, il risultato e' lo stesso
+        Player_OnDeath(p);
+    }
+}
 static void Player_MakeLevelOne_char(Player *p) {
     if (IsHalloween && (Player_is(p, "MARIA") || Player_is(p, "TATANKA"))) {  // 0x17995: camminata 'h' + nome dello sprite della skin
         cJSON *base = cJSON_GetArrayItem(p->data, 0), *skin = base, *sk;
@@ -2201,9 +2432,24 @@ static void Player_MakeLevelOne_char(Player *p) {
             anims_pause(&p->s);
         }
     }
+    Foscari_MakeLevelOne(p);
     if (Player_is(p, "ARENGIJUS")) Arengijus_MakeLevelOne(p);
     if (Player_is(p, "CAVALLO")) { p->isMorphed = 0, morphVfx.made = 0; if (Collected("RELIC_ROSALIA")) MorphVFX_Make(0); }
     if (Player_is(p, "MORTACCIO")) p->isMorphed = 0, morphVfx.made = 0, MorphVFX_Make(1);
+    if (Player_is(p, "MENYA")) {
+        p->MorphedTimes = 0, p->finalMorphedTimes = 2, p->isMorphed = 0, p->hasSecondAnim = 0;
+        p->MoveBonus = p->MightBonus = p->CooldownBonus = p->CurseBonus = 0;
+        Menya_CalculateTreshold(p);
+        morphVfx.made = 0, MorphVFX_Make(1);
+    }
+    if (Player_is(p, "SYUUTO")) {
+        p->isMorphed = 0, p->hasSecondAnim = 0;
+        morphVfx.made = 0, MorphVFX_Make(1);
+        morphVfx.dark.depth = game_height - 2, morphVfx.burst.depth = game_height - 1;
+        morphVfx.burst.blendAdd = 0, morphVfx.burst.tint = 0x2a002a;  // semplificazione: quattro angoli (0x220000, 0x880000, 0x22, 0x88) reso col colore medio
+    }
+    if (Player_is(p, "ONNA")) Onna_MakeLevelOne(p);
+    p->megaDead = 0;
     if (Player_is(p, "PANTALONE")) p->gfeverMul = 1.5f;  // 0x2968
     if (Player_is(p, "SIGMA")) {  // 0xa802: scintille chiare in tutte le direzioni
         ParticleEmitter *e = p->PfxEmitter;
@@ -2334,10 +2580,14 @@ static void Player_LevelUp(Player *p) {
         float *f = Player_field(p, p->onEveryLevelUp[i].k);
         if (f) *f += p->onEveryLevelUp[i].v;
     }
+    Foscari_LevelUp(p);
     if (Player_is(p, "PAVONE")) Pavone_LevelUp(p);
     if (Player_is(p, "SCOREJ")) Scorej_LevelUp(p);
     if (Player_is(p, "CAVALLO") && p->level >= 0x50 && Collected("RELIC_ROSALIA")) Cavallo_Morph(p);  // SealedItems: nessuna
     if (Player_is(p, "MORTACCIO") && p->level >= 0x50 && Collected("RELIC_MALACHITE")) Mortaccio_Morph(p);
+    if (Player_is(p, "MEGAMENYA")) Character_LevelHiddenWeapon(p, "BOCCE");
+    if (Player_is(p, "SYUUTO")) Character_LevelHiddenWeapon(p, "NIGHTSWORD");
+    if (Player_is(p, "ONNA")) Onna_LevelUp(p);
     if (Player_is(p, "SIGMA") && Arcana_unlockedCount() > Arcanas.n && RandomazzoEnabled() && (p->level == 2 || p->level == 3 || p->level == 0x4d || p->level == 0x6c))
         Core.GiveMainArcana = 1;  // 0xa802: una nuova arcana ai livelli 2, 3, 77, 108 (UnlockedArcanas > ActiveArcanas, SelectedMazzo)
 }
@@ -2345,7 +2595,8 @@ static void Player_LevelUp(Player *p) {
 static void Player_OnStop(Player *p) {
     tween_pause(p->wiggleTween);
     p->s.angle = 0;
-    if (Player_is(p, "AVATAR") || Player_is(p, "PEPPINO") || Player_is(p, "SIGMA") || Player_is(p, "SCOREJ") || (p->isMorphed && Player_is(p, "CAVALLO"))) return;  // Cavallo morfato: MorphedOnStop (Mortaccio no)  // 0x17d7d / 0x16af1: l'animazione continua da fermo (Peppino: neve solo con la skin December)
+    if (Player_is(p, "GENEVIEVE") || Player_is(p, "MEGAGENEVIEVE") || Player_is(p, "LUMINAIRE")) return;  // OnStop senza pausa dell'animazione
+    if (Player_is(p, "AVATAR") || Player_is(p, "PEPPINO") || Player_is(p, "SIGMA") || Player_is(p, "SCOREJ") || Player_is(p, "MENYA") || Player_is(p, "MEGAMENYA") || (p->isMorphed && Player_is(p, "CAVALLO"))) return;  // Cavallo morfato: MorphedOnStop (Mortaccio no)  // 0x17d7d / 0x16af1: l'animazione continua da fermo (Peppino: neve solo con la skin December)
     anims_pause(&p->s);
 }
 
@@ -2442,6 +2693,8 @@ static void Player_Update(Player *p, float delta) {
         p->head.x = x0 + (p->s.flipX ? -0x1a : 0x34) * p->s.scaleX, p->head.y = y0 - 0x15 * p->s.scaleY;
         p->head.depth = p->s.depth + 1;
     }
+    Character_Update(p);
+    Foscari_Update(p, delta);
 }
 
 // I "fantasmi" del giocatore: rtGhosts.draw(this, ..., alpha 0.1 - 0.1 * i) con alpha globale ghostAlpha
@@ -2610,12 +2863,16 @@ static void Item_Update(Pickup *p) {  // Update di tutti gli oggetti a terra: ba
     p->s.depth = 9 + p->s.y - Core.Player->s.y;
 }
 static void GoldFever_OnCoinPickup(Pickup *p);
+static void W_Mill_OnCoinPickup(float value);
+static void Foscari_OnCoinPickup(float value);
 static void GoldFever_Start(float ms);
 static void Coin_GetTaken(Pickup *p) {  // 0xdee7 Coin, 0xf789 CoinBag1, 0xb693 CoinBagMax
     if (p->disableGet) return;
     if (!strcmp(p->itemType, "COIN")) Core.RunPickups_Coins++;
     else RunPickups_push(p->itemType);
-    GoldFever_OnCoinPickup(p);  // CoinPickedup: OnCoinPickup vuoto
+    GoldFever_OnCoinPickup(p);
+    W_Mill_OnCoinPickup(p->value);  // CoinPickedup
+    Foscari_OnCoinPickup(p->value);
     PlayerOptions_AddCoins(p->value);
     MainUI_UpdateCoins();
     if (!strcmp(p->itemType, "COIN")) Sound_PlaySound("Coin", 0.5f, 1, 0, 1, 1);
@@ -3246,7 +3503,7 @@ static void LittleHeart_GetTaken(Pickup *p) {  // 0x16fe9: cuoricino, 1 HP
     Player_RecoverHp(Core.Player, 1, 1, 1);
     Pickup_SetSeenItem(p->itemType);
     Pickup_GetTaken(p);
-    Sound_PlaySound("LittleHeart", 0.35f, 1.2f, 0xc8 * (frand() - 0.5f), 0x32, 3);
+    Sound_PlaySound("LittleHeart", p->quiet ? 0.1f : 0.35f, 1.2f, 0xc8 * (frand() - 0.5f), 0x32, 3);
 }
 
 static int AchievementManager_UnlockSecret(const char *k);
@@ -4397,7 +4654,31 @@ static const EnemyVT E_Crab, E_Pincer, E_Drowner, E_WaveW, E_Gallo, E_Leda, E_Br
 static void GA_batDefeated(void);
 static void E_XXLBat_Die(Enemy *e) { base_EnemyDie(e); if (Core.Stage->fancyBG) GA_batDefeated(); }  // 0x182a5: fancyBG.xxlBatsDefeated += 1, se lo stage lo ha
 static const EnemyVT E_XXLBat = { .Die = E_XXLBat_Die };
+static const EnemyVT E_Gasha, E_EvilSpirit, E_Orochi, E_OroHead;
+static const EnemyVT E_Snak, E_SnakShield, E_Salmon2, E_Flowerfed, E_Cake, E_Patrol, E_MushHP, E_Crate, E_Pot, E_Agaea, E_Jeneviv;
+static EnemyVT E_Blinder;
+static void E_Blinder_OnRecycle(Enemy *e);
 static const EnemyVT *enemy_vt(const char *type) {  // EnemyPool: la classe del tipo (le altre arrivano con gli stage)
+    if (!strncmp(type, "FS_", 3) || !strcmp(type, "BOSS_XLBLINDER")) {
+        if (!strcmp(type, "BOSS_XLBLINDER")) { E_Blinder = E_Stalker, E_Blinder.OnRecycle = E_Blinder_OnRecycle; return &E_Blinder; }
+        if (!strcmp(type, "FS_SALMON2")) return &E_Salmon2;
+        if (!strcmp(type, "FS_SNAK1") || !strcmp(type, "FS_SNAK2") || !strcmp(type, "FS_SNAK3") || !strcmp(type, "FS_SNAK4") || !strcmp(type, "FS_SNAK_SWARM") || !strcmp(type, "FS_SNAKBOMB")) return &E_Snak;
+        if (!strcmp(type, "FS_SNAKSHIELD")) return &E_SnakShield;
+        if (!strcmp(type, "FS_SHOOTER1") || !strcmp(type, "FS_SHOOTER2")) return &E_Pile;
+        if (!strcmp(type, "FS_BOSS_AGAEA")) return &E_Agaea;
+        if (!strcmp(type, "FS_CAKE")) return &E_Cake;
+        if (!strcmp(type, "FS_MUSH_PATROL") || !strcmp(type, "FS_BLINDER_PATROL")) return &E_Patrol;
+        if (!strcmp(type, "FS_BROWN") || !strcmp(type, "FS_HTROW") || !strcmp(type, "FS_LAMB") || !strcmp(type, "FS_GEF")) return &E_Flowerfed;
+        if (!strcmp(type, "FS_MUSH_HP")) return &E_MushHP;
+        if (!strcmp(type, "FS_CRATE_HP")) return &E_Crate;
+        if (!strcmp(type, "FS_POT_HP") || !strcmp(type, "FS_ANFORA_HP")) return &E_Pot;
+        if (!strcmp(type, "FS_BOSS_JENEVIV")) return &E_Jeneviv;
+        return NULL;
+    }
+    if (!strcmp(type, "MS_GOSHADOKURO")) return &E_Gasha;
+    if (!strcmp(type, "MS_EVILSPIRIT")) return &E_EvilSpirit;
+    if (!strcmp(type, "MS_OROCHIMARIO")) return &E_Orochi;
+    if (!strcmp(type, "MS_OROCHIHEAD")) return &E_OroHead;
     if (!strcmp(type, "XXLBAT")) return &E_XXLBat;
     if (!strncmp(type, "D_MASK_", 7)) return &E_DMask;  // la Machine (0x15196, 0xa2b, 0x5b89, 0x185e5)
     if (!strcmp(type, "D_SKULL") || !strcmp(type, "D_EYE")) return &E_DSkull;
@@ -4494,7 +4775,17 @@ static void Enemy_CheckSelfDestruct(Enemy *e) {  // Update / ConditionalUpdate: 
 }
 
 static void base_EnemyUpdate(Enemy *e);
-static void Enemy_Update(Enemy *e) { if (e->vt && e->vt->Update) e->vt->Update(e); else base_EnemyUpdate(e); }
+static int Enemy_beatMode;  // Abyss Foscari (0xba51): Update = ConditionalUpdate sul battito
+static void Enemy_Update(Enemy *e) {
+    if (Enemy_beatMode && !e->conditional_canMove) {  // ConditionalUpdate col battito fermo: niente passi
+        if (!e->isDead) {
+            e->s.depth = e->s.y - Core.Player->s.y;
+            if (e->SelfDestruct && !e->IsTimeStopped) Enemy_CheckSelfDestruct(e);
+        }
+        return;
+    }
+    if (e->vt && e->vt->Update) e->vt->Update(e); else base_EnemyUpdate(e);
+}
 static void base_EnemyUpdate(Enemy *e) {
     if (e->isDead) return;
     e->s.depth = e->s.y - Core.Player->s.y;
@@ -5638,6 +5929,645 @@ static void B_Diamond_DeSpawn(Bullet *b) { b->s.body.collideWorldBounds = 0; bas
 static const BulletVT B_Diamond = { "items", "Diamond2.png", B_Diamond_ctor, NULL, B_Diamond_OnRecycle, B_Diamond_OnHasHitAnObject, B_Diamond_Update,
                                     B_Diamond_DeSpawn, B_Diamond_SetTarget, B_Diamond_SetNullTarget, B_Diamond_OnHasHitWall };
 
+// --- B_SilverWind (0xbd7c) / B_SilverWind2 (0x123a1): la foglia che traccia un'orbita attorno al giocatore --------
+#define WIND_FADE 0x2ee
+#define WIND_LINES 600  // il pool dell'originale cresce a richiesta; 4 linee a fotogramma per 750 ms ne usano circa 180
+struct WindLine { Vector2 a, b; unsigned color; float alpha, born; };
+static Animation WindSpin;  // anims.create('spin'): leaf0000..leaf0019, 30 fps
+static const BulletVT B_SilverWind2;
+static void Wind_trailDraw(Sprite *s) {
+    Bullet *b = s->owner;
+    if (!b->linesN || b->trailAlpha <= 0) return;
+    float ox = b->trail.x - camera_scrollX, oy = b->trail.y - camera_scrollY;
+    BeginBlendMode(BLEND_ADDITIVE);
+    for (int i = 0; i < b->linesN; i++) {
+        const struct WindLine *l = &b->lines[(b->linesHead - 1 - i + 2 * WIND_LINES) % WIND_LINES];
+        float k = 1 - (b->linesClock - l->born) / WIND_FADE;
+        if (k <= 0) { b->linesN = i; break; }  // dalla piu' nuova: le successive sono piu' vecchie
+        DrawLineEx((Vector2){ ox + l->a.x, oy + l->a.y }, (Vector2){ ox + l->b.x, oy + l->b.y }, 1, hexc(l->color, l->alpha * k * b->trailAlpha));
+    }
+    EndBlendMode();
+}
+static void Wind_setLine(Bullet *b, Vector2 from, Vector2 to, unsigned color, float alpha) {
+    b->lines[b->linesHead] = (struct WindLine){ from, to, color, alpha, b->linesClock };
+    b->linesHead = (b->linesHead + 1) % WIND_LINES;
+    if (b->linesN < WIND_LINES) b->linesN++;
+}
+static void B_SilverWind_ctor(Bullet *b) {
+    int evo = b->vt == &B_SilverWind2;
+    if (!WindSpin.n) {
+        for (int i = 0; i < 0x14; i++) WindSpin.frames[WindSpin.n++] = frame_get("vfx", TextFormat("leaf%04d.png", i));
+        WindSpin.frameRate = 0x1e, WindSpin.msPerFrame = 1000.0f / 0x1e, WindSpin.repeat = -1;
+    }
+    b->s.blendAdd = 1;
+    b->lines = malloc(WIND_LINES * sizeof(*b->lines));
+    sprite_init(&b->trail, NULL, 0, 0);
+    b->trail.owner = b;
+    b->trail.draw = Wind_trailDraw;
+    children_add(&b->trail);
+    b->Pfx = particles_add();
+    EmitterConfig c = { .speed = ERND(0xf, 0x1e), .quantity = 1, .lifespan = EOP(0x3e8), .alpha = ERANGE(1, 0), .on = 0 };
+    c.frames[c.nframes++] = frame_get("vfx", "PfxHoly1.png");
+    c.frames[c.nframes++] = frame_get("vfx", "PfxHoly2.png");
+    if (evo) c.frames[c.nframes++] = frame_get("vfx", "PfxGreen.png");
+    b->PfxEmitter = particles_createEmitter(b->Pfx, c);
+}
+static void B_SilverWind_clearHits(void *ctx) { ((Bullet *)ctx)->n_hit = 0; }  // 'HW Hitbox'
+static void B_SilverWind_OnRecycle(Bullet *b) {
+    static const unsigned colors[] = { 0xeeeeee, 0xffff, 0xff }, colors2[] = { 0x88ff88, 0xff00, 0xffff00, 0xff88 };
+    int evo = b->vt == &B_SilverWind2;
+    Bullet_OnRecycle(b);
+    b->hasPrevPos = 0;
+    body_setCircle(&b->s.body, 4, b->s.body.offset.x, b->s.body.offset.y);
+    b->isCullable = 0;
+    b->_speed = 1.1f;
+    sprite_setScale(&b->s, PixelScale * Weapon_PArea(b->weapon));
+    time_removeEvent(b->ExpireTimer);
+    b->IsInStartingPosition = 1;
+    b->trail.x = b->s.x - Core.Player->s.x, b->trail.y = b->s.y - Core.Player->s.y;
+    b->color = evo ? colors2[b->indexInWeapon % 4] : colors[b->indexInWeapon % 3];
+    b->s.tint = evo ? b->color : 0xffffff;  // l'originale, senza evoluzione: tints[indice] oltre la fine = setTint(undefined) = bianco
+    b->linesN = 0;  // clearPositions (positions non si usa) + recycle delle linee
+    anims_play(&b->s, &WindSpin, 0);
+    float area = Weapon_PArea(b->weapon);
+    if (b->hasTween) tween_stop(b->tween);
+    b->trailAlpha = 1, b->s.alpha = 0;
+    b->tween = tweens_add((TweenConfig){ .props = { { &b->s.alpha, NULL, area >= 2 ? 1 / area : 1 } }, .nprops = 1, .duration = 0xc8 });
+    b->hasTween = 1;
+    time_removeEvent(b->HitboxTimer);
+    b->HitboxTimer = time_addEvent(b->weapon->hitBoxDelay, 1, 0, B_SilverWind_clearHits, b);
+    b->ExpireTimer = time_addEvent(Weapon_PDuration(b->weapon), 0, 0, B_Diamond_FadeOut, b);  // stessa FadeOut del diamante
+    b->canUpdateTrail = 0;
+    Sound_PlaySound("Magic2", 0.15f, 1, -0x64 * b->indexInWeapon, 0x64, 0xa);
+}
+static void B_SilverWind_DeSpawn(Bullet *b) {
+    base_DeSpawn(b);
+    time_removeEvent(b->ExpireTimer);
+    b->IsInStartingPosition = 0;
+    anims_stop(&b->s);
+    b->linesN = 0;
+}
+static void B_SilverWind_Update(Bullet *b, float delta) {
+    manager_emitParticleAt(b->Pfx, b->s.x, b->s.y);
+    b->linesClock += delta;
+    if (b->canUpdateTrail) {
+        int n = (int)ceilf(delta / 0x10);
+        Vector2 cur = { b->s.x, b->s.y };
+        for (int i = 0; i < n; i++) {  // trailUpdate
+            if (!b->hasPrevPos) b->prevPos = cur, b->hasPrevPos = 1;
+            Wind_setLine(b, b->prevPos, cur, b->color, 0.5f);
+            Wind_setLine(b, b->prevPos, cur, 0xffffff, 0.25f);
+            b->prevPos = cur;
+        }
+    }
+    if (b->IsInStartingPosition) {
+        Weapon *w = b->weapon;
+        b->fnTime += delta * Weapon_PSpeed(w);  // mai azzerato (sic): ogni giro riparte da dove era
+        float t = 0.001f * b->fnTime, t2 = 3.375f * t, area = Weapon_PArea(w), rx = game_width * fminf(0.125f * area, 0.4f), rx2 = rx / 1.75f, ry = 5 * fminf(6, area) * 7;
+        b->s.x = Core.Player->s.x + rx * sinf(t) + rx2 * sinf(t2);
+        b->s.y = Core.Player->s.y + ry * cosf(t) + 4 * cosf(t2);
+    }
+    b->canUpdateTrail = 1;
+}
+static const BulletVT B_SilverWind = { "vfx", "leaf0001.png", B_SilverWind_ctor, NULL, B_SilverWind_OnRecycle, NULL, B_SilverWind_Update,
+                                       B_SilverWind_DeSpawn, B_Diamond_SetTarget, B_Diamond_SetNullTarget };
+static void B_SilverWind2_OnHasHitAnObject(Bullet *b, void *o, int isDead) {
+    (void)b;
+    if (isDead || !(((Sprite *)o)->groups & Core.Enemies.bit)) return;  // Destructible: in JS i campi sono undefined
+    Enemy *e = o;
+    if (e->res_Debuffs >= 2) return;
+    if (e->damageWeakness < 0x64) e->damageWeakness += 0.02f;  // maxDamageWeakness
+}
+static const BulletVT B_SilverWind2 = { "vfx", "leaf0001.png", B_SilverWind_ctor, NULL, B_SilverWind_OnRecycle, B_SilverWind2_OnHasHitAnObject, B_SilverWind_Update,
+                                        B_SilverWind_DeSpawn, B_Diamond_SetTarget, B_Diamond_SetNullTarget };
+
+// --- B_MirageRobe (0x5246) / B_MirageRobe2 (0x1404): la copia del giocatore che congela chi la tocca ---------------
+static void B_Mirage_despawn(void *ctx) { Bullet *b = ctx; if (b->s.active) Bullet_DeSpawn(b); }  // la copia puo' essere gia' sparita per penetrating
+static void B_Mirage_FadeOut(Bullet *b) {
+    if (!b->s.active) return;
+    b->s.body.enable = 0;
+    if (b->hasFadeOut) tween_stop(b->fadeOutTween);
+    b->fadeOutTween = tweens_add((TweenConfig){ .props = { { &b->s.alpha, NULL, 0 } }, .nprops = 1, .duration = 0xc8, .onComplete = B_Mirage_despawn, .ctx = b });
+    b->hasFadeOut = 1;
+}
+static void B_Mirage_expire(void *ctx) { Bullet *b = ctx; time_removeEvent(b->ExpireTimer); B_Mirage_FadeOut(b); }
+static void B_MirageRobe_ctor(Bullet *b) {
+    sprite_setScale(&b->s, 1);
+    b->s.originX = 0.5f, b->s.originY = 1;
+    b->s.tint = 0x7070ff;  // semplificazione: setTint a quattro angoli (0xe0e0ff, 0xff, 0xe0e0ff, 0xff) reso col colore medio
+}
+static void B_MirageRobe_OnRecycle(Bullet *b) {
+    Bullet_OnRecycle(b);
+    body_setCircle(&b->s.body, 0x10, b->s.body.offset.x, b->s.body.offset.y);
+    if (b->hasFadeOut) tween_stop(b->fadeOutTween);
+    sprite_setScale(&b->s, fminf(Weapon_PArea(b->weapon), 1));
+    b->s.frame = Core.Player->s.frame;  // setTexture sul fotogramma del giocatore
+    b->s.flipX = Core.Player->s.flipX;
+    b->s.alpha = 0.65f;
+    time_removeEvent(b->ExpireTimer);
+    b->ExpireTimer = time_addEvent(Weapon_PDuration(b->weapon), 0, 0, B_Mirage_expire, b);  // 'Mirage Expire'
+    b->mirageHits = b->weapon->amount;
+}
+static void B_MirageRobe_OnHasHitAnObject(Bullet *b, void *o, int isDead) {
+    if (isDead) return;
+    if (--b->mirageHits <= 0) B_Mirage_FadeOut(b);
+    if (((Sprite *)o)->groups & Core.Enemies.bit) Enemy_Freeze(o, Weapon_PDuration(b->weapon), 1);  // _0x.Freeze &&: i Destructible non ce l'hanno
+    if (Arcanas_has(12)) Arcanas_TriggerCold(((Sprite *)o)->x, ((Sprite *)o)->y);  // Out of Time
+}
+static const BulletVT B_MirageRobe = { "vfx", "Rings3.png", B_MirageRobe_ctor, NULL, B_MirageRobe_OnRecycle, B_MirageRobe_OnHasHitAnObject };
+static void B_MirageRobe2_ctor(Bullet *b) {
+    static const unsigned T[4] = { 0x4444a1, 0x7070ff, 0xef70ff, 0xb470ff };  // i quattro angoli di tints reso col colore medio
+    B_MirageRobe_ctor(b);
+    b->_speed = 0.3f;
+    anims_play(&b->s, &Core.Player->walk, 0);  // anims.create('walk') coi dati del personaggio scelto: e' l'animazione del giocatore
+    b->s.tint = T[b->indexInWeapon % 4];
+}
+static void B_MirageRobe2_OnRecycle(Bullet *b) {
+    B_MirageRobe_OnRecycle(b);
+    for (int i = 0; i < Core.Enemies.n; i++) {  // i nemici inseguono la copia, e continuano anche quando e' sparita (sic)
+        Enemy *e = (Enemy *)Core.Enemies.items[i];
+        if (e->target == &Core.Player->s) e->target = &b->s;
+    }
+    Vector2 *d = &Core.Player->lastFacedDirection;  // ApplyPlayerFacingVelocity(false) col TrueSpeed di questa classe
+    float l = sqrtf(d->x * d->x + d->y * d->y), v = Weapon_PSpeed(b->weapon) * PlayerPxSpeed * Core.Player->moveSpeed * b->_speed;
+    if (l > 0) d->x /= l, d->y /= l;
+    if (d->x == 0 && d->y == 0) d->x = 1;
+    sprite_setVelocity(&b->s, v * d->x, v * d->y);
+}
+static void B_MirageRobe2_OnHasHitAnObject(Bullet *b, void *o, int isDead) { (void)o; if (!isDead && --b->penetrating <= 0) Bullet_DeSpawn(b); }
+static const BulletVT B_MirageRobe2 = { "vfx", "Rings3.png", B_MirageRobe2_ctor, NULL, B_MirageRobe2_OnRecycle, B_MirageRobe2_OnHasHitAnObject };
+
+// --- B_Bubble (0x359f) / B_Bubble2 (0x10235): la bolla che va verso il nemico piu' vicino e si ferma dove capita -----
+static const BulletVT B_Bubble2;
+static void Bullet_SetForNearestEnemy(Bullet *b, Vector2 *out) {
+    Sprite *t = physics_closest(&Core.Player->s, &Core.Enemies);
+    Vector2 d;
+    if (t) {
+        d = (Vector2){ t->body.position.x - Core.Player->s.x, t->body.position.y - Core.Player->s.y };
+        float l = sqrtf(d.x * d.x + d.y * d.y);
+        if (l > 0) d.x /= l, d.y /= l;
+    } else {
+        Vector2 *f = &Core.Player->lastFacedDirection;
+        float l = sqrtf(f->x * f->x + f->y * f->y);
+        if (l > 0) f->x /= l, f->y /= l;
+        if (f->x == 0 && f->y == 0) f->x = 1;
+        d = *f;
+    }
+    *out = (Vector2){ Bullet_TrueSpeed(b) * d.x, Bullet_TrueSpeed(b) * d.y };
+}
+static void B_Bubble_clearHits(void *ctx) { ((Bullet *)ctx)->n_hit = 0; }
+static void B_Bubble_despawn(void *ctx) { Bullet_DeSpawn(ctx); }
+static void B_Bubble_FadeOut(void *ctx) {
+    Bullet *b = ctx;
+    if (b->hasFadeOut) tween_stop(b->fadeOutTween);
+    b->fadeOutTween = tweens_add((TweenConfig){ .props = { { &b->s.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x1f4, .onComplete = B_Bubble_despawn, .ctx = b });
+    b->hasFadeOut = 1;
+}
+static void B_Bubble_ctor(Bullet *b) { b->s.visible = 0, b->SpeedTween = (TweenRef){ -1, 0 }; }
+static void B_Bubble_OnRecycle(Bullet *b) {
+    static const char *const F[] = { "HitBlue1.png", "HitBlue2.png", "HitCloud1.png", "bubble.png", "bubble.png", "bubble.png" },
+                             *const F2[] = { "HitWhite1.png", "HitWhite2.png", "HitCloud1.png", "bubble.png", "bubble.png", "bubble.png" };
+    int evo = b->vt == &B_Bubble2;
+    Bullet_OnRecycle(b);
+    if (b->hasFadeOut) tween_stop(b->fadeOutTween);
+    body_setCircle(&b->s.body, 0xa, 1, 1);
+    b->s.body.enable = 1;
+    b->n_hit = 0;
+    b->s.visible = 1;
+    sprite_setScale(&b->s, 0);
+    b->isCullable = 1;
+    b->save_vel_x = b->save_vel_y = 1;
+    b->s.frame = frame_get("vfx", (evo ? F2 : F)[(int)floorf(frand() * 6)]);  // SetColor, chiamato da FireOneBullet
+    if (evo) {
+        time_removeEvent(b->HitboxTimer);
+        b->HitboxTimer = time_addEvent(b->weapon->hitBoxDelay, 1, 0, B_Bubble_clearHits, b);
+        b->s.tint = ((unsigned)(0x80 + 0x80 * frand()) << 16) | ((unsigned)(0x80 + 0x80 * frand()) << 8) | (unsigned)(0x80 + 0x80 * frand());  // semplificazione: 20 colori a caso per proiettile, qui uno a ogni riuso
+        b->s.depth = -game_height;
+    }
+    Bullet_SetForNearestEnemy(b, &b->aimVec);
+    float sp = Weapon_PSpeed(b->weapon), dur = Weapon_PDuration(b->weapon);
+    sprite_setVelocity(&b->s, b->aimVec.x * sp, b->aimVec.y * sp);
+    if (!evo) Sound_PlaySound("Bubbles", 0.4f, 1, 0x32 * b->indexInWeapon, 0x64, 0xc);
+    tween_stop(b->SpeedTween);
+    b->bombDeceleration = 1;
+    b->SpeedTween = tweens_add((TweenConfig){ .props = { { &b->bombDeceleration, NULL, 0 } }, .nprops = 1, .delay = 0.25f * dur, .duration = 0.75f * dur, .onComplete = B_Bubble_FadeOut, .ctx = b });
+    if (b->hasTween) tween_stop(b->tween);
+    b->s.alpha = 0.65f;
+    float area = Weapon_PArea(b->weapon);
+    b->tween = tweens_add((TweenConfig){ .props = { { &b->s.scaleX, &b->s.scaleY, area } }, .nprops = 1, .duration = 0xfa });
+    b->hasTween = 1;
+    if (evo) {
+        b->s.body.collideWorldBounds = 1, b->s.body.hasWorldBounce = 1, b->s.body.worldBounce = (Vector2){ 0.9f, 0.9f };
+        b->s.body.customBounds = &Core.Player->WorldBoxCollider;
+    }
+}
+static void B_Bubble_Update(Bullet *b, float delta) {
+    (void)delta;
+    sprite_setVelocity(&b->s, b->aimVec.x * b->save_vel_x, b->aimVec.y * b->save_vel_y);
+    if (b->vt != &B_Bubble2) b->s.depth = -game_height;
+}
+static void B_Bubble_DeSpawn(Bullet *b) {
+    tween_stop(b->SpeedTween);
+    if (b->hasTween) tween_stop(b->tween);
+    if (b->hasFadeOut) tween_stop(b->fadeOutTween);
+    sprite_setScale(&b->s, 0);
+    b->s.visible = 0;
+    b->s.body.enable = 0;
+    if (b->vt == &B_Bubble2) time_removeEvent(b->HitboxTimer);
+    base_DeSpawn(b);
+}
+static void B_Bubble_OnHasHitWall(Bullet *b, Tile *t) { (void)t; b->save_vel_x = b->save_vel_y = 0; }  // decelerate
+static const BulletVT B_Bubble = { "vfx", "circle8.png", B_Bubble_ctor, NULL, B_Bubble_OnRecycle, NULL, B_Bubble_Update, B_Bubble_DeSpawn, NULL, NULL, B_Bubble_OnHasHitWall };
+static const BulletVT B_Bubble2 = { "vfx", "circle8.png", B_Bubble_ctor, NULL, B_Bubble_OnRecycle, NULL, B_Bubble_Update, B_Bubble_DeSpawn, NULL, NULL, B_Bubble_OnHasHitWall };
+
+// --- B_SummonNight (0x14b69): zanna dall'alto / B_SummonNight2 (0x87c2): zanna dal basso, a meta' fra quelle rosse --------
+static const BulletVT B_SummonNight2;
+static void B_Night_ctor(Bullet *b) {
+    static const unsigned TINT[3] = { 0xff0000, 0xff00ff, 0xff };
+    int up = b->vt == &B_SummonNight2;
+    sprite_init(&b->fang, frame_get("vfx", up ? "fangNight2.png" : "fangNight.png"), b->s.x, b->s.y);
+    b->fang.originX = 0.5f, b->fang.originY = up ? 1 : 0;
+    sprite_setScale(&b->fang, 0);
+    b->fang.alpha = 0, b->fang.depth = game_height;
+    children_add(&b->fang);
+    EmitterConfig frag = { .speed = ERND(0x64, 0x12c), .angle = up ? ERND(0xd2, 0x14a) : ERND(0x1e, 0x96), .gravityY = up ? -0x190 : 0x190, .rotate = ERANGE(0, 0x168),
+                           .quantity = 0x10, .lifespan = ERND(0xfa, 0x2ee), .alpha = ERANGE(0.8f, 0.6f), .scale = ERANGE(4, 0), .tints = { 0, 0, 0x44 }, .ntints = 3, .on = 0 };
+    for (int i = 0; i < 4; i++) frag.frames[frag.nframes++] = frame_get("vfx", TextFormat("glass%04d.png", i));
+    b->PfxExplosion = particles_add();
+    particles_createEmitter(b->PfxExplosion, frag);
+    b->Pfx = particles_add();
+    b->PfxEmitter1 = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "bulletNightA.png") }, .nframes = 1, .speed = ERND(0xf, 0x1e), .quantity = 1, .lifespan = EOP(0x12c),
+                                                                       .alpha = ERANGE(1, 0), .tints = { TINT[0], TINT[1], TINT[2] }, .ntints = 3, .hasZoneRect = 1, .on = 0 });
+    b->PfxBack = particles_add();
+    b->PfxEmitter2 = particles_createEmitter(b->PfxBack, (EmitterConfig){ .frames = { frame_get("vfx", "bulletNightB.png") }, .nframes = 1, .speed = ERND(0xf, 0x1e), .quantity = 2, .lifespan = EOP(0x12c),
+                                                                           .scale = ERANGE(1, 0), .tints = { TINT[0], TINT[1], TINT[2] }, .ntints = 3, .hasZoneRect = 1, .on = 0 });
+    b->PfxExplosion->s.depth = game_height + 2, b->Pfx->s.depth = game_height + 1, b->PfxBack->s.depth = -game_height;
+    b->ScaleTween = (TweenRef){ -1, 0 };
+}
+static void B_Night_clearHits(void *ctx) { ((Bullet *)ctx)->n_hit = 0; }
+static void B_Night_expire(void *ctx) { Bullet_DeSpawn(ctx); }
+static void B_Night_frontBack(void *ctx) { Bullet *b = ctx; b->Pfx->s.depth = 1 - game_height; }
+static void B_Night_fangOut(void *ctx) {
+    Bullet *b = ctx;
+    if (b->hasFangTweenOut) tween_stop(b->fangTweenOut);
+    b->fangTweenOut = tweens_add((TweenConfig){ .props = { { &b->fang.scaleX, &b->fang.scaleY, 0 } }, .nprops = 1, .delay = 0xc8, .duration = 0xc8, .ease = Ease_SineInOut, .onComplete = B_Night_frontBack, .ctx = b });
+    b->hasFangTweenOut = 1;
+}
+static void B_Night_OnRecycle(Bullet *b) {
+    Weapon *w = b->weapon;
+    int up = b->vt == &B_SummonNight2;
+    Bullet_OnRecycle(b);
+    b->s.visible = 0;
+    b->s.originX = 0.5f, b->s.originY = up ? 1 : 0;
+    sprite_setScale(&b->s, 0);
+    b->s.body.enable = 1;
+    b->isCullable = 0;
+    manager_emitParticleAt(b->PfxExplosion, b->s.x, b->s.y + (up ? 0x18 : -0x18));
+    time_removeEvent(b->HitboxTimer), time_removeEvent(b->ExpireTimer);
+    b->HitboxTimer = time_addEvent(w->hitBoxDelay, 1, 0, B_Night_clearHits, b);
+    b->ExpireTimer = time_addEvent(Weapon_PDuration(w), 1, 0, B_Night_expire, b);
+    float area = Weapon_PArea(w), sx = 0x10 * area;
+    b->reach = 0.5f;
+    if (area - 1.2f > 0) b->reach += fminf(0.5f, area - 1.2f);
+    b->reach *= 0x1c8;  // GAMEPLAY_PIXEL_HEIGHT
+    tween_stop(b->ScaleTween);
+    b->ScaleTween = tweens_add((TweenConfig){ .props = { { &b->s.scaleX, NULL, sx }, { &b->s.scaleY, NULL, b->reach } }, .nprops = 2, .duration = 0x1f4 });
+    b->Pfx->s.depth = game_height + 1;
+    if (b->hasFangTweenOut) tween_stop(b->fangTweenOut);
+    if (b->hasFangTween) tween_stop(b->fangTween);
+    b->fang.x = b->s.x, b->fang.y = b->s.y + (up ? 0x80 : -0x80), b->fang.alpha = 0;  // onStart
+    sprite_setScale(&b->fang, 0);
+    b->fangTween = tweens_add((TweenConfig){ .props = { { &b->fang.alpha, NULL, 0.65f }, { &b->fang.scaleX, NULL, area }, { &b->fang.scaleY, NULL, b->reach / 0x43 } },
+                                             .nprops = 3, .duration = 0xc8, .ease = Ease_SineInOut, .onComplete = B_Night_fangOut, .ctx = b });
+    tweens_add((TweenConfig){ .props = { { &b->fang.y, NULL, b->s.y } }, .nprops = 1, .duration = 0xc8, .ease = Ease_SineInOut });  // un TweenConfig ha tre proprieta'
+    b->hasFangTween = 1;
+    float half = 0.5f * sx;
+    b->PfxEmitter1->c.zoneRect = b->PfxEmitter2->c.zoneRect = (Rectangle){ -0.5f * half, 0, half, b->reach };
+}
+static void B_Night_DeSpawn(Bullet *b) {
+    b->isCullable = 1;
+    b->s.body.enable = 0;
+    time_removeEvent(b->HitboxTimer), time_removeEvent(b->ExpireTimer);
+    base_DeSpawn(b);
+}
+static void B_Night_Update(Bullet *b, float delta) {
+    (void)delta;
+    int up = b->vt == &B_SummonNight2;
+    b->PfxEmitter1->c.zoneRect.height = b->PfxEmitter2->c.zoneRect.height = b->s.scaleY;  // explosionRect
+    if (up) b->PfxEmitter1->c.zoneRect.y = b->PfxEmitter2->c.zoneRect.y = -b->s.scaleY;
+    manager_emitParticleAt(b->Pfx, b->s.x, b->s.y);
+    manager_emitParticleAt(b->PfxBack, b->s.x, b->s.y);
+}
+static const BulletVT B_SummonNight = { "vfx", "WhiteDot.png", B_Night_ctor, NULL, B_Night_OnRecycle, NULL, B_Night_Update, B_Night_DeSpawn };
+static const BulletVT B_SummonNight2 = { "vfx", "WhiteDot.png", B_Night_ctor, NULL, B_Night_OnRecycle, NULL, B_Night_Update, B_Night_DeSpawn };
+
+// --- B_NightSword (0x2497): il fendente sul bersaglio; la sesta spada (canFinish) e' doppia e sparge particelle ---------
+static const float NightFireX[6] = { -0x10, 0x10, 0, 0x10, -0x10, 0 };
+static void B_NightSword_ctor(Bullet *b) {
+    b->Pfx = particles_add();
+    b->PfxEmitter = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "WhiteDot.png") }, .nframes = 1, .quantity = 0xa, .lifespan = EOP(0x1f4), .alpha = ERANGE(1, 0),
+        .angle = ERND(0xe1, 0x13b), .blendAdd = 1, .speed = ERND(0x4b, 0x7d), .scale = ERANGE(2 * PixelScale, 0), .gravityY = -0x258, .tint = 0xff0000, .tintEnd = 0xff00ff, .hasTintEnd = 1,
+        .hasZoneRect = 1, .zoneRect = { -0x10, -0x80, 0x20, 0x100 }, .flowEveryFrame = 1, .on = 0 });
+}
+static void B_NightSword_Init(Bullet *b, float x, float y) {
+    Bullet_Init(b, x, y);
+    sprite_setScale(&b->s, 0);
+    b->s.blendAdd = 1;
+    b->s.depth = 0xf0;
+}
+static void B_NightSword_OnRecycle(Bullet *b) { Bullet_OnRecycle(b); emitter_stop(b->PfxEmitter); }
+static void B_NightSword_DeSpawn(Bullet *b) { base_DeSpawn(b); emitter_stop(b->PfxEmitter); }
+static void B_NightSword_SetNullTarget(Bullet *b) { Bullet_DeSpawn(b); }
+static void B_NightSword_pfxStop(void *ctx) { emitter_stop(((Bullet *)ctx)->PfxEmitter); }
+static void B_NightSword_despawn(void *ctx) { Bullet_DeSpawn(ctx); }
+static void B_NightSword_SetTarget(Bullet *b, Vector2 t) {
+    Weapon *w = b->weapon;
+    int i = b->indexInWeapon % 6, fin = w->canFinish && i == 5;
+    if (i < 5) Sound_PlaySound("Crystal6", 0.4f * w->volume, 1, 0xc8 * i, 0x64, 5);
+    else if (fin) Sound_PlaySound("Crystal8", w->volume, 1, 0x4b0, 0x12c, 1);
+    b->s.x = t.x + NightFireX[i], b->s.y = t.y;
+    b->s.frame = frame_get("vfx", fin ? "nightSwordCrit.png" : "nightSword.png");
+    b->s.alpha = fin ? 0.5f : 0.75f;
+    b->s.originX = 0.5f, b->s.originY = fin ? 1 : 0.5f;
+    b->s.angle = w->fireAngles[i];
+    b->s.depth = game_height;
+    if (b->hasTween) tween_stop(b->tween);
+    b->s.scaleX = 0.5f * (fin ? 2 : 1), b->s.scaleY = Weapon_PArea(w) * (fin ? 2 : 1);  // onStart
+    if (fin) b->PfxEmitter->x = b->s.x, b->PfxEmitter->y = b->s.y, emitter_start(b->PfxEmitter);
+    b->tween = tweens_add((TweenConfig){ .props = { { &b->s.scaleY, NULL, 0 }, { &b->s.scaleX, NULL, 0.5f } }, .nprops = 2, .duration = fin ? 0x96 : 0x64, .onComplete = fin ? B_NightSword_pfxStop : NULL, .ctx = b });
+    b->hasTween = 1;
+    if (b->hasTween2) tween_stop(b->tween2);
+    b->tween2 = tweens_add((TweenConfig){ .props = { { &b->s.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x64, .delay = 0x64, .onComplete = B_NightSword_despawn, .ctx = b });
+    b->hasTween2 = 1;
+}
+static const BulletVT B_NightSword = { "vfx", "nightSword.png", B_NightSword_ctor, B_NightSword_Init, B_NightSword_OnRecycle, NULL, NULL, B_NightSword_DeSpawn, B_NightSword_SetTarget, B_NightSword_SetNullTarget };
+
+// --- B_Bocce (0xd9ed): l'area invisibile attorno al giocatore ------------------------------------------------------
+static void B_Bocce_expire(void *ctx) { Bullet *b = ctx; time_removeEvent(b->ExpireTimer); Bullet_DeSpawn(b); }
+static void B_Bocce_ctor(Bullet *b) { b->s.x = Core.Player->s.x, b->s.y = Core.Player->s.y; }
+static void B_Bocce_OnRecycle(Bullet *b) {
+    Bullet_OnRecycle(b);
+    body_setCircle(&b->s.body, 0x10, b->s.body.offset.x, b->s.body.offset.y);
+    sprite_setScale(&b->s, 2 * PixelScale * Weapon_PArea(b->weapon));
+    b->s.visible = 0;
+    time_removeEvent(b->ExpireTimer);
+    b->ExpireTimer = time_addEvent(Weapon_PInterval(b->weapon), 0, 0, B_Bocce_expire, b);
+}
+static void B_Bocce_Update(Bullet *b, float delta) {
+    (void)delta;
+    b->s.x = Core.Player->s.x, b->s.y = Core.Player->s.y;
+    sprite_setScale(&b->s, 2 * PixelScale * Weapon_PArea(b->weapon));
+}
+static const BulletVT B_Bocce = { "vfx", "Rings3.png", B_Bocce_ctor, NULL, B_Bocce_OnRecycle, NULL, B_Bocce_Update };
+
+// --- B_FourSeasons (0xcc71) / B_FourSeasons2 (0x9a27): lo scoppio della stagione (o dell'elemento) negli angoli dello schermo -----
+// fwEmitter e particles dell'originale non emettono mai: omessi
+static const BulletVT B_FourSeasons2;
+static void FS_sprite(Sprite *s, const char *frame, int add, float depth) {
+    sprite_init(s, frame_get("vfx", frame), 0, 0);
+    s->visible = 0, s->blendAdd = add, s->alpha = add ? 0.65f : 1, s->depth = depth;
+    children_add(s);
+}
+static void B_FS_ctor(Bullet *b) {
+    static const unsigned T1[4][4] = { { 0xff8888, 0xff88ff, 0xff88ff, 0xffff88 }, { 0x88ff88, 0xff00, 0x88ff00, 0x88ff44 }, { 0xff0088, 0xff8800, 0xffcc00, 0xffff00 }, { 0xffffff, 0x88ff, 0xccccff, 0x8888ff } };
+    static const unsigned T2[5][4] = { { 0x884400, 0x442200, 0x551100, 0xcc8800 }, { 0xffff44, 0xff00, 0x88ff00, 0x88ff44 }, { 0xff0000, 0xff8800, 0xffcc00, 0xffff00 }, { 0xffffff, 0x4488ff, 0xccccff, 0x8888ff }, { 0x2222, 0xffffff, 0x8888, 0xcccc } };
+    int evo = b->vt == &B_FourSeasons2, n = evo ? 5 : 4;
+    Weapon *w = b->weapon;
+    FS_sprite(&b->ring, "sPFX_ring_64.png", 1, game_height + 1);
+    FS_sprite(&b->rainbow, evo ? "s_pfx_rainbow_64u.png" : "s_pfx_rainbow_64.png", 1, game_height + 1);
+    FS_sprite(&b->rays, "fuzzA.png", 1, game_height + 1);
+    FS_sprite(&b->kanji, "k_spring.png", 0, game_height + 1);
+    if (evo) FS_sprite(&b->lightning, "Lightning3.png", 0, game_height);
+    for (int i = 0; i < n; i++) {
+        EmitterConfig c = { .lifespan = EOP(evo ? 0x3e8 : 0x4b0), .rotate = ERND(0, 0x168), .alpha = evo ? (EmitterOp){ 1, 0, 2, Ease_ExpoIn } : (EmitterOp){ 0, 1, 2, Ease_ExpoOut },
+                            .angle = { 0, 0x168, 1 }, .angleSteps = 0x1f, .speed = ERND(0x32, 0x64), .quantity = 0x50, .scale = evo ? ERANGE(2, 1) : ERANGE(2, 0.1f), .frequency = 0x50, .ntints = 4, .hasZone = 1, .zoneRadius = 0x20, .on = 0 };
+        for (int k = 0; k < 4; k++) c.tints[k] = evo ? T2[i][k] : T1[i][k];
+        if (!evo && i == 0) {  // MakeEmitter_Frames: i fiori
+            for (int k = 1; k <= 10; k++) c.frames[c.nframes++] = frame_get("vfx", TextFormat("flo_%02d.png", k));
+            c.rotate = (EmitterOp){ 0, 0x2d0, 2, Ease_SineInOut };
+        } else c.frameRef = &w->seasonFrame[evo ? i : i == 3 ? 1 : 0];  // Animated: foglia, foglia, neve / terra, vento, fuoco, acqua, vuoto
+        b->SeasonPfx[i] = particles_add();
+        b->SeasonPfx[i]->s.depth = game_height;
+        b->SeasonEmit[i] = particles_createEmitter(b->SeasonPfx[i], c);
+        b->SeasonPfx[i]->hasWell = 1;  // createGravityWell({ power, epsilon, gravity: 200 })
+        b->SeasonPfx[i]->wellPower = (evo ? 0.5f : 1) * 0xc8, b->SeasonPfx[i]->wellEpsilon = evo ? 0x28 * 0x28 : 0x14 * 0x14;
+    }
+    for (int i = 0; i < 6; i++) b->fsTween[i] = (TweenRef){ -1, 0 };
+}
+static void B_FS_expire(void *ctx) { Bullet *b = ctx; time_removeEvent(b->ExpireTimer); Bullet_DeSpawn(b); }
+static void B_FS_follow(void *ctx) {
+    Bullet *b = ctx;
+    b->ring.x = b->rainbow.x = b->rays.x = b->kanji.x = b->lightning.x = b->s.x;
+    b->ring.y = b->rainbow.y = b->rays.y = b->kanji.y = b->lightning.y = b->s.y;
+}
+static void B_FS_ringOff(void *ctx) { ((Bullet *)ctx)->ring.visible = 0; }
+static void B_FS_rainbowOff(void *ctx) { ((Bullet *)ctx)->rainbow.visible = 0; }
+static void B_FS_raysOff(void *ctx) { ((Bullet *)ctx)->rays.visible = 0; }
+static void B_FS_kanjiOut(void *ctx) {
+    Bullet *b = ctx;
+    tween_stop(b->fsTween[4]);
+    b->kanjiTint = 0xffffff;
+    b->fsTween[4] = tweens_add((TweenConfig){ .props = { { &b->kanji.scaleX, &b->kanji.scaleY, 4 }, { &b->kanji.alpha, NULL, 0 }, { &b->kanjiTint, NULL, 0 } }, .nprops = 3, .duration = 0xc8 });
+}
+static void B_FS_lightningOut(void *ctx) {
+    Bullet *b = ctx;
+    b->lightningTint = 0xffffff;
+    tweens_add((TweenConfig){ .props = { { &b->lightning.alpha, NULL, 0 }, { &b->lightningTint, NULL, 0 } }, .nprops = 2, .duration = 0x64 });
+}
+static void B_FS_OnRecycle(Bullet *b) {
+    static const char *const K1[4] = { "k_spring.png", "k_summer.png", "k_autumn.png", "k_winter.png" }, *const K2[5] = { "k_earth.png", "k_wind.png", "k_fire.png", "k_water.png", "k_void.png" };
+    static const char *const SND[5] = { "Seasons2", "Seasons3", "Seasons4", "Seasons5", "Seasons6" };
+    int evo = b->vt == &B_FourSeasons2;
+    float a = Weapon_PArea(b->weapon);
+    Bullet_OnRecycle(b);
+    body_setCircle(&b->s.body, 0x10, b->s.body.offset.x, b->s.body.offset.y);
+    b->s.body.enable = 1;
+    b->s.visible = 0;
+    b->season = b->indexInWeapon % (evo ? 5 : 4);
+    b->kanji.frame = frame_get("vfx", (evo ? K2 : K1)[b->season]);
+    ParticleEmitter *e = b->SeasonEmit[b->season];
+    if (!evo) e->c.quantity = (int)(0x10 * a);
+    b->s.alpha = 1;
+    sprite_setScale(&b->s, a);
+    e->c.speed = ERND(5 * a, 0xa * a);
+    e->c.zoneRadius = fmaxf(0x20, 0x10 * a);
+    b->isCullable = 0;
+    time_removeEvent(b->ExpireTimer);
+    b->ExpireTimer = time_addEvent(0x1f4, 0, 0, B_FS_expire, b);
+    // TryDetonate
+    emitter_emitParticleAt(e, b->s.x, b->s.y, 0);
+    Sound_PlaySound(SND[b->season], 0.5f, 1, 0, b->season == 1 || b->season == 4 ? 0x1770 : 0x1f4, 1);
+    B_FS_follow(b);
+    for (int i = 0; i < 6; i++) tween_stop(b->fsTween[i]);
+    b->ring.visible = 1, sprite_setScale(&b->ring, 0);
+    b->fsTween[0] = tweens_add((TweenConfig){ .props = { { &b->ring.scaleX, &b->ring.scaleY, a } }, .nprops = 1, .duration = 0xc8, .onUpdate = B_FS_follow, .onComplete = B_FS_ringOff, .ctx = b });
+    b->rainbow.visible = 1, sprite_setScale(&b->rainbow, 0), b->rainbow.angle = 0;
+    b->fsTween[1] = tweens_add((TweenConfig){ .props = { { &b->rainbow.scaleX, &b->rainbow.scaleY, a }, { &b->rainbow.angle, NULL, 0x168 } }, .nprops = 2, .duration = 0xfa, .onUpdate = B_FS_follow, .onComplete = B_FS_rainbowOff, .ctx = b });
+    b->rays.visible = 1, sprite_setScale(&b->rays, 0), b->rays.angle = 0;
+    b->fsTween[2] = tweens_add((TweenConfig){ .props = { { &b->rays.scaleX, &b->rays.scaleY, 1.2f * a } }, .nprops = 1, .duration = 0x3c, .onUpdate = B_FS_follow, .onComplete = B_FS_raysOff, .ctx = b });
+    b->kanji.visible = 1, sprite_setScale(&b->kanji, 0), b->kanji.alpha = 1, b->kanji.tint = 0xffffff, b->kanjiTint = 0xffffff;
+    b->fsTween[3] = tweens_add((TweenConfig){ .props = { { &b->kanji.scaleX, &b->kanji.scaleY, 2 } }, .nprops = 1, .duration = 0xc8, .onUpdate = B_FS_follow, .onComplete = B_FS_kanjiOut, .ctx = b });
+    if (evo && b->season == 4) {
+        b->lightning.visible = 1, sprite_setScale(&b->lightning, 0), b->lightning.alpha = 1, b->lightning.tint = 0xffffff, b->lightningTint = 0xffffff;
+        b->fsTween[5] = tweens_add((TweenConfig){ .props = { { &b->lightning.scaleX, &b->lightning.scaleY, game_width / 480.0f } }, .nprops = 1, .duration = 0x64, .onUpdate = B_FS_follow, .onComplete = B_FS_lightningOut, .ctx = b });
+    }
+}
+static void B_FS_Update(Bullet *b, float delta) {
+    (void)delta;
+    int evo = b->vt == &B_FourSeasons2;
+    Weapon *w = b->weapon;
+    b->s.x = w->seasonPos[b->indexInWeapon].x, b->s.y = w->seasonPos[b->indexInWeapon].y;
+    b->s.depth = -game_height;
+    b->kanji.tint = (unsigned)b->kanjiTint;  // il tween interpola il numero intero
+    if (evo) b->lightning.tint = (unsigned)b->lightningTint;
+    for (int i = 0; i < (evo ? 5 : 4); i++) {
+        b->SeasonPfx[i]->wellX = evo ? b->s.x : Core.Player->s.x;
+        b->SeasonPfx[i]->wellY = evo ? b->s.y : Core.Player->s.y;
+    }
+}
+static void B_FS_DeSpawn(Bullet *b) { b->isCullable = 1; base_DeSpawn(b); }
+static const BulletVT B_FourSeasons = { "vfx", "blurBlack2.png", B_FS_ctor, NULL, B_FS_OnRecycle, NULL, B_FS_Update, B_FS_DeSpawn };
+static const BulletVT B_FourSeasons2 = { "vfx", "blurBlack2.png", B_FS_ctor, NULL, B_FS_OnRecycle, NULL, B_FS_Update, B_FS_DeSpawn };
+
+// --- B_Spellstring (0x91a5): il filo dal mago al bersaglio -------------------------------------------------------------
+static void B_String_trailDraw(Sprite *s) { Bullet *b = s->owner; if (s->visible) Rope_drawH(b->ropePts, 0xa, b->trailFrame, 1, s->alpha, 1, 0); }
+static void B_String_despawn(void *ctx) { Bullet_DeSpawn(ctx); }
+static void B_String_FadeOut(Bullet *b) {
+    tween_stop(b->fadeOutTween);
+    b->fadeOutTween = tweens_add((TweenConfig){ .props = { { &b->trail.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x64, .onComplete = B_String_despawn, .ctx = b });
+}
+static void B_String_ctor(Bullet *b) {
+    b->Pfx = particles_add();
+    particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "PfxHoly1.png"), frame_get("vfx", "PfxHoly2.png") }, .nframes = 2, .speed = EOP(0), .quantity = 1, .lifespan = EOP(0x12c), .alpha = ERANGE(1, 0), .on = 0 });
+    b->trailFrame = frame_get("vfx", frand() >= 0.5f ? "spellstring1.png" : "spellstring2.png");
+    sprite_init(&b->trail, NULL, b->s.x, b->s.y);
+    b->trail.owner = b, b->trail.draw = B_String_trailDraw;
+    children_add(&b->trail);
+    b->fadeOutTween = b->tween = (TweenRef){ -1, 0 };
+}
+static void B_String_OnRecycle(Bullet *b) {
+    Bullet_OnRecycle(b);
+    b->expired = 0, b->updateLoops = 0;
+    b->s.body.enable = 0;
+    b->trail.visible = 1;
+    b->startingPoint = (Vector2){ b->s.x, b->s.y };
+    Sound_PlaySound("SpellString", 0.1f, 1, -0x64 * b->indexInWeapon, 0xc8, 4);
+    b->trail.alpha = 1;
+    tween_stop(b->tween);
+    float target = -b->angleLerp;  // il valore finale si calcola prima di onStart (sic)
+    b->angleLerp = 2 * (frand() - 0.5f);
+    b->tween = tweens_add((TweenConfig){ .props = { { &b->angleLerp, NULL, target } }, .nprops = 1, .duration = 0x78 });
+}
+static void B_String_SetTarget(Bullet *b, Vector2 t) { (void)t; b->target = b->weapon->target; }
+static void B_String_Update(Bullet *b, float delta) {
+    (void)delta;
+    b->updateLoops++;
+    if (!b->expired && b->updateLoops > 1) b->expired = 1, B_String_FadeOut(b);
+    b->trail.depth = b->s.y - Core.Player->s.y + 0.5f * game_height;
+    if (!b->target) return;
+    Vector2 t = { b->target->x, b->target->y }, st = b->startingPoint;
+    float a = 0.5f * b->angleLerp, sn = sinf(a), cs = cosf(a), rx = t.x - st.x, ry = t.y - st.y;
+    Vector2 c = { rx * cs - ry * sn + st.x, rx * sn + ry * cs + st.y };
+    for (int i = 0; i < 0xa; i++) {  // QuadraticBezier.getPoints(9)
+        float k = i / 9.0f, u = 1 - k;
+        b->ropePts[i] = (Vector2){ u * u * t.x + 2 * u * k * c.x + k * k * st.x, u * u * t.y + 2 * u * k * c.y + k * k * st.y };
+        if (i < 9) manager_emitParticleAt(b->Pfx, b->ropePts[i].x, b->ropePts[i].y);
+    }
+}
+static void B_String_DeSpawn(Bullet *b) { tween_stop(b->tween); b->trail.visible = 0; base_DeSpawn(b); }
+static const BulletVT B_Spellstring = { "vfx", "ProjectileHoly1.png", B_String_ctor, NULL, B_String_OnRecycle, NULL, B_String_Update, B_String_DeSpawn, B_String_SetTarget };
+
+// --- B_Spellstream (0x15475): il cerchio che avanza, cresce e rallenta --------------------------------------------------
+static void B_Stream_ctor(Bullet *b) {
+    b->Pfx = particles_add();
+    b->PfxEmitter1 = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "2Spell1.png"), frame_get("vfx", "2Spell2.png") }, .nframes = 2, .speed = EOP(0), .quantity = 1, .lifespan = ERND(0x12c, 0x2bc),
+        .alpha = ERANGE(1, 0), .scale = ERND(1, 2), .hasZone = 1, .zoneRadius = 0x10, .on = 0 });
+    b->PfxEmitter2 = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "2Spell3.png"), frame_get("vfx", "2Spell4.png") }, .nframes = 2, .speed = EOP(0), .quantity = 1, .lifespan = ERND(0x64, 0xc8),
+        .alpha = ERANGE(1, 0), .scale = { 0, 2, 2, Ease_QuintOut }, .hasZone = 1, .zoneRadius = 0x10, .on = 0 });
+    b->ScaleTween = b->SpeedTween = (TweenRef){ -1, 0 };
+    b->ExpireTimer = (Timer){ -1, 0 };
+}
+static void B_Stream_expire(void *ctx) { Bullet_DeSpawn(ctx); }
+static void B_Stream_OnRecycle(Bullet *b) {
+    Weapon *w = b->weapon;
+    Bullet_OnRecycle(b);
+    b->isCullable = 0;
+    b->s.visible = 0;
+    sprite_setScale(&b->s, 1);
+    body_setCircle(&b->s.body, 1, -0.5f, -0.5f);
+    b->s.body.enable = 1;
+    b->deceleration = 2;
+    b->s.x += 8 * w->critChancesArray[w->critIndex++ % 1000], b->s.y -= 0xc;  // GetChanceFromArray
+    Bullet_SetForNearestEnemy(b, &b->aimVec);
+    sprite_setVelocity(&b->s, b->aimVec.x, b->aimVec.y);
+    int shortLife = Weapon_PDuration(w) < 0x2ee;
+    tween_stop(b->ScaleTween);
+    b->ScaleTween = tweens_add((TweenConfig){ .props = { { &b->s.scaleX, &b->s.scaleY, 0x10 * (1 + Weapon_PArea(w)) } }, .nprops = 1, .duration = 0x2ee, .onComplete = shortLife ? B_Stream_expire : NULL, .ctx = b });
+    time_removeEvent(b->ExpireTimer);
+    if (!shortLife) b->ExpireTimer = time_addEvent(Weapon_PDuration(w), 0, 0, B_Stream_expire, b);  // durationTween
+    tween_stop(b->SpeedTween);
+    b->SpeedTween = tweens_add((TweenConfig){ .props = { { &b->deceleration, NULL, -0.75f } }, .nprops = 1, .duration = 0x2ee, .ease = Ease_SineInOut });
+    Sound_PlaySound("Song", 0.4f, 1, 0, 0x96, 1);
+}
+static void B_Stream_Update(Bullet *b, float delta) {
+    (void)delta;
+    float sc = b->s.scaleX, n = fminf(0xa0, 0.25f * sc);
+    b->PfxEmitter1->c.zoneRadius = b->PfxEmitter2->c.zoneRadius = sc;
+    emitter_emitParticleAt(b->PfxEmitter1, b->s.x, b->s.y, (int)ceilf(n));
+    emitter_emitParticleAt(b->PfxEmitter2, b->s.x, b->s.y, (int)ceilf(0.5f * n));
+    sprite_setVelocity(&b->s, b->aimVec.x * b->deceleration, b->aimVec.y * b->deceleration);
+}
+static void B_Stream_DeSpawn(Bullet *b) { time_removeEvent(b->ExpireTimer); tween_stop(b->SpeedTween), tween_stop(b->ScaleTween); base_DeSpawn(b); }
+static const BulletVT B_Spellstream = { "vfx", "WhiteDot.png", B_Stream_ctor, NULL, B_Stream_OnRecycle, NULL, B_Stream_Update, B_Stream_DeSpawn };
+
+// --- B_Spellstrike (0x4990): il fulmine sul bersaglio ---------------------------------------------------------------------
+static void B_Strike_ctor(Bullet *b) {
+    b->Pfx = particles_add();
+    b->PfxEmitter1 = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "2Spell1.png"), frame_get("vfx", "2Spell2.png") }, .nframes = 2, .speed = ERND(0x32, 0x96), .quantity = 1, .lifespan = ERND(0x12c, 0x2bc),
+        .alpha = ERANGE(1, 0), .scale = ERND(1, 2), .hasZone = 1, .zoneRadius = 0x10, .on = 0 });
+    b->PfxEmitter2 = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "2Spell3.png"), frame_get("vfx", "2Spell4.png") }, .nframes = 2, .speed = EOP(0), .quantity = 1, .lifespan = ERND(0x96, 0x12c),
+        .alpha = ERANGE(1, 0), .scale = { 0, 2, 2, Ease_QuintOut }, .hasZone = 1, .zoneRadius = 0x10, .on = 0 });
+    b->ScaleTween = b->SpeedTween = (TweenRef){ -1, 0 };
+}
+static void B_Strike_done(void *ctx) { Bullet *b = ctx; b->s.visible = 0; Bullet_DeSpawn(b); }
+static void B_Strike_emit(void *ctx) {
+    Bullet *b = ctx;
+    b->PfxEmitter1->c.zoneRadius = b->PfxEmitter2->c.zoneRadius = b->radius;
+    emitter_emitParticleAt(b->PfxEmitter1, b->s.x, b->s.y, 4);
+    emitter_emitParticleAt(b->PfxEmitter2, b->s.x, b->s.y, 2);
+}
+static void B_Strike_OnRecycle(Bullet *b) {
+    Bullet_OnRecycle(b);
+    b->s.body.enable = 0;
+    b->s.flipX = b->s.x > Core.Player->s.x;
+    tween_stop(b->ScaleTween);
+    sprite_setScale(&b->s, 0), b->s.visible = 1;
+    b->ScaleTween = tweens_add((TweenConfig){ .props = { { &b->s.scaleX, &b->s.scaleY, 2 } }, .nprops = 1, .duration = 0x50, .ease = Ease_BounceOut, .onComplete = B_Strike_done, .ctx = b });
+    tween_stop(b->SpeedTween);
+    b->radius = 0x20;
+    b->SpeedTween = tweens_add((TweenConfig){ .props = { { &b->radius, NULL, 0x40 } }, .nprops = 1, .duration = 0x50, .onUpdate = B_Strike_emit, .ctx = b });
+    Sound_PlaySound("SpellStrike", b->weapon->volume ? b->weapon->volume : 0.15f, 1, -0x64 * b->indexInWeapon, 0xc8, 4);
+}
+static void B_Strike_Update(Bullet *b, float delta) { (void)delta; b->Pfx->s.depth = b->s.depth - 1; }
+static const BulletVT B_Spellstrike = { "vfx", "2Strike1.png", B_Strike_ctor, NULL, B_Strike_OnRecycle, NULL, B_Strike_Update };
+
+// --- B_Spellstrom (0x4124): due sfere nere che seguono i pozzi, senza scadenza -----------------------------------------------
+static void B_Strom_ctor(Bullet *b) { sprite_setTint(&b->s, 0), b->s.alpha = 0.65f, b->isCullable = 0; }
+static void B_Strom_clearHits(void *ctx) { ((Bullet *)ctx)->n_hit = 0; }
+static void B_Strom_OnRecycle(Bullet *b) {
+    Bullet_OnRecycle(b);
+    if (b->alreadyRecycled) return;
+    b->s.visible = 1, b->alreadyRecycled = 1;
+    sprite_setScale(&b->s, 1);
+    body_setCircle(&b->s.body, 0x40, 0, 0);
+    time_removeEvent(b->HitboxTimer);
+    b->HitboxTimer = time_addEvent(b->weapon->hitBoxDelay, 1, 0, B_Strom_clearHits, b);
+    b->s.depth = -game_height - 1;
+}
+static void B_Strom_Update(Bullet *b, float delta) { (void)delta; b->s.x = b->weapon->wellPos[b->indexInWeapon].x, b->s.y = b->weapon->wellPos[b->indexInWeapon].y; }
+static void B_Strom_DeSpawn(Bullet *b) { base_DeSpawn(b); b->s.visible = 0; }
+static const BulletVT B_Spellstrom = { "vfx", "blur128.png", B_Strom_ctor, NULL, B_Strom_OnRecycle, NULL, B_Strom_Update, B_Strom_DeSpawn };
+
 // --- RibbonTrail orizzontale (0x7c1 su una Rope horizontal = true): vertici a mezza altezza del fotogramma ------------
 static void Rope_drawH(const Vector2 *pts, int n, const Frame *f, float scale, float alpha, int add, int flipY) {  // n <= 128
     if (!f || alpha <= 0) return;
@@ -6027,6 +6957,7 @@ static void base_MakeLevelOne(Weapon *w) {
     // bgm, unexcludeSelf: nessuna delle armi tradotte li ha
     if (w->vt->CheckArcanas) w->vt->CheckArcanas(w);
     w->lastFiringInterval = Weapon_PInterval(w);
+    if (Player_is(Core.Player, "SYUUTO") && !strcmp(w->bulletType, "SUMMONNIGHT2")) Syuuto_Morph(Core.Player);  // OnWeaponMadeLevelOne
 }
 
 static void base_onBulletOverlapsEnemy(Weapon *w, Bullet *b, Enemy *e) {
@@ -6040,10 +6971,13 @@ static void Weapon_onBulletOverlapsEnemy(void *ctx, Sprite *bs, Sprite *es) {
 }
 static void Destructible_GetDamagedFwd(void *d, float amount);
 static int Destructible_isDead(void *d);
+static const char *Destructible_hitBy;
 static void Weapon_onBulletOverlapsDestuctible(void *ctx, Sprite *bs, Sprite *ds) {  // (sic) nome originale
     Weapon *w = ctx;
     Bullet *b = bs->owner;
+    Destructible_hitBy = w->bulletType;  // i sigilli di Foscari guardano l'arma
     if (!Bullet_HasAlreadyHitObject(b, ds->owner, Destructible_isDead(ds->owner))) Destructible_GetDamagedFwd(ds->owner, Weapon_PPower(w));
+    Destructible_hitBy = NULL;
 }
 
 static void Weapon_onBulletOverlapsWall(void *ctx, Sprite *bs, Sprite *tile) {  // Bullet.OnHasHitWall: DeSpawn (Fire Wand: in piu' solo con l'arcana Hellfire)
@@ -6307,9 +7241,10 @@ static void Weapon_onSecondaryBulletOverlapsEnemy(void *ctx, Sprite *bs, Sprite 
 }
 static const BulletVT B_FireExplosion, B_ColdExplosion;
 static void Weapon_onBulletOverlapsDestuctible(void *ctx, Sprite *bs, Sprite *ds);
+static const BulletVT B_Millionaire;
 static Bullet *Weapon_SpawnExplosionAt(Weapon *w, float x, float y, int index) {
     if (!w->secondaryPool) {
-        const BulletVT *vt = !strcmp(w->explosionType, "FIREEXPLOSION") ? &B_FireExplosion : !strcmp(w->explosionType, "COLDEXPLOSION") ? &B_ColdExplosion : &B_FlareExplosion;
+        const BulletVT *vt = !strcmp(w->explosionType, "FIREEXPLOSION") ? &B_FireExplosion : !strcmp(w->explosionType, "COLDEXPLOSION") ? &B_ColdExplosion : !strcmp(w->explosionType, "SEC_MILLIONAIRE") ? &B_Millionaire : &B_FlareExplosion;
         w->secondaryPool = BulletPool_new(w, vt);
         physics_addOverlap(&w->secondaryPool->group, &Core.Enemies, Weapon_onSecondaryBulletOverlapsEnemy, w);
         physics_addOverlap(&w->secondaryPool->group, &Core.Destructibles, Weapon_onBulletOverlapsDestuctible, w);
@@ -6359,6 +7294,7 @@ static Weapon *Core_GetHiddenWeapon(const char *type) {
     for (int i = 0; i < Core.n_HiddenWeapons; i++) if (!strcmp(Core.HiddenWeapons[i]->bulletType, type)) return Core.HiddenWeapons[i];
     return NULL;
 }
+static void Weapon_LevelUpNow(Weapon *w) { w->vt->LevelUp(w); }
 static Weapon *Aquarius_Add(const char *type, int toLevel) {  // AddHiddenWeapon + LevelUp fino al livello (l'originale non si ferma: qui si', a fine dati)
     Weapon *c = Core_AddHiddenWeapon(type);
     while (c && c->level < toLevel && Weapon_LevelUp(c)) {}
@@ -6650,6 +7586,122 @@ static const WeaponVT W_Vortex = { BASE, .CheckArcanas = CA_tragic, .bullet = &B
 // W_Diamond (0xc916, Runetracer): bersaglio a caso; danno come la base (onBulletOverlapsEnemy ridefinito identico)
 static void W_Diamond_Fire(Weapon *w) { w->target = Core.Enemies.n ? Core.Enemies.items[(int)floorf(frand() * Core.Enemies.n)] : NULL; base_Fire(w); }
 static const WeaponVT W_Diamond = { BASE, .CheckArcanas = CA_twilightJewels, .bullet = &B_Diamond, .Fire = W_Diamond_Fire };
+// W_SilverWind (0xf6a6) / W_SilverWind2 (0xc271): i nemici uccisi possono lasciare un cuore
+static void W_SilverWind_onBulletOverlapsEnemy(Weapon *w, Bullet *b, Enemy *e) {
+    if (e->isDead || Bullet_HasAlreadyHitObject(b, e, e->isDead)) return;
+    Enemy_GetDamaged(e, Weapon_PPower(w), (int)w->hitVFX, w->knockback, w->bulletType);
+    w->stats_inflictedDamage += Weapon_PPower(w);
+    if (!e->isDead) return;
+    float c = w->critChancesArray[w->critIndex % 1000];
+    w->critIndex++;
+    if (c <= w->chance * Player_PLuck(Core.Player)) {
+        Pickup *h = Core_MakePickup(e->s.x, e->s.y, "LITTLEHEART");
+        if (h) h->goToPlayer = 1, h->time = 1, h->quiet = 1;
+    }
+}
+static const WeaponVT W_SilverWind = { BASE, .PPower = armor_PPower, .CheckArcanas = CA_twilight, .bullet = &B_SilverWind, .onBulletOverlapsEnemy = W_SilverWind_onBulletOverlapsEnemy };
+static const WeaponVT W_SilverWind2 = { BASE, .PPower = armor_PPower, .CheckArcanas = CA_twilight, .bullet = &B_SilverWind2, .onBulletOverlapsEnemy = W_SilverWind_onBulletOverlapsEnemy };
+// W_MirageRobe (0x1753d) / W_MirageRobe2 (0xed6, senza collider fra le copie)
+static void W_MirageRobe_ctor(Weapon *w) {
+    w->explosionType = "COLDEXPLOSION";
+    sprite_init(&w->image, frame_get("vfx", "sPFX_ring_64.png"), 0, 0);
+    w->image.originX = 0.5f, w->image.originY = 1;
+    w->image.tint = 0x7070ff;  // semplificazione: quattro angoli (0xff, 0xff, 0xe0e0ff, 0xe0e0ff) reso col colore medio
+    w->image.alpha = 0, w->image.depth = -1;
+    children_add(&w->image);
+}
+static void W_Mirage_ringFollow(void *ctx) { Weapon *w = ctx; w->image.x = Core.Player->s.x, w->image.y = Core.Player->s.y; }
+static void W_Mirage_ringOut(void *ctx) {
+    Weapon *w = ctx;
+    if (w->hasRingTween2) tween_stop(w->ringTween2);
+    w->image.alpha = 0.5f;
+    w->ringTween2 = tweens_add((TweenConfig){ .props = { { &w->image.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x64 });
+    w->hasRingTween2 = 1;
+}
+static void W_MirageRobe_Fire(Weapon *w) {
+    base_Fire(w);
+    Sound_PlaySound("Clones", 0.3f, 1, 0x3e8 * (frand() - 0.25f), 0x64, 8);
+    if (w->hasRingTween2) tween_stop(w->ringTween2);
+    if (w->hasRingTween) tween_stop(w->ringTween);
+    W_Mirage_ringFollow(w);
+    sprite_setScale(&w->image, 0);
+    w->image.alpha = 1;
+    w->ringTween = tweens_add((TweenConfig){ .props = { { &w->image.alpha, NULL, 0.5f }, { &w->image.scaleX, &w->image.scaleY, 1.25f * fminf(Weapon_PArea(w), 1) } }, .nprops = 2, .duration = 0x96,
+                                             .onUpdate = W_Mirage_ringFollow, .onComplete = W_Mirage_ringOut, .ctx = w });
+    w->hasRingTween = 1;
+}
+static void W_MirageRobe_OnStart(Weapon *w) { base_OnStart(w); physics_addCollider(&w->pool->group, &w->pool->group, NULL, NULL); }
+static void W_MirageRobe_onBulletOverlapsEnemy(Weapon *w, Bullet *b, Enemy *e) {
+    if (e->isDead || Bullet_HasAlreadyHitObject(b, e, e->isDead)) return;
+    Enemy_GetDamaged(e, Weapon_PPower(w), (int)w->hitVFX, w->knockback, w->bulletType);
+    w->stats_inflictedDamage += Weapon_PPower(w);
+    if (w->chance <= 0) return;
+    float c = w->critChancesArray[w->critIndex % 1000];
+    w->critIndex++;
+    if (c < w->chance * Player_PLuck(Core.Player)) Weapon_SpawnExplosionAt(w, b->s.x, b->s.y, 0);
+}
+static const WeaponVT W_MirageRobe = { BASE, .bullet = &B_MirageRobe, .ctor = W_MirageRobe_ctor, .Fire = W_MirageRobe_Fire, .OnStart = W_MirageRobe_OnStart,
+                                       .onBulletOverlapsEnemy = W_MirageRobe_onBulletOverlapsEnemy, .SecondaryPPower = Weapon_PPower };
+static const WeaponVT W_MirageRobe2 = { BASE, .bullet = &B_MirageRobe2, .ctor = W_MirageRobe_ctor, .Fire = W_MirageRobe_Fire,
+                                        .onBulletOverlapsEnemy = W_MirageRobe_onBulletOverlapsEnemy, .SecondaryPPower = Weapon_PPower };
+// W_Bubble (0x16828) / W_Bubble2 (0x1015a): collider fra le bolle; solo la prima si ferma fuori dal raggio del magnete
+static void W_Bubble_OnStart(Weapon *w) { base_OnStart(w); physics_addCollider(&w->pool->group, &w->pool->group, NULL, NULL); }
+static void W_Bubble_Update(Weapon *w, float delta) {
+    base_Update(w, delta);
+    Magnet *m = Core.Magnet;
+    for (int i = 0; i < w->pool->group.n; i++) {  // OverlapCirc
+        Bullet *b = w->pool->group.items[i]->owner;
+        float dx = m->s.x - b->s.body.position.x, dy = m->s.y - b->s.body.position.y;
+        if (sqrtf(dx * dx + dy * dy) > m->radius + b->s.body.radius) b->save_vel_x = b->save_vel_y = 0;
+    }
+}
+static const WeaponVT W_Bubble = { BASE, .bullet = &B_Bubble, .OnStart = W_Bubble_OnStart, .Update = W_Bubble_Update };
+static const WeaponVT W_Bubble2 = { BASE, .bullet = &B_Bubble2, .OnStart = W_Bubble_OnStart };
+// W_SummonNight (0xbecb) / W_SummonNight2 (0x6c73): colonne equidistanti sulla larghezza dello schermo, nel punto in cui si trovava il giocatore allo sparo
+typedef struct { Weapon *w; float x, y; int index, red; } NightShot;
+static void W_Night_shot(void *ctx) {
+    NightShot *s = ctx;
+    BulletPool_SpawnAt(s->red ? s->w->redPool : s->w->pool, s->x, s->y, s->w, s->index);
+}
+static void W_Night_schedule(Weapon *w, float x, float y, int i, int red) {
+    static NightShot shots[64];  // come i ShotCtx: un anello basta per i colpi ritardati in volo
+    static int n;
+    NightShot one = { w, x, y, i, red };
+    if (w->repeatInterval * i > 0) {
+        NightShot *s = &shots[n++ & 63];
+        *s = one;
+        w->lastShotTimer = time_addEvent(w->repeatInterval * i, 0, 0, W_Night_shot, s);
+    } else W_Night_shot(&one);
+}
+static void W_SummonNight_Fire(Weapon *w) {
+    Sound_PlaySound("ExploNight", 0.9f, 1, 0, 0x64, 8);
+    int n = (int)Weapon_PAmount(w);
+    float step = game_width / (1.0f + Weapon_PAmount(w)), x = Core.Player->s.x - 0.5f * game_width, y = Core.Player->s.y - 0.5f * game_height;
+    for (int i = 0; i < n; i++) W_Night_schedule(w, x + step * (1 + i), y, i, 0);
+    if (w->lastFiringInterval != Weapon_PInterval(w)) w->lastFiringInterval = Weapon_PInterval(w), Weapon_ResetFiringTimer(w);
+}
+static const WeaponVT W_SummonNight = { BASE, .bullet = &B_SummonNight, .Fire = W_SummonNight_Fire };
+static void W_SummonNight2_ctor(Weapon *w) { w->skipAddingEvolution = 1; }
+static void W_Night2_bgm(void *ctx) { (void)ctx; po_sets("SelectedBGM", "BGM_Night2"); Sound_SetupAndPlayBGM_Banger(1); }
+static void W_SummonNight2_OnStart(Weapon *w) {
+    base_OnStart(w);
+    w->redPool = BulletPool_new(w, &B_SummonNight);
+    physics_addOverlap(&w->redPool->group, &Core.Enemies, Weapon_onBulletOverlapsEnemy, w);
+    physics_addOverlap(&w->redPool->group, &Core.Destructibles, Weapon_onBulletOverlapsDestuctible, w);
+    if (BGM.idx == Sound_index("BGM_Night1")) {  // la musica di Syuuto cambia con l'evoluzione
+        Sound_FadeMusic(0, 0x64);
+        time_addEvent(0x64, 0, 0, W_Night2_bgm, NULL);
+    }
+}
+static void W_SummonNight2_Fire(Weapon *w) {
+    int n = (int)Weapon_PAmount(w);
+    float step = game_width / (1.0f + Weapon_PAmount(w)), x = Core.Player->s.x - 0.5f * game_width, y = Core.Player->s.y - 0.5f * game_height, y2 = Core.Player->s.y + 0.5f * game_height;
+    Sound_PlaySound("ExploNight", 0.9f, 1, 0x12c, 0x64, 8);
+    for (int i = 0; i < n; i++) W_Night_schedule(w, x + step * (1 + i), y, i, 1);
+    for (int i = 0; i < n - 1; i++) W_Night_schedule(w, x + 0.5f * step + step * (1 + i), y2, i, 0);
+    if (w->lastFiringInterval != Weapon_PInterval(w)) w->lastFiringInterval = Weapon_PInterval(w), Weapon_ResetFiringTimer(w);
+}
+static const WeaponVT W_SummonNight2 = { BASE, .bullet = &B_SummonNight2, .ctor = W_SummonNight2_ctor, .OnStart = W_SummonNight2_OnStart, .Fire = W_SummonNight2_Fire };
 // W_Lightning (0x26b9): spara da Update ogni PInterval (come Garlic); ScreenRectangle del giocatore
 static void W_UpdateFire(Weapon *w, float delta) {  // super.Update + totalTime, frameWalk, Fire
     base_Update(w, delta);
@@ -7352,6 +8404,7 @@ static void Weapon_onBulletOverlapsEnemy_Retaliation(void *ctx, Sprite *bs, Spri
     w->stats_inflictedDamage += p;
     if (Arcanas.hasDivineBloodline && e->isDead) Arcanas_IncreaseBloodlineBonus();
 }
+static void Weapon_onBulletOverlapsEnemy_NightSword(void *ctx, Sprite *bs, Sprite *es);
 static BulletPool *BulletPool_new(Weapon *w, const BulletVT *vt) {  // new BulletPool(scene, type)
     BulletPool *p = calloc(1, sizeof(BulletPool));
     p->weapon = w;
@@ -7359,6 +8412,424 @@ static BulletPool *BulletPool_new(Weapon *w, const BulletVT *vt) {  // new Bulle
     p->upperLimit = 0x32;
     return p;
 }
+// W_NightSword (0x1368) / W_NightSword2 (0xbe1f): sul colpo subito, sei fendenti sul giocatore; l'evoluzione si ferisce sparando
+static const float NightAngles[6] = { 0x14, -0x14, -0x46, 0x1e, -0x1e, 0x46 }, NightAngles2[6] = { 0x14, -0x14, -0x46, 0x1e, -0x1e, 0 };
+static float W_NightSword_PPower(Weapon *w) { return base_PPower(w) + Arcanas.bloodlineDamage; }  // (sic) il sangue due volte
+static void W_NightSword_canExplode(void *ctx) { ((Weapon *)ctx)->canExplode = 1; }
+static Bullet *W_NightSword_SpawnExplosionAt(Weapon *w, float x, float y, int index) {
+    if (!w->secondaryPool) {
+        w->secondaryPool = BulletPool_new(w, &B_NightSword);
+        physics_addOverlap(&w->secondaryPool->group, &Core.Enemies, Weapon_onBulletOverlapsEnemy_NightSword, w);
+        physics_addOverlap(&w->secondaryPool->group, &Core.Destructibles, Weapon_onBulletOverlapsDestuctible, w);
+    }
+    Bullet *b = BulletPool_SpawnAt(w->secondaryPool, x, y, w, index);
+    if (b) b->vt->SetTarget(b, (Vector2){ Core.Player->s.x, Core.Player->s.y });
+    return b;
+}
+static void W_NightSword_delayedExplosion(void *ctx) {
+    ShotCtx *c = ctx;
+    W_NightSword_SpawnExplosionAt(c->w, Core.Player->s.x, Core.Player->s.y, c->index);
+}
+static void W_NightSword_ExplodeOnPlayer(void *ctx) {
+    static ShotCtx shots[64];
+    static int n;
+    Weapon *w = ctx;
+    if (!w->canExplode) return;
+    w->canExplode = 0;
+    time_removeEvent(w->ExplodeTimer);
+    w->ExplodeTimer = time_addEvent(fmaxf(Weapon_PInterval(w), w->retaliationDelay), 0, 0, W_NightSword_canExplode, w);
+    W_NightSword_SpawnExplosionAt(w, Core.Player->s.x, Core.Player->s.y, 0);
+    for (int i = 1; i < 6; i++) {
+        ShotCtx *c = &shots[n++ & 63];
+        *c = (ShotCtx){ w, i };
+        time_addEvent(w->repeatInterval * i, 0, 0, W_NightSword_delayedExplosion, c);
+    }
+}
+static void W_NightSword_ctor(Weapon *w) {
+    w->fireAngles = NightAngles;
+    w->canFinish = 0, w->retaliationDelay = 0x258, w->volume = 1, w->canExplode = 1, w->canCrit = 0;
+    w->ExplodeTimer = (Timer){ -1, 0 };
+    PlayerEvents_add(EV_PLAYER_RECEIVEDDAMAGE, W_NightSword_ExplodeOnPlayer, w);
+    PlayerEvents_add(EV_PLAYER_LOSTSHIELD, W_NightSword_ExplodeOnPlayer, w);
+}
+static void W_NightSword2_ctor(Weapon *w) { W_NightSword_ctor(w); w->fireAngles = NightAngles2, w->canFinish = 1, w->volume = 0.5f; }
+static void W_NightSword_ResetFiringTimer(Weapon *w) { if (w->retaliationOnly) time_removeEvent(w->firingTimer); else base_ResetFiringTimer(w); }  // SetAsRetaliatoryOnly
+static void W_NightSword_SetAsRetaliatoryOnly(Weapon *w) { time_removeEvent(w->firingTimer); w->retaliationDelay = 0x3e8, w->retaliationOnly = 1; }
+static void W_NightSword_Fire(Weapon *w) {
+    static Sprite *list[512];  // closest: i successivi record di vicinanza, nell'ordine dei nemici
+    int n = 0;
+    float best = HUGE_VALF;
+    for (int i = 0; i < Core.Enemies.n && n < 512; i++) {
+        Enemy *e = (Enemy *)Core.Enemies.items[i];
+        if (e->isDead) continue;
+        float dx = Core.Player->s.x - e->s.x, dy = Core.Player->s.y - e->s.y, d = sqrtf(dx * dx + dy * dy);
+        if (d < best) best = d, list[n++] = &e->s;
+    }
+    w->target = n > 1 ? list[n - 1 - (int)floorf(frand() * n * 0.5f)] : n ? list[0] : NULL;
+    base_Fire(w);
+}
+static void W_NightSword2_Fire(Weapon *w) {
+    W_NightSword_Fire(w);
+    float d = fmaxf(1, Core.Player->hp / Core.Player->maxHp * 8);
+    Player_GetDamaged(Core.Player, Player_PArmor(Core.Player) + d);
+}
+static void W_NightSword_heart(Weapon *w, Enemy *e) {
+    float r = frand();
+    if (w->chance * Player_PLuck(Core.Player) <= r) return;
+    float o = 0xa * (r - 0.5f);
+    Pickup *h = Core_MakePickup(e->s.x + o, e->s.y - o, "LITTLEHEART");
+    if (h) h->goToPlayer = 1, h->time = 1;
+}
+static void W_NightSword_onBulletOverlapsEnemy(Weapon *w, Bullet *b, Enemy *e) {
+    if (e->isDead || Bullet_HasAlreadyHitObject(b, e, e->isDead)) return;
+    Enemy_GetDamaged(e, Weapon_PPower(w), (int)w->hitVFX, w->knockback, w->bulletType);
+    w->stats_inflictedDamage += Weapon_PPower(w);
+    if (e->isDead) W_NightSword_heart(w, e);
+}
+static void Weapon_onBulletOverlapsEnemy_NightSword(void *ctx, Sprite *bs, Sprite *es) {
+    Weapon *w = ctx;
+    Enemy *e = es->owner;
+    int wasDead = e->isDead;
+    Weapon_onBulletOverlapsEnemy_Retaliation(ctx, bs, es);
+    if (!wasDead && e->isDead) W_NightSword_heart(w, e);
+}
+static const WeaponVT W_NightSword = { BASE, .bullet = &B_NightSword, .ctor = W_NightSword_ctor, .PPower = W_NightSword_PPower, .Fire = W_NightSword_Fire,
+                                       .ResetFiringTimer = W_NightSword_ResetFiringTimer, .onBulletOverlapsEnemy = W_NightSword_onBulletOverlapsEnemy };
+static const WeaponVT W_NightSword2 = { BASE, .bullet = &B_NightSword, .ctor = W_NightSword2_ctor, .PPower = W_NightSword_PPower, .Fire = W_NightSword2_Fire,
+                                        .ResetFiringTimer = W_NightSword_ResetFiringTimer, .onBulletOverlapsEnemy = W_NightSword_onBulletOverlapsEnemy };
+// W_Bocce (0x113e4): il danno cresce con la distanza fra Fortuna e Maledizione
+static float W_Bocce_PPower(Weapon *w) {
+    float k = 1 + fminf(0xa, fabsf(Player_PLuck(Core.Player) - Player_PCurse(Core.Player)));
+    return fminf(10, (Arcanas.silentMight + Core.Player->power) * sinev(Core.Player->sineMight)) * w->power * k + Arcanas.bloodlineDamage;
+}
+static void W_Bocce_ctor(Weapon *w) {
+    sprite_init(&w->image, frame_get("vfx", "bubbleSphere.png"), 0.5f * game_width, 0.5f * game_height);
+    w->image.alpha = 0.1f, w->image.scrollFactor0 = 1;
+    sprite_setScale(&w->image, 2 * Weapon_PArea(w));
+    children_add(&w->image);
+    w->bocceTint = 0xffffff, w->nOrbs = 8;
+    tweens_add((TweenConfig){ .props = { { &w->image.alpha, NULL, 0.3f } }, .nprops = 1, .yoyo = 1, .duration = 0x3e8, .repeat = -1 });
+    tweens_add((TweenConfig){ .props = { { &w->bocceTint, NULL, 0x880000 } }, .nprops = 1, .yoyo = 1, .duration = 0x1770, .repeat = -1 });
+    for (int i = 0; i < 8; i++) {
+        sprite_init(&w->orbs[i], frame_get("vfx", "bulletFourSeasons.png"), 0, 0);
+        children_add(&w->orbs[i]);
+    }
+    for (int i = 0; i < 9; i++) w->orbAngles[i] = 2 * PI * (i / 9.0f), w->orbMul[i] = 0.8f + 0.2f * frand();
+}
+static void W_Bocce_Fire(Weapon *w) {
+    w->image.x = 0.5f * game_width, w->image.y = 0.5f * game_height;
+    sprite_setScale(&w->image, 2 * Weapon_PArea(w));
+    base_Fire(w);
+}
+static void W_Bocce_Update(Weapon *w, float delta) {
+    base_Update(w, delta);
+    w->image.tint = (unsigned)w->bocceTint;  // il tween interpola il numero intero, non i canali
+    w->image.depth = Core.Player->s.depth - 0.5f * game_height;
+    sprite_setScale(&w->image, 2 * PixelScale * Weapon_PArea(w));
+    w->image.x = 0.5f * game_width, w->image.y = 0.5f * game_height;
+    for (int i = 0; i < 9; i++) w->orbAngles[i] += PI / 0x168 * w->orbMul[i] * delta;
+    float area = Weapon_PArea(w), r = 0x20 * area, px = Core.Player->s.x, py = Core.Player->s.y;
+    for (int i = 0; i < 8; i++) {
+        float a = w->orbAngles[i], b = w->orbAngles[i + 1];
+        w->orbs[i].x = px + (i < 2 || i >= 6 ? cosf(a) : sinf(a)) * r;
+        w->orbs[i].y = py + (i < 2 || (i >= 4 && i < 6) ? sinf(b) : cosf(b)) * r;
+        sprite_setScale(&w->orbs[i], area);
+    }
+}
+static const WeaponVT W_Bocce = { BASE, .bullet = &B_Bocce, .ctor = W_Bocce_ctor, .PPower = W_Bocce_PPower, .PAmount = one_PAmount, .Fire = W_Bocce_Fire, .Update = W_Bocce_Update };
+// W_FourSeasons (0xa2d9) / W_FourSeasons2 (0x16755): quattro angoli che si stringono col livello / quattro angoli fissi piu' il centro
+static const WeaponVT W_FourSeasons2;
+static float W_FS_PPower(Weapon *w) {
+    float p = (w->power + 0.001f * Weapon_PDuration(w)) * Weapon_PAmount(w);
+    return fminf(10, (Arcanas.silentMight + Core.Player->power) * sinev(Core.Player->sineMight)) * p + Arcanas.bloodlineDamage;
+}
+static void W_FS_positions(Weapon *w) {
+    static const int OFF[9] = { 0xc0, 0xc0, 0xb0, 0xa0, 0x90, 0x80, 0x70, 0x60, 0x40 };
+    float o = w->vt == &W_FourSeasons2 ? 0x40 : OFF[w->level < 8 ? w->level : 8], hw = 0.5f * game_width, hh = 0.5f * game_height, px = Core.Player->s.x, py = Core.Player->s.y;
+    w->seasonPos[0] = (Vector2){ px - hw + o, py - hh + o };
+    w->seasonPos[1] = (Vector2){ px + hw - o, py - hh + o };
+    w->seasonPos[2] = (Vector2){ px - hw + o, py + hh - o };
+    w->seasonPos[3] = (Vector2){ px + hw - o, py + hh - o };
+    w->seasonPos[4] = (Vector2){ px, py };
+}
+static void W_FS_ctor(Weapon *w) {
+    w->nOrbs = w->vt == &W_FourSeasons2 ? 0x18 : 8;
+    for (int i = 0; i < w->nOrbs; i++) {
+        sprite_init(&w->orbs[i], frame_get("vfx", "bulletFourSeasons.png"), 0, 0);
+        w->orbs[i].scrollFactor0 = w->vt == &W_FourSeasons2;
+        children_add(&w->orbs[i]);
+    }
+    w->explodeOnExpire = 0;
+    w->seasonFrame[0] = frame_get("vfx", "leaf0000.png");
+}
+static void W_FS_animate(Weapon *w, float delta) {  // i fotogrammi delle RenderTexture, a 30 fps
+    static const struct { const char *fmt; int n; } A1[2] = { { "leaf%04d.png", 0x14 }, { "snowb%04d.png", 7 } },
+        A2[5] = { { "rock%04d.png", 0x30 }, { "spinThick%04d.png", 0x2c }, { "fiamma%04d.png", 0x19 }, { "icicle%04d.png", 0x18 }, { "lightning%04d.png", 4 } };
+    int evo = w->vt == &W_FourSeasons2;
+    w->seasonClock += delta;
+    int f = (int)(w->seasonClock * 0x1e / 1000);
+    for (int i = 0; i < (evo ? 5 : 2); i++) {
+        const char *fmt = evo ? A2[i].fmt : A1[i].fmt;
+        w->seasonFrame[i] = frame_get("vfx", TextFormat(fmt, f % (evo ? A2[i].n : A1[i].n)));
+    }
+}
+static void W_FS_spinOn(void *ctx) { ((Weapon *)ctx)->canSpin = 1; }
+static void W_FS_MakeLevelOne(Weapon *w) {
+    base_MakeLevelOne(w);
+    W_FS_animate(w, 0);
+    w->canSpin = 0;
+    for (int i = 0; i < 9; i++) w->orbAngles[i] = 2 * PI * 0.11f * i;
+    W_FS_positions(w);
+    for (int i = 0; i < 8; i++) {
+        Sprite *o = &w->orbs[i];
+        o->visible = 1, o->x = Core.Player->s.x, o->y = Core.Player->s.y;
+        tweens_add((TweenConfig){ .props = { { &o->x, NULL, w->seasonPos[i % 4].x }, { &o->y, NULL, w->seasonPos[i % 4].y } }, .nprops = 2, .duration = 0x1f4, .onComplete = W_FS_spinOn, .ctx = w });
+    }
+}
+static void W_FS2_MakeLevelOne(Weapon *w) {
+    base_MakeLevelOne(w);
+    W_FS_animate(w, 0);
+    for (int i = 0; i < 0x18; i++) w->orbAngles[i] = 2 * PI * (i / (float)0x18);
+}
+static void W_FS_Update(Weapon *w, float delta) {
+    base_Update(w, delta);
+    W_FS_positions(w);
+    W_FS_animate(w, delta);
+    if (!w->canSpin) return;
+    for (int i = 0; i < 9; i++) w->orbAngles[i] += PI / 0x168 * delta;
+    for (int i = 0; i < 8; i++) {
+        w->orbs[i].x = w->seasonPos[i % 4].x + cosf(w->orbAngles[i]) * 0x20;
+        w->orbs[i].y = w->seasonPos[i % 4].y + cosf(w->orbAngles[i + 1]) * 0x20;
+    }
+}
+static void W_FS2_Update(Weapon *w, float delta) {
+    base_Update(w, delta);
+    W_FS_positions(w);
+    W_FS_animate(w, delta);
+    float r = 0.65f * game_height, cx = 0.5f * game_width, cy = 0.5f * game_height;
+    for (int i = 0; i < 0x18; i++) {
+        w->orbAngles[i] += PI / 0x2710 * delta;
+        w->orbs[i].x = cx + cosf(w->orbAngles[i]) * r;
+        w->orbs[i].y = cy + sinf(w->orbAngles[i]) * r;
+    }
+}
+static void W_FS_shot(void *ctx) { ShotCtx *c = ctx; BulletPool_SpawnAt(c->w->pool, c->w->seasonPos[c->index].x, c->w->seasonPos[c->index].y, c->w, c->index); }
+static void W_FS_Fire(Weapon *w) {
+    static ShotCtx shots[64];
+    static int n;
+    Sound_PlaySound("Seasons1", 1, 1, 0, 0x7d0, 1);
+    for (int i = 0; i < (w->vt == &W_FourSeasons2 ? 5 : 4); i++) {
+        ShotCtx *c = &shots[n++ & 63];
+        *c = (ShotCtx){ w, i };
+        if (w->repeatInterval * i > 0) w->lastShotTimer = time_addEvent(w->repeatInterval * i, 0, 0, W_FS_shot, c);
+        else W_FS_shot(c);
+    }
+    if (w->lastFiringInterval != Weapon_PInterval(w)) w->lastFiringInterval = Weapon_PInterval(w), Weapon_ResetFiringTimer(w);
+}
+static const WeaponVT W_FourSeasons = { BASE, .bullet = &B_FourSeasons, .ctor = W_FS_ctor, .PPower = W_FS_PPower, .MakeLevelOne = W_FS_MakeLevelOne, .Update = W_FS_Update, .Fire = W_FS_Fire };
+static const WeaponVT W_FourSeasons2 = { BASE, .bullet = &B_FourSeasons2, .ctor = W_FS_ctor, .PPower = W_FS_PPower, .MakeLevelOne = W_FS2_MakeLevelOne, .Update = W_FS2_Update, .Fire = W_FS_Fire };
+// --- Foscari: gli incantesimi (0x142c3, 0x7d8a, 0xc553) e la loro unione (0xe817) ---------------------------------------------
+static Sprite *Weapon_closestAlive(float range) {  // dal giocatore; range: Number.MAX_VALUE se assente
+    Sprite *best = NULL;
+    float bd = range, px = Core.Player->s.x, py = Core.Player->s.y;
+    for (int i = 0; i < Core.Enemies.n; i++) {
+        Enemy *e = Core.Enemies.items[i]->owner;
+        if (e->isDead) continue;
+        float dx = px - e->s.body.center.x, dy = py - e->s.body.center.y, d = sqrtf(dx * dx + dy * dy);
+        if (d < bd) best = &e->s, bd = d;
+    }
+    return best;
+}
+static void Weapon_DirectDamage(Weapon *w, Sprite *t) {
+    Enemy *e = t->owner;
+    if (e->isDead) return;
+    Enemy_GetDamaged(e, Weapon_PPower(w), (int)w->hitVFX, w->knockback, w->bulletType);
+    w->stats_inflictedDamage += Weapon_PPower(w);
+}
+static float Might_P(float p) { return fminf(10, (Arcanas.silentMight + Core.Player->power) * sinev(Core.Player->sineMight)) * p + Arcanas.bloodlineDamage; }
+static Vector2 W_Spell_GetSource(Weapon *w) {
+    if (!w->wellSrc) return (Vector2){ Core.Player->s.x, Core.Player->s.y };
+    w->sourceIndex = (w->sourceIndex + 1) % 2;
+    return w->wellSrc[w->sourceIndex];
+}
+static float W_String_PPower(Weapon *w) { return Might_P(w->power * (1.25f * Weapon_PSpeed(w))); }
+static void W_String_later(void *ctx) {
+    Weapon *w = ctx;
+    Sprite *t = Weapon_closestAlive(fminf(0.4f * game_width, 0.4f * game_height));
+    if (!t) return;
+    Vector2 s = W_Spell_GetSource(w);
+    w->target = t;
+    Weapon_FireOneBullet(w, s.x + 8 * w->critChancesArray[w->critIndex++ % 1000], w->spellY, 0);
+    Weapon_DirectDamage(w, t);
+}
+static void W_String_Fire(Weapon *w) {
+    Sprite *t = Weapon_closestAlive(fminf(0.4f * game_width, 0.4f * game_height));
+    Vector2 s = W_Spell_GetSource(w);
+    float x = s.x + 8 * w->critChancesArray[w->critIndex++ % 1000];
+    w->spellY = s.y - 0x18;
+    if (t) w->target = t, Weapon_FireOneBullet(w, x, w->spellY, 0), Weapon_DirectDamage(w, t);
+    for (int i = 1; i < Weapon_PAmount(w); i++) w->lastShotTimer = time_addEvent(w->repeatInterval * i, 0, 0, W_String_later, w);
+    if (w->lastFiringInterval != Weapon_PInterval(w)) w->lastFiringInterval = Weapon_PInterval(w), Weapon_ResetFiringTimer(w);
+}
+static float W_Stream_PPower(Weapon *w) { return Might_P(w->power * (1.25f * Weapon_PArea(w))); }
+static void W_Stream_Fire(Weapon *w) {
+    Sprite *t = Weapon_closestAlive(HUGE_VALF);
+    if (t) {
+        Vector2 s = W_Spell_GetSource(w);
+        w->target = t;
+        Weapon_FireOneBullet(w, s.x, s.y, 0);
+    }
+    if (w->lastFiringInterval != Weapon_PInterval(w)) w->lastFiringInterval = Weapon_PInterval(w), Weapon_ResetFiringTimer(w);
+}
+static float W_Strike_PPower(Weapon *w) { return Might_P(w->power * (1.25f * Core.Player->power)); }
+static void W_Strike_later(void *ctx) {
+    Weapon *w = ctx;
+    Sprite *t = Weapon_closestAlive(HUGE_VALF);
+    if (t) w->target = t, Weapon_FireOneBullet(w, t->x, t->y, 0), Weapon_DirectDamage(w, t);
+}
+static void W_Strike_Fire(Weapon *w) {
+    W_Strike_later(w);
+    for (int i = 1; i < Weapon_PAmount(w); i++) w->lastShotTimer = time_addEvent(w->repeatInterval * i, 0, 0, W_Strike_later, w);
+    if (w->lastFiringInterval != Weapon_PInterval(w)) w->lastFiringInterval = Weapon_PInterval(w), Weapon_ResetFiringTimer(w);
+}
+static const WeaponVT W_Spellstring = { BASE, .bullet = &B_Spellstring, .PPower = W_String_PPower, .Fire = W_String_Fire };
+static const WeaponVT W_Spellstream = { BASE, .bullet = &B_Spellstream, .PPower = W_Stream_PPower, .Fire = W_Stream_Fire };
+static const WeaponVT W_Spellstrike = { BASE, .bullet = &B_Spellstrike, .PPower = W_Strike_PPower, .Fire = W_Strike_Fire };
+
+static void Weapon_CopyAccumulatedLimitBreaks(Weapon *from, Weapon *to) {
+    for (int i = 0; i < from->nLbKeys; i++) {
+        float *s = Weapon_field(from, from->lbKeys[i]), *d = Weapon_field(to, from->lbKeys[i]);
+        if (s && d) *d += *s;  // (sic) tutto il valore dell'arma di partenza, non l'accumulato
+        if (to->nLbKeys < 16) to->lbKeys[to->nLbKeys++] = from->lbKeys[i];
+    }
+    if (from->nLbKeys) to->limitBreakLevel += from->limitBreakLevel;
+}
+static void Weapon_ScreenShake_start(void *c) { (void)c; camera_followOffsetX = -3; }
+static void Weapon_ScreenShake_done(void *c) { (void)c; camera_followOffsetX = 0; }
+static void Weapon_ScreenShake(int repeat) {
+    if (!po_is("ScreenShakeEnabled")) return;
+    camera_followOffsetX = -3;
+    tweens_add((TweenConfig){ .props = { { &camera_followOffsetX, NULL, 3 } }, .nprops = 1, .duration = 0x18, .yoyo = 1, .repeat = repeat, .onComplete = Weapon_ScreenShake_done });
+}
+static Weapon *Weapon_new(const char *bulletType);
+static void Weapon_Init(Weapon *w);
+static Weapon *W_Strom_sub(Weapon *w, const char *type) {  // WeaponFactory.GetWeapon, portata a livello 6; resta fuori dalle liste: l'aggiorna Spellstrom
+    Weapon *s = Weapon_new(type);
+    if (!s) return NULL;
+    Weapon_Init(s);
+    s->skipAddingEvolution = 1;
+    while (s->level < 6 && s->vt->LevelUp(s)) {}
+    (void)w;
+    return s;
+}
+static void W_Strom_ctor(Weapon *w) {
+    static Vector2 ring[0x78];
+    for (int i = 0; i < 0x78; i++) ring[i] = (Vector2){ 0xc8 * cosf(2 * PI * i / 0x78), 0xc8 * sinf(2 * PI * i / 0x78) };  // la zona 'edge' si calcola una volta: raggio 200 fisso (sic)
+    w->stormPfx = particles_add();
+    w->stormE1 = particles_createEmitter(w->stormPfx, (EmitterConfig){ .frames = { frame_get("vfx", "2Spell1.png"), frame_get("vfx", "2Spell2.png") }, .nframes = 2, .speed = EOP(0), .quantity = 1, .lifespan = ERND(0xbb8, 0x1b58),
+        .alpha = ERANGE(1, 0), .scale = ERND(1, 2), .blendAdd = 1, .hasZone = 1, .zoneRadius = 0x10, .on = 0 });
+    w->stormE2 = particles_createEmitter(w->stormPfx, (EmitterConfig){ .frames = { frame_get("vfx", "2Spell3.png"), frame_get("vfx", "2Spell4.png") }, .nframes = 2, .speed = EOP(0), .quantity = 1, .lifespan = ERND(0x3e8, 0x7d0),
+        .alpha = ERANGE(1, 0), .scale = { 0, 2, 2, Ease_QuintOut }, .hasZone = 1, .zoneRadius = 0x10, .on = 0 });
+    w->stormPfx->hasWell = w->stormPfx->hasWell2 = 1;
+    w->stormPfx->wellPower = 1 * 0x190, w->stormPfx->wellEpsilon = 0xc8 * 0xc8;  // createGravityWell({ power: 1, epsilon: 200, gravity: 400 })
+    ParticleManager *m = particles_add();
+    m->scrollFactor0 = 1;
+    w->circleE = particles_createEmitter(m, (EmitterConfig){ .frames = { frame_get("vfx", "2Spell1.png"), frame_get("vfx", "2Spell2.png"), frame_get("vfx", "2Spell3.png") }, .nframes = 3, .quantity = 1, .alpha = ERANGE(1, 0),
+        .lifespan = EOP(0x5dc), .blendAdd = 1, .edge = ring, .nEdge = 0x78, .flowEveryFrame = 1, .on = 1 });
+    w->circleE->x = 0.5f * game_width, w->circleE->y = 0.5f * game_height;
+}
+static void W_Strom_OnStart(Weapon *w) {
+    base_OnStart(w);
+    if ((w->Weapon_String = W_Strom_sub(w, "SPELL_STRING"))) w->Weapon_String->wellSrc = w->wellPos, w->Weapon_String->power += 1;
+    if ((w->Weapon_Stream = W_Strom_sub(w, "SPELL_STREAM"))) w->Weapon_Stream->speed += 1, w->Weapon_Stream->duration += 0x1f4, w->Weapon_Stream->area += 0.5f;
+    if ((w->Weapon_Strike = W_Strom_sub(w, "SPELL_STRIKE"))) w->Weapon_Strike->amount += 2;
+    for (int i = 0; i < Core.n_RemovedWeapons; i++) {
+        Weapon *r = Core.RemovedWeapons[i];
+        if (!strcmp(r->bulletType, "SPELL_STRING") && w->Weapon_String) Weapon_CopyAccumulatedLimitBreaks(r, w->Weapon_String);
+        if (!strcmp(r->bulletType, "SPELL_STREAM") && w->Weapon_Stream) Weapon_CopyAccumulatedLimitBreaks(r, w->Weapon_Stream);
+        if (!strcmp(r->bulletType, "SPELL_STRIKE") && w->Weapon_Strike) Weapon_CopyAccumulatedLimitBreaks(r, w->Weapon_Strike);
+    }
+    Sound_PlaySound("SpellStrom", 2, 1, 0, 0x190, 1);
+    Weapon_ScreenShake(0xc);
+}
+static void W_Strom_ExplodeUpdate(void *ctx) {
+    Weapon *w = ctx;
+    Rectangle r = { -0.5f * game_width * w->stormK, -5, game_width * w->stormK, 0xa };
+    w->stormE1->c.zoneRect = w->stormE2->c.zoneRect = r;
+    emitter_emitParticleAt(w->stormE1, Core.Player->s.x, Core.Player->s.y, 0xa0);
+    emitter_emitParticleAt(w->stormE2, Core.Player->s.x, Core.Player->s.y, 0xa0);
+}
+static void W_Strom_ExplodeDone(void *ctx) { ((Weapon *)ctx)->skipEmitUpdate = 0; }
+static void W_Strom_ExplodeSingularity(void *ctx) {
+    Weapon *w = ctx;
+    w->skipEmitUpdate = 1;
+    w->stormE1->c.hasZone = w->stormE2->c.hasZone = 0;
+    w->stormE1->c.hasZoneRect = w->stormE2->c.hasZoneRect = 1;
+    w->stormE1->c.blendAdd = w->stormE2->c.blendAdd = 1;
+    w->stormK = 0;
+    tweens_add((TweenConfig){ .props = { { &w->stormK, NULL, 1 } }, .nprops = 1, .duration = 0xc8, .onUpdate = W_Strom_ExplodeUpdate, .onComplete = W_Strom_ExplodeDone, .ctx = w });
+}
+static void W_Strom_restoreStart(void *ctx) {
+    Weapon *w = ctx;
+    Weapon_ScreenShake(0xc);
+    Sound_PlaySound("SpellStrike", 1, 0.5f, 0, 0xc8, 4);
+    Sound_PlaySound("SpellStrike", 1, 0.4f, 0, 0xc8, 4);
+    w->singularityTimes++;
+}
+static void W_Strom_restoreUpdate(void *ctx) {
+    Weapon *w = ctx;
+    w->stormPfx->s.depth = game_height;
+    emitter_emitParticleAt(w->stormE1, Core.Player->s.x, Core.Player->s.y, 0x50);
+    emitter_emitParticleAt(w->stormE2, Core.Player->s.x, Core.Player->s.y, 0x50);
+}
+static void W_Strom_restoreDone(void *ctx) {
+    Weapon *w = ctx;
+    float p = Might_P((w->power + 0.001f * Weapon_PDuration(w) + Weapon_PSpeed(w) + Weapon_PArea(w)) * Weapon_PAmount(w) + 0.5f * w->singularityTimes);  // SingularityPower
+    for (int i = 0; i < Core.Enemies.n; i++) {  // DamageAllEnemies
+        Enemy *e = Core.Enemies.items[i]->owner;
+        if (ContainmentRect_Contains(&Core.containmentRect_Exact, &e->s)) Enemy_GetDamaged(e, p, HIT_NONE, 0, w->bulletType), w->stats_inflictedDamage += p;
+    }
+    w->doingSingularity = 0;
+}
+static void W_Strom_Update(Weapon *w, float delta) {
+    base_Update(w, delta);
+    if (!w->hasBullets) {  // InitBullets
+        BulletPool_SpawnAt(w->pool, w->wellPos[0].x, w->wellPos[0].y, w, 0);
+        BulletPool_SpawnAt(w->pool, w->wellPos[1].y, w->wellPos[1].y, w, 1);
+        w->hasBullets = 1;
+    }
+    w->singularityTime += delta;
+    if (w->singularityTime > 0x4e20 + 0x4e20 * fmaxf(0.1f, Arcanas.silentCooldown + Core.Player->cooldown)) {  // SingularityDelay
+        w->doingSingularity = 1;
+        Weapon_ScreenShake(0xc);
+        Sound_PlaySound("SpellStrom", 1, 1, 0, 0x190, 3), Sound_PlaySound("SpellStrom", 1, 0.6f, 0, 0x190, 3), Sound_PlaySound("SpellStrom", 1, 0.2f, 0, 0x190, 3);
+        tweens_add((TweenConfig){ .props = { { &w->stormRadius, NULL, 1 } }, .nprops = 1, .duration = 0x1388, .onComplete = W_Strom_ExplodeSingularity, .ctx = w });
+        tweens_add((TweenConfig){ .props = { { &w->stormRadius, NULL, fminf(0.4f * game_width, 0.4f * game_height) } }, .nprops = 1, .duration = 0xc8, .delay = 0x1388,
+                                  .onStart = W_Strom_restoreStart, .onUpdate = W_Strom_restoreUpdate, .onComplete = W_Strom_restoreDone, .ctx = w });
+        w->singularityTime = 0;
+    }
+    if (w->Weapon_String) w->Weapon_String->vt->Update(w->Weapon_String, delta);
+    if (w->Weapon_Stream) w->Weapon_Stream->vt->Update(w->Weapon_Stream, delta);
+    if (w->Weapon_Strike) w->Weapon_Strike->vt->Update(w->Weapon_Strike, delta);
+    if (!w->doingSingularity) {
+        w->stormRadius = fminf(0.4f * game_width, 0.4f * game_height);
+        w->stormE1->c.zoneRadius = w->stormE2->c.zoneRadius = 0.8f * w->stormRadius;
+        w->stormPfx->s.depth = -game_height;
+    }
+    w->angleValue += 0.001f * delta;
+    float cx = cosf(w->angleValue) * w->stormRadius, cy = sinf(w->angleValue) * w->stormRadius, px = Core.Player->s.x, py = Core.Player->s.y;
+    w->wellPos[0] = (Vector2){ px + cx, py + cy }, w->wellPos[1] = (Vector2){ px - cx, py - cy };
+    w->stormPfx->wellX = w->wellPos[0].x, w->stormPfx->wellY = w->wellPos[0].y, w->stormPfx->well2X = w->wellPos[1].x, w->stormPfx->well2Y = w->wellPos[1].y;
+    if (!w->skipEmitUpdate) {
+        w->stormE1->c.blendAdd = w->stormE2->c.blendAdd = 0;
+        w->stormE1->c.hasZone = w->stormE2->c.hasZone = 1;
+        w->stormE1->c.hasZoneRect = w->stormE2->c.hasZoneRect = 0;
+        emitter_emitParticleAt(w->stormE1, px, py, 8);
+        emitter_emitParticleAt(w->stormE2, px, py, 8);
+    }
+}
+static void noop_Fire(Weapon *w) { (void)w; }
+static const WeaponVT W_Spellstrom = { BASE, .bullet = &B_Spellstrom, .ctor = W_Strom_ctor, .OnStart = W_Strom_OnStart, .Update = W_Strom_Update, .Fire = noop_Fire };
 static void W_Carnage_OnStart(Weapon *w) {
     base_OnStart(w);
     w->TVexplosionPool = BulletPool_new(w, &B_CarnageExplosion);
@@ -11262,10 +12733,1365 @@ static const WeaponVT W_SoleSolution = { BASE, .bullet = &B_SoleSolution, .ctor 
                                          .Update = W_SoleSolution_Update, .OnWeaponAdded = W_SoleSolution_OnWeaponAdded };
 
 // WeaponFactory.GetWeapon (0x9ff0): i tipi non ancora tradotti restano fuori dal LevelUpFactory
+// --- Foscari: attacchi forzati del personaggio (0xb7e6 e affini: meleeA / rangedA) ---------------------------------------
+static void Player_forcedAnimDone(void *ctx) {
+    Player *p = ctx;
+    p->isAnimForced = 0, p->canFlipX = 1;
+    p->s.onAnimationComplete = NULL;
+    anims_play(&p->s, &p->walk, 0);
+}
+static void Player_OnMeleeAttackAnim(Player *p) {
+    if (!p->hasMeleeA) return;
+    p->isAnimForced = 1, p->canFlipX = 0;
+    p->s.onAnimationComplete = Player_forcedAnimDone;
+    anims_play(&p->s, &p->meleeA, 0);
+}
+static void Player_OnRangedAttackAnim(Player *p) {
+    if (!p->hasRangedA) return;
+    p->isAnimForced = 1;
+    p->s.onAnimationComplete = Player_forcedAnimDone;
+    anims_play(&p->s, &p->meleeA, 0);
+}
+static void fx_init(Sprite *s, const char *frame, int add) {  // scene.add.image(...).setVisible(false)
+    sprite_init(s, frame ? frame_get("vfx", frame) : NULL, 0, 0);
+    s->blendAdd = add, s->visible = 0;
+    children_add(s);
+}
+static void Circle_draw(Sprite *s) {  // scene.add.circle: raggio in width, scala e tinta dello sprite, ADD
+    if (!s->visible || s->scaleX <= 0) return;
+    BeginBlendMode(BLEND_ADDITIVE);
+    DrawCircle((int)roundf(s->x - camera_scrollX), (int)roundf(s->y - camera_scrollY), s->width * s->scaleX, hexc(s->tint, s->alpha));
+    EndBlendMode();
+}
+static void Ribbon_draw(Sprite *s) {
+    Bullet *b = s->owner;
+    if (s->visible && b->npos > 1) Rope_drawH(b->ropePts, b->npos, b->trailFrame, 1, s->alpha, b->trailAdd, 0);
+}
+static void Ribbon_update(Bullet *b, float x, float y, int max) {  // RibbonTrail.trailUpdate (0x7c1)
+    memmove(&b->ropePts[1], &b->ropePts[0], (max - 1) * sizeof(Vector2));
+    b->ropePts[0] = (Vector2){ x, y };
+    if (b->npos < max) b->npos++;
+}
+static void Ribbon_init(Bullet *b, const char *frame, int add) {
+    sprite_init(&b->trail, NULL, 0, 0);
+    b->trail.owner = b, b->trail.draw = Ribbon_draw, b->trail.visible = 0;
+    b->trailFrame = frame_get("vfx", frame), b->trailAdd = add;
+    children_add(&b->trail);
+}
+static void B_despawnIfActive(void *ctx) { Bullet *b = ctx; if (b->s.active) Bullet_DeSpawn(b); }
+static void Sprite_hide(void *ctx) { ((Sprite *)ctx)->visible = 0; }
+static void B_disableBody(void *ctx) { ((Bullet *)ctx)->s.body.enable = 0; }
+
+// --- B_Sword (0x107b3): il fendente; SetDetune arriva dopo OnRecycle, il suono usa quello del giro prima (sic) ------------
+static void B_Sword_OnRecycle(Bullet *b) {
+    Bullet_OnRecycle(b);
+    b->s.alpha = 1;
+    sprite_setScale(&b->s, 0);
+    tween_stop(b->tween), tween_stop(b->tween2);
+    b->tween = tweens_add((TweenConfig){ .props = { { &b->s.scaleX, &b->s.scaleY, PixelScale * Weapon_PArea(b->weapon) } }, .nprops = 1, .duration = 0x64 });
+    b->tween2 = tweens_add((TweenConfig){ .props = { { &b->s.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x64, .delay = 0x64, .onComplete = B_despawnIfActive, .ctx = b });
+    int flip = Core.Player->s.flipX ? b->indexInWeapon % 2 != 1 : b->indexInWeapon % 2 == 1;
+    b->s.x += flip ? -0x40 : 0x40, b->s.y -= 0x10;
+    b->s.flipY = b->indexInWeapon % 2 == 1, b->s.flipX = flip;
+    Sound_PlaySound("Attack1", 1, 1, -0x64 * b->indexInWeapon + 0x190 * b->detuneMul, 0, 0);
+}
+static void B_Sword_ctor(Bullet *b) { b->tween = b->tween2 = (TweenRef){ -1, 0 }; }
+static const BulletVT B_Sword = { "vfx", "slash_sword.png", B_Sword_ctor, NULL, B_Sword_OnRecycle };
+
+// --- B_SwordFinisher (0x?): il colpo a terra, la crepa resta quattro secondi -------------------------------------------------
+static void W_Sword_shake(void *ctx) { (void)ctx; Weapon_ScreenShake(4); }
+static void B_Finisher_ctor(Bullet *b) {
+    fx_init(&b->kanji, "ground.png", 0);  // crackSprite
+    sprite_setTint(&b->kanji, 0);
+    fx_init(&b->lightning, "ground2.png", 1);  // highlightSprite
+    sprite_setTint(&b->lightning, 0xff6600);
+    fx_init(&b->flash, "Hit1.png", 0);  // impactSprite
+    b->Pfx = particles_add();
+    b->PfxEmitter = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "rock0000.png"), frame_get("vfx", "rock0010.png"), frame_get("vfx", "rock0020.png"), frame_get("vfx", "rock0030.png"), frame_get("vfx", "rock0040.png") }, .nframes = 5,
+        .quantity = 5, .lifespan = ERND(0x258, 0x44c), .rotate = ERND(0, 0x168), .angle = ERND(0xe1, 0x13b), .speed = ERND(0x32, 0x190), .scale = ERANGE(0.5f, 0), .gravityY = 0x190, .tint = 0x2c1f16, .flowEveryFrame = 1, .on = 0 });
+}
+static void B_Finisher_bodyOff(void *ctx) { Bullet *b = ctx; b->s.body.enable = 0; emitter_stop(b->PfxEmitter); }
+static void B_Finisher_impactDone(void *ctx) { Bullet *b = ctx; sprite_setScale(&b->flash, 0), b->flash.visible = 0; }
+static void B_Finisher_OnRecycle(Bullet *b) {
+    Weapon *w = b->weapon;
+    float a = Weapon_PArea(w);
+    Bullet_OnRecycle(b);
+    b->s.visible = 0, sprite_setScale(&b->s, 0), b->indexInWeapon = 0;
+    b->s.alpha = 1;
+    b->s.x += Core.Player->s.flipX ? -0x40 : 0x40, b->s.y -= 0x10;
+    float hd = -game_height;
+    Sprite *hl = &b->lightning, *cr = &b->kanji, *im = &b->flash;
+    hl->x = cr->x = im->x = b->s.x, hl->y = cr->y = im->y = b->s.y;
+    hl->alpha = 0, cr->alpha = 1, hl->visible = cr->visible = im->visible = 1;
+    hl->depth = hd - 1, cr->depth = hd, im->depth = 0;
+    sprite_setScale(hl, 0), sprite_setScale(cr, 0), sprite_setScale(im, 0);
+    b->PfxEmitter->c.scale = ERANGE(0.5f * a, 0);
+    b->PfxEmitter->x = b->s.x, b->PfxEmitter->y = b->s.y - 8;
+    emitter_start(b->PfxEmitter);
+    tweens_add((TweenConfig){ .props = { { &b->s.scaleX, &b->s.scaleY, 3 * a } }, .nprops = 1, .duration = 0x64, .onComplete = W_Sword_shake });
+    tweens_add((TweenConfig){ .props = { { &im->scaleX, &im->scaleY, 6 * a } }, .nprops = 1, .duration = 0x64, .onComplete = B_Finisher_impactDone, .ctx = b });
+    tweens_add((TweenConfig){ .props = { { &b->s.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x64, .delay = 0x64, .onComplete = B_Finisher_bodyOff, .ctx = b });
+    float s = 3 * a * (0x39 / 128.0f);  // spriteRatio
+    tweens_add((TweenConfig){ .props = { { &hl->scaleX, NULL, 1.05f * s }, { &hl->scaleY, NULL, 0.95f * s }, { &cr->scaleX, NULL, 1.05f * s } }, .nprops = 3, .duration = 0x78 });
+    tweens_add((TweenConfig){ .props = { { &cr->scaleY, NULL, 0.95f * s } }, .nprops = 1, .duration = 0x78 });
+    tweens_add((TweenConfig){ .props = { { &hl->y, NULL, b->s.y - 4 } }, .nprops = 1, .duration = 0x384, .delay = 0x64 });
+    tweens_add((TweenConfig){ .props = { { &hl->alpha, NULL, 0.65f } }, .nprops = 1, .duration = 0x1c2, .delay = 0x64, .yoyo = 1 });
+    tweens_add((TweenConfig){ .props = { { &cr->alpha, NULL, 0.65f } }, .nprops = 1, .duration = 0x1f4, .delay = 0x1f4 });
+    tweens_add((TweenConfig){ .props = { { &cr->alpha, NULL, 0 } }, .nprops = 1, .duration = 0x3e8, .delay = 0xbb8, .onComplete = B_despawnIfActive, .ctx = b });
+    Sound_PlaySound("Attack2", 1, 1, 0, 0, 0);
+}
+static void B_Finisher_DeSpawn(Bullet *b) { b->lightning.visible = b->kanji.visible = 0; base_DeSpawn(b); }
+static const BulletVT B_SwordFinisher = { "vfx", "slash_sword.png", B_Finisher_ctor, NULL, B_Finisher_OnRecycle, NULL, NULL, B_Finisher_DeSpawn };
+
+// --- B_Legionnaire (0x?): la copia del personaggio che cammina ----------------------------------------------------------------
+static void B_Legion_stop(void *ctx) { Bullet *b = ctx; b->isGrounded = 0; anims_stop(&b->s); sprite_setVelocity(&b->s, 0, 0); }
+static void B_Legion_ctor(Bullet *b) {
+    static const unsigned T[4] = { 0xa14444, 0x7f7070, 0xff7070, 0xc37070 };  // semplificazione: le quattro tinte d'angolo, col colore medio
+    b->_speed = 2;
+    sprite_setTint(&b->s, T[b->indexInWeapon % 4]);
+    b->s.alpha = 0;
+    b->alphaTween = b->despawnTween = (TweenRef){ -1, 0 };
+}
+static void B_Legion_OnRecycle(Bullet *b) {
+    Weapon *w = b->weapon;
+    Bullet_OnRecycle(b);
+    if (b->alreadyRecycled) return;
+    b->alreadyRecycled = 1;
+    anims_play(&b->s, &Core.Player->walk, 0);  // semplificazione: la camminata del giocatore e' quella del suo skin
+    Vector2 *d = &Core.Player->lastFacedDirection;  // ApplyPlayerFacingVelocity(false) col TrueSpeed di questa classe
+    float l = sqrtf(d->x * d->x + d->y * d->y), v = Weapon_PSpeed(w) * PlayerPxSpeed * Core.Player->moveSpeed * b->_speed;
+    if (l > 0) d->x /= l, d->y /= l;
+    if (d->x == 0 && d->y == 0) d->x = 1;
+    sprite_setVelocity(&b->s, v * d->x, v * d->y);
+    b->s.flipX = b->s.body.velocity.x < 0;
+    sprite_setScale(&b->s, fmaxf(1, Weapon_PArea(w) - 0.4f));
+    b->isGrounded = 1;  // isMoving
+    b->s.alpha = 0;
+    tween_stop(b->alphaTween), tween_stop(b->despawnTween);
+    b->alphaTween = tweens_add((TweenConfig){ .props = { { &b->s.alpha, NULL, 0.65f } }, .nprops = 1, .duration = 0xc8 });
+    b->despawnTween = tweens_add((TweenConfig){ .props = { { &b->s.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x1f4, .delay = Weapon_PDuration(w), .onStart = B_Legion_stop, .onComplete = B_despawnIfActive, .ctx = b });
+}
+static void B_Legion_DeSpawn(Bullet *b) { base_DeSpawn(b); b->alreadyRecycled = 0; }
+static void B_Legion_Update(Bullet *b, float delta) {
+    (void)delta;
+    if (b->isGrounded) emitter_emitParticleAt(b->weapon->SmokeEmitter, b->s.x, b->s.y + 0.35f * b->s.height * b->s.scaleY, 0);
+}
+static const BulletVT B_Legionnaire = { "vfx", "Rings3.png", B_Legion_ctor, NULL, B_Legion_OnRecycle, NULL, B_Legion_Update, B_Legion_DeSpawn };
+
+// --- W_Sword (0x166c0) / W_Legionnaire (0x12a4c): ogni quinto giro, l'ultimo colpo e' il finisher --------------------------
+typedef struct { Weapon *w; int index, detune, retal, finisher; } SwordShot;
+static void W_Sword_one(const SwordShot *c) {
+    Weapon *w = c->w;
+    float x = Core.Player->s.x, y = Core.Player->s.y;
+    if (c->finisher) { BulletPool_SpawnAt(w->finisherPool, x, y, w, c->index); return; }
+    Bullet *b = BulletPool_SpawnAt(c->retal ? w->retaliationPool : w->pool, x, y, w, c->index);
+    if (b) b->detuneMul = c->detune;
+}
+static void W_Sword_later(void *ctx) { W_Sword_one(ctx); }
+static void W_Sword_melee(void *ctx) { (void)ctx; Player_OnMeleeAttackAnim(Core.Player); }
+static void W_Sword_Fire(Weapon *w) {
+    static SwordShot shots[256];
+    static int shot_i;
+    int retal = w->retalNext;
+    w->retalNext = 0;
+    if (w->level >= 5 || w->canDoFinisher) w->firingCounter++;
+    float amount = Weapon_PAmount(w);
+    int detune = w->firingCounter, isF = w->firingCounter == 5;
+    float fIdx = isF ? amount - 1 : -1;
+    if (isF) { time_removeEvent(w->MeleeAnimEvent); w->MeleeAnimEvent = time_addEvent(fmaxf(0, w->repeatInterval * fIdx - 0x118), 0, 0, W_Sword_melee, NULL); }
+    if (w->firingCounter >= 5) w->firingCounter = 0;
+    W_Sword_one(&(SwordShot){ w, 0, detune, retal, !(fIdx > 0 || fIdx == -1) });
+    for (int i = 1; i < amount; i++) {
+        if (w->repeatInterval * i > 0) {
+            SwordShot *c = &shots[shot_i++ & 255];
+            *c = (SwordShot){ w, i, detune, retal, fIdx == i };
+            w->lastShotTimer = time_addEvent(w->repeatInterval * i, 0, 0, W_Sword_later, c);
+        } else W_Sword_one(&(SwordShot){ w, i, detune, retal, 0 });
+    }
+    if (w->lastFiringInterval != Weapon_PInterval(w)) w->lastFiringInterval = Weapon_PInterval(w), Weapon_ResetFiringTimer(w);
+}
+static void W_Sword_canRetaliate(void *ctx) { ((Weapon *)ctx)->canRetaliate = 1; }
+static void W_Sword_OnPlayerHit(void *ctx) {
+    Weapon *w = ctx;
+    if (!w->canRetaliate) return;
+    w->canRetaliate = 0;
+    time_removeEvent(w->RetaliationTimer);
+    w->RetaliationTimer = time_addEvent(0x5dc, 0, 0, W_Sword_canRetaliate, w);
+    w->retalNext = 1;
+    w->vt->Fire(w);
+}
+static void W_Sword_ctor(Weapon *w) {
+    w->canRetaliate = 1;
+    w->RetaliationTimer = w->MeleeAnimEvent = (Timer){ -1, 0 };
+    PlayerEvents_add(EV_PLAYER_RECEIVEDDAMAGE, W_Sword_OnPlayerHit, w);
+    PlayerEvents_add(EV_PLAYER_LOSTSHIELD, W_Sword_OnPlayerHit, w);
+}
+static void W_Sword_OnStart(Weapon *w) {
+    base_OnStart(w);
+    w->retaliationPool = BulletPool_new(w, &B_Sword);
+    w->finisherPool = BulletPool_new(w, &B_SwordFinisher);
+    BulletPool *p[2] = { w->retaliationPool, w->finisherPool };
+    for (int k = 0; k < 2; k++) {
+        physics_addOverlap(&p[k]->group, &Core.Destructibles, Weapon_onBulletOverlapsDestuctible, w);
+        physics_addOverlap(&p[k]->group, &Core.Enemies, Weapon_onBulletOverlapsEnemy_Retaliation, w);
+    }
+}
+static const WeaponVT W_Sword = { BASE, .bullet = &B_Sword, .ctor = W_Sword_ctor, .OnStart = W_Sword_OnStart, .Fire = W_Sword_Fire, .CheckArcanas = CA_slash, .onBulletOverlapsEnemy = W_canCrit_onBulletOverlapsEnemy };
+static void W_Legion_ctor(Weapon *w) {
+    W_Sword_ctor(w);
+    w->canDoFinisher = 1;
+    fx_init(&w->image, "foscari.png", 0);  // cursor: non si vede mai
+    w->image.alpha = 0.65f, w->image.depth = game_height;
+    w->pfx = particles_add();
+    w->SmokeEmitter = particles_createEmitter(w->pfx, (EmitterConfig){ .frames = { frame_get("vfx", "Smoke1.png"), frame_get("vfx", "Smoke2.png") }, .nframes = 2, .speed = ERND(0xa, 0x14), .quantity = 2, .rotate = ERND(0, 0x168),
+        .lifespan = ERND(0x32, 0x96), .alpha = ERANGE(0.65f, 0), .scale = ERND(0.5f, 1.25f), .tint = 0xffeedd, .on = 0 });
+}
+static void W_Legion_OnStart(Weapon *w) {
+    W_Sword_OnStart(w);
+    w->legionnairePool = BulletPool_new(w, &B_Legionnaire);
+    physics_addOverlap(&w->legionnairePool->group, &Core.Enemies, Weapon_onBulletOverlapsEnemy_Retaliation, w);
+}
+static void W_Legion_Fire(Weapon *w) {
+    W_Sword_Fire(w);
+    float x = w->image.x, y = w->image.y, n = Weapon_PAmount(w);
+    BulletPool_SpawnAt(w->legionnairePool, x, y, w, 0);
+    if (n >= 1) for (int i = 0; i < (int)n; i++) {  // Circle.getPoints(n)
+        float a = 2 * PI * i / (int)n;
+        BulletPool_SpawnAt(w->legionnairePool, x + 0x40 * cosf(a), y + 0x40 * sinf(a), w, i);
+    }
+}
+static void W_Legion_Update(Weapon *w, float delta) {
+    base_Update(w, delta);
+    Vector2 d = Core.Player->lastFacedDirection;
+    float a = atan2f(-d.y, -d.x);
+    w->image.x = Core.Player->s.x + cosf(a) * game_width * 0.5f, w->image.y = Core.Player->s.y + sinf(a) * game_height * 0.5f;
+    w->image.angle = a * (180 / PI);
+}
+static const WeaponVT W_Legionnaire = { BASE, .bullet = &B_Sword, .ctor = W_Legion_ctor, .OnStart = W_Legion_OnStart, .Fire = W_Legion_Fire, .Update = W_Legion_Update, .CheckArcanas = CA_slash, .onBulletOverlapsEnemy = W_canCrit_onBulletOverlapsEnemy };
+
+// --- B_FlashArrow (0xb048) -------------------------------------------------------------------------------------------------
+static void W_Millionaire_Fire(Weapon *w, float x, float y, int count);
+static const WeaponVT W_Millionaire;
+static void B_Flash_Bounce(void *ctx) {
+    Bullet *b = ctx;
+    if (b->bounces > 0) b->bounces--, b->s.body.velocity.x *= -1, b->s.body.velocity.y *= -1, b->n_hit = 0;
+    else b->s.body.collideWorldBounds = 0;
+}
+static void B_Flash_ctor(Bullet *b) {
+    sprite_setScale(&b->s, PixelScale * Weapon_PArea(b->weapon));
+    b->s.angle = -0x5a;
+    b->Pfx = particles_add();
+    particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "WhiteDot.png") }, .nframes = 1, .angle = EOP(0), .speed = EOP(0), .quantity = 1, .lifespan = EOP(0x12c), .alpha = ERANGE(1, 0), .on = 0 });
+    fx_init(&b->flatSprite, "disc.png", 1), fx_init(&b->sideSprite, "WhiteLineH.png", 1), fx_init(&b->starSprite, "blurredSharpStar.png", 1);
+}
+static void B_Flash_OnRecycle(Bullet *b) {
+    Weapon *w = b->weapon;
+    Bullet_OnRecycle(b);
+    body_setCircle(&b->s.body, 8, b->s.body.offset.x, b->s.body.offset.y);
+    b->_speed = 2;
+    sprite_setScale(&b->s, Weapon_PArea(w));
+    b->s.y -= 0x16;
+    Bullet_ApplyPlayerFacingVelocity(b);
+    b->hasHitFirstEnemy = 0;
+    Sound_PlaySound("Shot", w->volume ? w->volume : 0.4f, 1, -0x64 * b->indexInWeapon, 0xc8, 0xa);
+    Bullet_activateBounce(b, B_Flash_Bounce);
+}
+static void B_Flash_VFX(Bullet *b) {  // PlayUselessVFX
+    Sprite *d = &b->flatSprite, *l = &b->sideSprite, *f = &b->starSprite;
+    d->angle = l->angle = b->s.angle + 0x5a;
+    sprite_setScale(d, 1), sprite_setScale(l, 1), sprite_setScale(f, 0);
+    d->alpha = l->alpha = f->alpha = 1, d->visible = l->visible = f->visible = 1;
+    d->x = l->x = f->x = b->s.x, d->y = l->y = f->y = b->s.y;
+    tweens_add((TweenConfig){ .props = { { &l->alpha, NULL, 0 }, { &l->scaleX, NULL, 5 }, { &d->alpha, NULL, 0 } }, .nprops = 3, .duration = 0x64 });
+    tweens_add((TweenConfig){ .props = { { &d->scaleX, NULL, 5 } }, .nprops = 1, .duration = 0x64 });
+    tweens_add((TweenConfig){ .props = { { &f->alpha, NULL, 0 }, { &f->angle, NULL, 0x2d0 }, { &f->scaleX, &f->scaleY, 2 } }, .nprops = 3, .duration = 0xc8 });
+}
+static void B_Flash_OnHasHitAnObject(Bullet *b, void *o, int isDead) {
+    (void)o;
+    if (isDead || b->hasHitFirstEnemy) return;
+    b->hasHitFirstEnemy = 1;
+    if (po_is("FlashingVFXEnabled")) B_Flash_VFX(b);
+    sprite_setVelocity(&b->s, 2 * b->s.body.velocity.x, 2 * b->s.body.velocity.y);
+    if (b->weapon->vt == &W_Millionaire) W_Millionaire_Fire(b->weapon, b->s.x, b->s.y, 4);  // TrueWeapon.Millionaire: vuoto su FLASHARROW
+}
+static void B_Flash_Update(Bullet *b, float delta) { (void)delta; manager_emitParticleAt(b->Pfx, b->s.x, b->s.y); }
+static const BulletVT B_FlashArrow = { "vfx", "2Arrow.png", B_Flash_ctor, NULL, B_Flash_OnRecycle, B_Flash_OnHasHitAnObject, B_Flash_Update };
+
+// --- B_Millionaire (0x?): la freccia dal cielo, spezzandosi diventa l'area di danno ------------------------------------------
+static void B_Mill_ctor(Bullet *b) {
+    const Frame *F[3] = { frame_get("vfx", "PfxYellow.png"), frame_get("vfx", "PfxPurple.png"), frame_get("vfx", "PfxLine.png") };
+    b->_speed = 2;
+    b->PositionTween = (TweenRef){ -1, 0 };
+    b->HitboxTimer = b->ExpireTimer = (Timer){ -1, 0 };
+    fx_init(&b->GroundFx, NULL, 1);
+    b->GroundFx.draw = Circle_draw, b->GroundFx.width = 0x10, b->GroundFx.alpha = 0.1f, b->GroundFx.tint = 0xff;
+    b->Pfx = particles_add();
+    b->PfxEmitter1 = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { F[0], F[1], F[2] }, .nframes = 3, .speed = EOP(1), .quantity = 1, .rotate = EOP(0x5a), .lifespan = EOP(0x12c), .alpha = ERANGE(1, 0), .scale = ERANGE(1, 2), .hasZone = 1, .zoneRadius = 8, .on = 0 });
+    b->PfxEmitter2 = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { F[0], F[1], F[2] }, .nframes = 3, .speed = EOP(1), .quantity = 1, .rotate = EOP(0x5a), .lifespan = EOP(0x12c), .alpha = ERANGE(0.2f, 0), .scale = ERANGE(1, 0.5f), .blendAdd = 1, .hasZone = 1, .zoneRadius = 8, .on = 0 });
+    b->PfxExplosion = particles_add();
+    particles_createEmitter(b->PfxExplosion, (EmitterConfig){ .frames = { frame_get("vfx", "disc.png") }, .nframes = 1, .quantity = 1, .lifespan = EOP(0x64), .alpha = ERANGE(0.65f, 0.35f), .scale = ERANGE(PixelScale / 4, 2 * PixelScale), .on = 0 });
+    particles_createEmitter(b->PfxExplosion, (EmitterConfig){ .frames = { frame_get("vfx", "blurredSharpStar.png") }, .nframes = 1, .quantity = 1, .rotate = ERND(0, 0x168), .lifespan = EOP(0x64), .alpha = ERANGE(0.35f, 0.15f), .scale = ERANGE(PixelScale / 4, PixelScale), .on = 0 });
+}
+static void B_Mill_OnRecycle(Bullet *b) {
+    Weapon *w = b->weapon;
+    Bullet_OnRecycle(b);
+    b->_speed = 2;
+    body_setCircle(&b->s.body, 0x10, -8, -8);
+    sprite_setScale(&b->s, PixelScale);
+    b->s.flipX = 0, b->isBroken = 0, b->s.body.enable = 0, b->isCullable = 0;
+    time_removeEvent(b->HitboxTimer), time_removeEvent(b->ExpireTimer);
+    int y = frand() >= 0.5f;
+    sprite_setFrame(&b->s, frame_get("vfx", frand() >= 0.5f ? "2Arrow3Y.png" : "2Arrow3P.png"));  // (sic) due estrazioni indipendenti
+    b->s.blendAdd = 1;
+    b->GroundFx.tint = y ? 0xffff00 : 0x8800ff;
+    float r = 8 * Weapon_PArea(w) * 3;
+    int q = 1 + (int)floorf(w->level / 3.0f);
+    b->PfxEmitter1->c.zoneRadius = b->PfxEmitter2->c.zoneRadius = r;
+    b->PfxEmitter1->c.quantity = b->PfxEmitter2->c.quantity = q;
+    b->startingPoint = (Vector2){ b->s.x, b->s.y };  // target
+    b->s.x = b->startingPoint.x + (frand() - 0.5f) * game_width * 0.5f, b->s.y = Core.Player->s.y - 0.6f * game_height;
+    float a = frand() * (2 * PI), d = 0xf0 * frand();
+    b->startingPoint.x += cosf(a) * d, b->startingPoint.y += sinf(a) * d;
+    b->s.depth = b->s.y - Core.Player->s.y + game_height;
+    b->s.visible = po_is("FlashingVFXEnabled");
+}
+static void B_Mill_expire(void *ctx) {
+    Bullet *b = ctx;
+    b->GroundFx.visible = 0;
+    time_removeEvent(b->HitboxTimer), time_removeEvent(b->ExpireTimer);
+    Bullet_DeSpawn(b);
+}
+static void B_Mill_Break(void *ctx) {
+    Bullet *b = ctx;
+    if (b->isBroken) return;
+    b->isBroken = 1, b->s.visible = 0;
+    sprite_setVelocity(&b->s, 0, 0);
+    b->n_hit = 0, b->s.body.enable = 1;
+    float a = Weapon_PArea(b->weapon);
+    b->GroundFx.x = b->s.x, b->GroundFx.y = b->s.y;
+    sprite_setScale(&b->GroundFx, a);
+    b->GroundFx.visible = po_is("FlashingVFXEnabled");
+    sprite_setScale(&b->s, a);
+    b->ExpireTimer = time_addEvent(0x64, 0, 0, B_Mill_expire, b);
+    float dp = b->s.y - Core.Player->s.y - 0.5f * game_height;
+    if (po_is("FlashingVFXEnabled")) manager_emitParticleAt(b->PfxExplosion, b->s.x, b->s.y), b->Pfx->s.depth = dp;
+    b->GroundFx.depth = dp;
+    Sound_PlaySound("Holywater", 0.35f, 2, -0xc8 + 0x32 * b->indexInWeapon, 0xc8, 0xc);
+}
+static void B_Mill_setDisplayDirection(Bullet *b, int flip) {
+    float k = 0.5f * game_width;
+    b->s.flipX = flip;
+    b->s.x = Core.Player->s.x + (flip ? k : -k), b->s.y = b->startingPoint.y - k;
+    tween_stop(b->PositionTween);
+    b->PositionTween = tweens_add((TweenConfig){ .props = { { &b->s.x, NULL, b->startingPoint.x }, { &b->s.y, NULL, b->startingPoint.y } }, .nprops = 2, .duration = 0x64, .onComplete = B_Mill_Break, .ctx = b });
+}
+static void B_Mill_Update(Bullet *b, float delta) { (void)delta; if (b->isBroken) manager_emitParticleAt(b->Pfx, b->s.x, b->s.y); }
+static void B_Mill_DeSpawn(Bullet *b) {
+    b->isCullable = 1;
+    time_removeEvent(b->HitboxTimer), time_removeEvent(b->ExpireTimer);
+    b->GroundFx.visible = 0;
+    base_DeSpawn(b);
+}
+static const BulletVT B_Millionaire = { "vfx", "2Arrow3.png", B_Mill_ctor, NULL, B_Mill_OnRecycle, NULL, B_Mill_Update, B_Mill_DeSpawn };
+
+// --- W_FlashArrow (0x47c3) / W_Millionaire (0x9dc2) ----------------------------------------------------------------------------
+static float W_Flash_PPower(Weapon *w) { return Might_P(w->power * Weapon_PAmount(w)); }
+static void W_Flash_rangedAnim(void *ctx) { (void)ctx; Player_OnRangedAttackAnim(Core.Player); }
+static void W_Flash_PlayNext(Weapon *w) { time_removeEvent(w->RangedAnimEvent); w->RangedAnimEvent = time_addEvent(fmaxf(0, Weapon_PInterval(w) - 0x78), 0, 0, W_Flash_rangedAnim, NULL); }
+static void W_Flash_OnStart(Weapon *w) { base_OnStart(w); w->RangedAnimEvent = (Timer){ -1, 0 }; W_Flash_PlayNext(w); w->canCrit = 1; }
+static void W_Flash_Fire(Weapon *w) {
+    Weapon_FireOneBullet(w, Core.Player->s.x, Core.Player->s.y, 0);
+    W_Flash_PlayNext(w);
+    if (w->lastFiringInterval != Weapon_PInterval(w)) w->lastFiringInterval = Weapon_PInterval(w), Weapon_ResetFiringTimer(w);
+}
+static void CA_flash(Weapon *w) {
+    if (ARC_T(7)) w->penetrating = 0xffff, w->bounces = 3, IronBlue_noWalls(w);
+    base_CheckArcanas(w);
+}
+static const WeaponVT W_FlashArrow = { BASE, .bullet = &B_FlashArrow, .PPower = W_Flash_PPower, .OnStart = W_Flash_OnStart, .Fire = W_Flash_Fire, .CheckArcanas = CA_flash, .onBulletOverlapsEnemy = W_canCrit_onBulletOverlapsEnemy };
+static Weapon *Core_coinListener;  // Core.OnCoinPickup: la usa solo W_Millionaire, che e' unica
+static void W_Mill_OnCoinPickup(float value) { if (Core_coinListener) Core_coinListener->CoinsQueue += value ? value : 1; }
+static void W_Mill_ctor(Weapon *w) {
+    w->explosionType = "SEC_MILLIONAIRE";
+    static const unsigned T[2] = { 0xffff00, 0xffccff };
+    for (int k = 0; k < 2; k++) {
+        Sprite *r = &w->rays[k];
+        sprite_init(r, frame_get("vfx", "rays.png"), 0.5f * game_width, 0);
+        sprite_setOrigin(r, 0, 1);
+        r->angle = 0x5a, r->alpha = 0, r->scrollFactor0 = 1, r->blendAdd = 1, r->tint = T[k];
+        children_add(r);
+        w->millTween[k] = (TweenRef){ -1, 0 };
+    }
+    Core_coinListener = w;
+}
+static void W_Mill_RaysVFX(Weapon *w, int flip, int repeat) {
+    for (int k = 0; k < 2; k++) {
+        Sprite *r = &w->rays[k];
+        tween_stop(w->millTween[k]);
+        r->x = flip ? game_width + 0x30 : -0x30, r->y = -0x30, r->alpha = 0;
+        r->angle = flip ? (k ? 0xb9 : 0xaf) : (k ? 0x5f : 0x55);
+        r->scaleX = flip ? 8 : 4, r->scaleY = flip ? 4 : 8;
+        w->millTween[k] = tweens_add((TweenConfig){ .props = { { &r->alpha, NULL, 0.25f } }, .nprops = 1, .yoyo = 1, .repeat = repeat, .duration = 0x32 });
+    }
+}
+typedef struct { Weapon *w; float x, y, amount; int flip; } MillShot;
+static void W_Mill_one(const MillShot *c) {
+    for (int j = 0; j < c->amount; j++) {
+        Bullet *b = Weapon_SpawnExplosionAt(c->w, c->x, c->y, j);
+        if (b) B_Mill_setDisplayDirection(b, c->flip);
+    }
+}
+static void W_Mill_later(void *ctx) { W_Mill_one(ctx); }
+static void W_Millionaire_Fire(Weapon *w, float x, float y, int count) {
+    static MillShot shots[256];
+    static int shot_i;
+    float amount = Weapon_PAmount(w), total = count * amount;
+    int flip = x < Core.Player->s.x;
+    w->secondaryPower = w->power;
+    MillShot now = { w, x, y, amount, flip };
+    for (int i = 0; i < total; i++) {
+        if (w->repeatInterval * i > 0) {
+            MillShot *c = &shots[shot_i++ & 255];
+            *c = now;
+            w->lastShotTimer = time_addEvent(w->repeatInterval * i, 0, 0, W_Mill_later, c);
+        } else W_Mill_one(&now);
+    }
+    if (po_is("FlashingVFXEnabled")) W_Mill_RaysVFX(w, flip, (int)(2 * amount));
+}
+static void W_Mill_Update(Weapon *w, float delta) {
+    base_Update(w, delta);
+    w->CoinsTime += delta;
+    if (w->CoinsTime < 0x64) return;
+    w->CoinsTime = 0;
+    if (w->CoinsQueue < 1) return;
+    w->CoinsQueue -= 1;
+    int left = Core.Player->lastFacedDirection.x < 0;
+    W_Millionaire_Fire(w, Core.Player->s.x + 0.25f * game_width * (left ? -1 : 1), Core.Player->s.y, 1);
+}
+static const WeaponVT W_Millionaire = { BASE, .bullet = &B_FlashArrow, .ctor = W_Mill_ctor, .PPower = W_Flash_PPower, .OnStart = W_Flash_OnStart, .Fire = W_Flash_Fire, .Update = W_Mill_Update, .CheckArcanas = CA_flash, .onBulletOverlapsEnemy = W_canCrit_onBulletOverlapsEnemy };
+
+// --- B_ShadowServant (0xf72e) / _Counter (0x15aa6): il serpente che punta un nemico a caso e sale in fumo ----------------------
+static Animation SnakeIdle[2], SnakeDie[2];
+static void B_Shadow_ctor(Bullet *b) {
+    Weapon *w = b->weapon;
+    b->_speed = 0.5f;
+    sprite_setFrame(&b->s, frame_get("vfx", w->snakeKind ? "bubbleSphere3.png" : "bubbleSphere2.png"));
+    fx_init(&b->flash, NULL, 0);  // DisplaySprite
+    anims_play(&b->flash, &SnakeIdle[w->snakeKind], 0);
+    Ribbon_init(b, w->snakeKind ? "BlackTrail2.png" : "BlackTrail.png", 0);
+    b->trail.depth = b->s.depth;
+}
+static void B_Shadow_OnRecycle(Bullet *b) {
+    Bullet_OnRecycle(b);
+    sprite_setScale(&b->s, 1);
+    body_setCircle(&b->s.body, 8, b->s.body.offset.x, b->s.body.offset.y);
+    b->s.body.enable = 1, b->s.visible = 0, b->trail.visible = 0, b->isExploding = 0;
+    b->counterVal = 1;
+    b->flash.visible = 1;
+    anims_play(&b->flash, &SnakeIdle[b->weapon->snakeKind], 0);
+    b->s.x += (frand() - 0.5f) * b->indexInWeapon * 0xa, b->s.y += (frand() - 0.5f) * b->indexInWeapon * 0xa;
+    Bullet_AimForRandomEnemy(b);
+    Sound_PlaySound("MagicMissile", 0.1f, 1, -0x64 * b->indexInWeapon - 0x1f4, 0xc8, 3);
+}
+static void B_Shadow_exploStart(void *ctx) { Bullet *b = ctx; sprite_setScale(&b->s, 0), b->s.visible = po_is("FlashingVFXEnabled"); }
+static void B_Shadow_exploUpdate(void *ctx) { Bullet *b = ctx; if (po_is("FlashingVFXEnabled")) manager_emitParticleAt(b->weapon->pfx, b->s.x, b->s.y); }
+static void B_Shadow_exploDone(void *ctx) { Bullet *b = ctx; b->s.visible = 0, b->s.body.enable = 0; }
+static void B_Shadow_followUpdate(void *ctx) {
+    Bullet *b = ctx;
+    b->jubX = b->s.x + 0x28 * b->counterVal * sinf(0.1f * b->jubY);
+    b->trail.alpha = 0.1f + 0.55f * b->counterVal;
+}
+static void B_Shadow_followDone(void *ctx) { Bullet *b = ctx; b->trail.visible = 0; B_despawnIfActive(b); }
+static void B_Shadow_Explode(Bullet *b) {
+    if (b->isExploding) return;
+    b->isExploding = 1;
+    anims_play(&b->flash, &SnakeDie[b->weapon->snakeKind], 0);
+    sprite_setScale(&b->s, 0), b->s.visible = po_is("FlashingVFXEnabled");
+    tweens_add((TweenConfig){ .props = { { &b->s.scaleX, &b->s.scaleY, 2 * Weapon_PArea(b->weapon) } }, .nprops = 1, .duration = 0x78, .yoyo = 1, .onStart = B_Shadow_exploStart, .onComplete = B_Shadow_exploDone, .onUpdate = B_Shadow_exploUpdate, .ctx = b });
+    b->jubX = b->s.x, b->jubY = b->s.y;  // TrailFollower
+    b->npos = 0;
+    b->trail.visible = 1, b->trail.alpha = 0.65f;
+    tweens_add((TweenConfig){ .props = { { &b->jubY, NULL, b->s.y - 0xc8 }, { &b->counterVal, NULL, 0 } }, .nprops = 2, .duration = 0x12c, .ease = Ease_SineInOut, .onUpdate = B_Shadow_followUpdate, .onComplete = B_Shadow_followDone, .ctx = b });
+}
+static void B_Shadow_OnHasHitAnObject(Bullet *b, void *o, int isDead) {
+    B_Shadow_Explode(b);
+    if (isDead || !(((Sprite *)o)->groups & Core.Enemies.bit)) return;  // sui Destructible res_Debuffs e slow sono undefined
+    Enemy *e = o;
+    Weapon *w = b->weapon;
+    if (e->res_Debuffs >= 1) return;
+    if (e->slow > 0.2f && w->critChancesArray[w->critIndex++ % 1000] < w->chance * Player_PLuck(Core.Player)) e->slow -= 0.05f;
+}
+static void B_Shadow_Update(Bullet *b, float delta) {
+    (void)delta;
+    b->flash.x = b->s.x, b->flash.y = b->s.y, b->flash.angle = b->s.angle;
+    if (b->isExploding) Ribbon_update(b, b->jubX, b->jubY, 0x10);
+    b->flash.depth = -game_height;
+}
+static void B_Shadow_DeSpawn(Bullet *b) { b->flash.visible = 0; base_DeSpawn(b); }
+static const BulletVT B_ShadowServant = { "vfx", "bubbleSphere2.png", B_Shadow_ctor, NULL, B_Shadow_OnRecycle, B_Shadow_OnHasHitAnObject, B_Shadow_Update, B_Shadow_DeSpawn };
+
+// --- B_Ophion (0x17bef) -------------------------------------------------------------------------------------------------------
+static void B_Oph_clearHits(void *ctx) { ((Bullet *)ctx)->n_hit = 0; }
+static void B_Oph_ctor(Bullet *b) {
+    static Animation loop;
+    if (!loop.n) make_anim(&loop, "vfx", "Ophion", 0, 0x1f, 4, 0x10, -1);
+    b->_speed = 2, b->s.visible = 0;
+    fx_init(&b->flash, "_OPBubble.png", 0), b->flash.visible = 1;  // DisplaySprite
+    fx_init(&b->flash2, "Ophion0000.png", 0), b->flash2.visible = 1;  // SnakeSprite
+    anims_play(&b->flash2, &loop, 0);
+    b->Pfx = particles_add();
+    b->PfxEmitter2 = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "OPpfx.png") }, .nframes = 1, .lifespan = EOP(0x1f4), .rotate = ERND(0, 0x168), .angle = { 0, 0x168, 3, NULL }, .angleSteps = 0x10, .speed = ERND(0x32, 0x50),
+        .quantity = 1, .scale = ERANGE(1, 0), .alpha = ERANGE(0.5f, 0), .frequency = 1, .hasZone = 1, .zoneRadius = 0x10, .flowEveryFrame = 1, .on = 0 });
+    b->PfxEmitter1 = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "OPpfx2.png") }, .nframes = 1, .lifespan = EOP(0x1f4), .rotate = ERND(0, 0x168), .angle = { 0, 0x168, 3, NULL }, .angleSteps = 0x10, .speed = ERND(0x32, 0x50),
+        .quantity = 1, .scale = ERANGE(1, 0), .alpha = ERANGE(0.5f, 0), .frequency = 1, .hasZone = 1, .zoneRadius = 0x10, .flowEveryFrame = 1, .on = 0 });
+    float d = -game_height;
+    b->flash2.depth = d - 2, b->Pfx->s.depth = d - 1, b->flash.depth = d;
+    b->HitboxTimer = b->ExpireTimer = (Timer){ -1, 0 };
+    b->fangTween = b->growTween = b->scaleGroundTween = b->exploTween = b->fadeOutTween = (TweenRef){ -1, 0 };
+}
+static void B_Oph_OnRecycle(Bullet *b) {
+    Weapon *w = b->weapon;
+    Bullet_OnRecycle(b);
+    sprite_setScale(&b->s, 1);
+    body_setCircle(&b->s.body, 0x18, -0xc, -0xc);
+    b->s.body.enable = 1, b->s.visible = 0, b->isExploding = 0;
+    b->PfxEmitter1->c.zoneRadius = 0x10 * Weapon_PArea(w);
+    b->PfxEmitter2->c.quantity = 1 + (int)floorf(w->level / 3.0f);  // (sic) setEmitZone e setQuantity sempre sugli stessi: 1 la zona, 2 la quantita'
+    Bullet_AimForRandomEnemy(b);
+    time_removeEvent(b->HitboxTimer);
+    b->HitboxTimer = time_addEvent(w->hitBoxDelay, 1, 0, B_Oph_clearHits, b);
+}
+static void B_Oph_Explode2(void *ctx);
+static void B_Oph_Implode(void *ctx) {
+    Bullet *b = ctx;
+    emitter_stop(b->PfxEmitter1), emitter_stop(b->PfxEmitter2);
+    tween_stop(b->growTween);
+    b->growTween = tweens_add((TweenConfig){ .props = { { &b->s.scaleX, &b->s.scaleY, 0 }, { &b->flash.scaleX, &b->flash.scaleY, 0 }, { &b->flash.alpha, NULL, 1 } }, .nprops = 3, .duration = 0x64, .onComplete = B_Oph_Explode2, .ctx = b });
+}
+static void B_Oph_grown(void *ctx) {
+    Bullet *b = ctx;
+    emitter_start(b->PfxEmitter1), emitter_start(b->PfxEmitter2);
+    tween_stop(b->scaleGroundTween);
+    b->scaleGroundTween = tweens_add((TweenConfig){ .props = { { &b->flash.scaleX, &b->flash.scaleY, 0.9f * b->flash.scaleX } }, .nprops = 1, .duration = 0x64, .yoyo = 1, .repeat = -1 });
+}
+static void B_Oph_Explode(Bullet *b) {
+    if (b->isExploding) return;
+    Weapon *w = b->weapon;
+    float k = 2 * Weapon_PArea(w);
+    Sound_PlaySound("Ophion1", 0.3f, 1, -0xc8 * b->indexInWeapon, 0xc8, 6);
+    if (b->indexInWeapon == 1) Sound_PlaySound("Ophion2", 0.3f, 1, 0, 0xc8, 2);
+    b->isExploding = 1;
+    sprite_setVelocity(&b->s, 0, 0);
+    b->flash.x = b->flash2.x = b->s.x, b->flash.y = b->flash2.y = b->s.y;
+    b->PfxEmitter1->x = b->PfxEmitter2->x = b->s.x, b->PfxEmitter1->y = b->PfxEmitter2->y = b->s.y;
+    tween_stop(b->fangTween), tween_stop(b->growTween), tween_stop(b->scaleGroundTween);
+    b->flash2.alpha = 0, sprite_setScale(&b->flash2, 0);
+    b->fangTween = tweens_add((TweenConfig){ .props = { { &b->flash2.scaleX, &b->flash2.scaleY, 1 }, { &b->flash2.alpha, NULL, 0.65f } }, .nprops = 2, .duration = 0x1f4 });
+    sprite_setScale(&b->s, 0), sprite_setScale(&b->flash, 0), b->flash.alpha = 1;
+    b->growTween = tweens_add((TweenConfig){ .props = { { &b->s.scaleX, &b->s.scaleY, k }, { &b->flash.scaleX, &b->flash.scaleY, k }, { &b->flash.alpha, NULL, 0.65f } }, .nprops = 3, .duration = 0x1f4, .onComplete = B_Oph_grown, .ctx = b });
+    time_removeEvent(b->ExpireTimer);
+    b->ExpireTimer = time_addEvent(Weapon_PDuration(w), 0, 0, B_Oph_Implode, b);
+}
+static void B_Oph_OnHasHitAnObject(Bullet *b, void *o, int isDead) { (void)o, (void)isDead; B_Oph_Explode(b); }
+static void B_Oph_fadeIn(void *ctx) { ((Bullet *)ctx)->flash.alpha = 0; }
+static void B_Oph_Explode2(void *ctx) {
+    Bullet *b = ctx;
+    Weapon *w = b->weapon;
+    float k = 4 * Weapon_PArea(w);
+    Sound_PlaySound("Ophion3", 0.3f, 1, -0xc8 * b->indexInWeapon, 0x1f4, 6);
+    tween_stop(b->fangTween), tween_stop(b->growTween), tween_stop(b->scaleGroundTween);
+    if (w->pfxEmitter) emitter_emitParticleAt(w->pfxEmitter, b->s.x, b->s.y, 0x3c);
+    b->flash2.alpha = 1;
+    tween_stop(b->exploTween);
+    b->exploTween = tweens_add((TweenConfig){ .props = { { &b->s.scaleX, &b->s.scaleY, k }, { &b->flash2.scaleX, &b->flash2.scaleY, k }, { &b->flash2.alpha, NULL, 0 } }, .nprops = 3, .duration = 0xc8, .onComplete = B_disableBody, .ctx = b });
+    b->flash.alpha = 0;
+    tweens_add((TweenConfig){ .props = { { &b->flash.scaleX, &b->flash.scaleY, k }, { &b->flash.alpha, NULL, 1 } }, .nprops = 2, .duration = 0xc8, .onComplete = B_Oph_fadeIn, .ctx = b });
+    tweens_add((TweenConfig){ .delay = 0xc8, .props = { { &b->flash.alpha, NULL, 0 } }, .nprops = 1, .duration = 0xc8, .onStart = B_Oph_fadeIn, .onComplete = B_despawnIfActive, .ctx = b });
+}
+static void B_Oph_DeSpawn(Bullet *b) {
+    if (b->indexInWeapon == 1) Sound_StopSound("Ophion2");
+    emitter_stop(b->PfxEmitter1), emitter_stop(b->PfxEmitter2);
+    base_DeSpawn(b);
+}
+static const BulletVT B_Ophion = { "vfx", "bubbleSphere2.png", B_Oph_ctor, NULL, B_Oph_OnRecycle, B_Oph_OnHasHitAnObject, NULL, B_Oph_DeSpawn };
+
+// --- W_ShadowServant (0x17dee), _Counter, W_Ophion (0x5050) ---------------------------------------------------------------------
+static void W_Shadow_common(Weapon *w, int kind) {
+    if (!SnakeIdle[0].n) {
+        make_anim(&SnakeIdle[0], "vfx", "snakeW_i0", 1, 6, 0, 0xc, -1), make_anim(&SnakeDie[0], "vfx", "snakeW_", 0, 0xb, 0, 0x10, -1);
+        make_anim(&SnakeIdle[1], "vfx", "snakeS_i0", 1, 6, 0, 0xc, -1), make_anim(&SnakeDie[1], "vfx", "snakeS_", 0, 0xb, 0, 0x10, -1);
+    }
+    w->snakeKind = kind;
+    fx_init(&w->image, "summon2.png", 0);  // SummonSprite
+    w->image.depth = -game_height;
+    w->imageTween = (TweenRef){ -1, 0 };
+    w->pfx = particles_add();
+    w->pfxEmitter = particles_createEmitter(w->pfx, (EmitterConfig){ .frames = { frame_get("vfx", "PfxGray1.png"), frame_get("vfx", "PfxGray2.png"), frame_get("vfx", "PfxPurple2.png"), frame_get("vfx", "PfxPurple3.png") }, .nframes = 4,
+        .angle = ERND(0, 0x168), .rotate = ERND(0, 0x168), .speed = ERND(0x64, 0xc8), .quantity = 2, .lifespan = EOP(0x190), .alpha = ERANGE(1, 0), .scale = ERANGE(1, 1), .on = 0 });
+    w->pfx->hasWell = 1, w->pfx->wellPower = 1 * 0x14, w->pfx->wellEpsilon = 0x32 * 0x32;
+}
+static void W_Shadow_ctor(Weapon *w) { W_Shadow_common(w, 0); }
+static void W_ShadowC_ctor(Weapon *w) { W_Shadow_common(w, 1); }
+static void W_Shadow_Fire(Weapon *w) {
+    base_Fire(w);
+    Sprite *s = &w->image;  // SummonAnimation
+    sprite_setScale(s, 0), s->visible = 1, s->alpha = 1;
+    tween_stop(w->imageTween);
+    w->imageTween = tweens_add((TweenConfig){ .props = { { &s->scaleX, &s->scaleY, Weapon_PArea(w) }, { &s->alpha, NULL, 0 } }, .nprops = 2, .duration = 0x1f4 });
+}
+static void W_Shadow_Update(Weapon *w, float delta) {
+    base_Update(w, delta);
+    w->image.x = w->pfx->wellX = Core.Player->s.x, w->image.y = w->pfx->wellY = Core.Player->s.y;
+}
+static void CA_shadow(Weapon *w) {
+    if (ARC_T(1)) {
+        if (Core_GetHiddenWeapon("SHADOWSERVANT_COUNTER")) return;
+        w->counterWeapon = Aquarius_Add("SHADOWSERVANT_COUNTER", w->level);
+    }
+    base_CheckArcanas(w);
+}
+static void CA_ophion(Weapon *w) {
+    if (ARC_T(1)) {
+        if (Core_GetHiddenWeapon("SHADOWSERVANT_COUNTER")) return;
+        Weapon *c = Core_AddHiddenWeapon("SHADOWSERVANT_COUNTER");
+        w->counterWeapon = c;
+        if (c) c->skipAddingEvolution = 1;
+        while (c && c->level < w->level && Weapon_LevelUp(c)) {}
+    }
+    base_CheckArcanas(w);
+}
+static const WeaponVT W_ShadowServant = { BASE, .bullet = &B_ShadowServant, .ctor = W_Shadow_ctor, .Fire = W_Shadow_Fire, .Update = W_Shadow_Update, .CheckArcanas = CA_shadow };
+static const WeaponVT W_ShadowServant_Counter = { BASE, .bullet = &B_ShadowServant, .ctor = W_ShadowC_ctor, .Fire = W_Shadow_Fire, .Update = W_Shadow_Update, .CheckArcanas = CA_none };
+static void W_Oph_ctor(Weapon *w) {
+    w->skipAddingEvolution = 1;
+    w->pfx = particles_add();
+    w->pfxEmitter = particles_createEmitter(w->pfx, (EmitterConfig){ .frames = { frame_get("vfx", "OPpfx.png"), frame_get("vfx", "OPpfx2.png"), frame_get("vfx", "PfxPurple2.png"), frame_get("vfx", "PfxPurple3.png") }, .nframes = 4,
+        .angle = ERND(0, 0x168), .rotate = ERND(0, 0x168), .speed = ERND(1, 0x190), .quantity = 4, .lifespan = EOP(0x190), .alpha = ERANGE(0.65f, 0), .scale = ERANGE(1, 0), .on = 0 });
+    w->pfx->hasWell = 1, w->pfx->wellPower = 0xa * 0xc8, w->pfx->wellEpsilon = 0x1f4 * 0x1f4;
+}
+static void W_Oph_Update(Weapon *w, float delta) { base_Update(w, delta); w->pfx->wellX = Core.Player->s.x, w->pfx->wellY = Core.Player->s.y; }
+static void W_Oph_onBulletOverlapsEnemy(Weapon *w, Bullet *b, Enemy *e) {
+    if (e->isDead || Bullet_HasAlreadyHitObject(b, e, e->isDead)) return;
+    float p = Weapon_PPower(w);
+    if (!e->res_Rosary && w->critChancesArray[w->critIndex++ % 1000] < w->chance * Player_PLuck(Core.Player)) p = e->hp;
+    Enemy_GetDamaged(e, p, (int)w->hitVFX, w->knockback, w->bulletType);
+    w->stats_inflictedDamage += Weapon_PPower(w);
+}
+static const WeaponVT W_Ophion = { BASE, .bullet = &B_Ophion, .ctor = W_Oph_ctor, .Update = W_Oph_Update, .CheckArcanas = CA_ophion, .onBulletOverlapsEnemy = W_Oph_onBulletOverlapsEnemy };
+
+// --- B_PrismaticMissile (0x407e) -------------------------------------------------------------------------------------------------
+static const WeaponVT W_PrismaticMissile, W_Luminaire;
+static void B_Prism_ctor(Bullet *b) {
+    b->radius = 0x40, b->_speed = 0, b->s.alpha = 0.5f;
+    fx_init(&b->GroundFx, NULL, 1);
+    b->GroundFx.draw = Circle_draw, b->GroundFx.width = 1, b->GroundFx.alpha = 0.1f, b->GroundFx.tint = 0xff, b->GroundFx.depth = -game_height;
+    b->Pfx = particles_add();
+    b->pfxEmitterB = particles_createEmitter(b->Pfx, (EmitterConfig){ .frames = { frame_get("vfx", "HitSmokeA.png"), frame_get("vfx", "HitSmokeA2.png") }, .nframes = 2, .lifespan = EOP(0x1f4), .rotate = ERND(0, 0x168), .angle = { 0, 0x168, 3, NULL }, .angleSteps = 0x10,
+        .speed = ERND(0x32, 0x50), .quantity = 1, .scale = ERANGE(1, 0), .alpha = ERANGE(0.25f, 0), .frequency = 1, .blendAdd = 1, .hasZone = 1, .zoneRadius = 0x10, .flowEveryFrame = 1, .on = 0 });
+    b->Pfx->hasWell = 1, b->Pfx->wellPower = 2 * 0x14, b->Pfx->wellEpsilon = 0x32 * 0x32;
+    Ribbon_init(b, "Gradient3_4px.png", 1);
+    b->trail.depth = 1;
+    b->fadeOutTween = b->scaleTween = b->scaleGroundTween = (TweenRef){ -1, 0 };
+}
+static void B_Prism_groundStart(void *ctx) {
+    Bullet *b = ctx;
+    b->GroundFx.x = b->s.x, b->GroundFx.y = b->s.y, b->GroundFx.visible = 1;
+    b->pfxEmitterB->x = b->s.x, b->pfxEmitterB->y = b->s.y;
+    emitter_start(b->pfxEmitterB);
+}
+static void B_Prism_groundDone(void *ctx) { Bullet *b = ctx; b->GroundFx.visible = 0; emitter_stop(b->pfxEmitterB); }
+static void B_Prism_landed(void *ctx) {
+    Bullet *b = ctx;
+    b->s.body.enable = 1;
+    tween_stop(b->fadeOutTween);
+    b->fadeOutTween = tweens_add((TweenConfig){ .props = { { &b->trail.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x64 });
+}
+static void B_Prism_OnRecycle(Bullet *b) {
+    static const char L[7] = { 'A', 'B', 'C', 'D', 'E', 'F', 'G' };
+    static const unsigned Col[7] = { 0xff0000, 0xffa500, 0xffff00, 0x8000, 0xff, 0x4b0082, 0xee82ee };
+    Weapon *w = b->weapon;
+    Bullet_OnRecycle(b);
+    sprite_setScale(&b->s, 1);
+    body_setCircle(&b->s.body, 0x10, b->s.body.offset.x, b->s.body.offset.y);
+    b->s.body.enable = 0, b->isCullable = 0;
+    float fall = fmaxf(0x1f4, 0x5dc / Weapon_PSpeed(w));
+    b->startingAngle = (2 * PI / 7) * (b->indexInWeapon + 0.5f * w->firedTimes);
+    b->angleIncrement = w->firedTimes % 2 == 0 ? 0.25f : -0.25f;
+    b->startingPoint.x = b->s.x = Core.Player->s.x;
+    b->startingPoint.y = b->s.y = Core.Player->s.y - game_height;
+    float ty = Core.Player->s.y;
+    b->s.visible = 0;
+    char n[32];
+    int i = b->indexInWeapon % 7;
+    snprintf(n, sizeof n, "Prism%c.png", L[i]);
+    b->trailFrame = frame_get("vfx", n);
+    snprintf(n, sizeof n, "HitSmoke%c.png", L[i]);
+    b->pfxEmitterB->c.frames[0] = frame_get("vfx", n);
+    snprintf(n, sizeof n, "HitSmoke%c2.png", L[i]);
+    b->pfxEmitterB->c.frames[1] = frame_get("vfx", n);
+    b->GroundFx.tint = Col[i];
+    b->updateLoops = 0, b->npos = 0;
+    int fl = po_is("FlashingVFXEnabled");
+    b->trail.visible = 1, b->trail.alpha = fl ? 1 : 0.2f;
+    Sound_PlaySound("Magic3", 0.15f, 1, -0x1f4 + 0x64 * b->indexInWeapon, 0x12c, 7);
+    tween_stop(b->fadeOutTween);
+    b->radius = 0;
+    sprite_setScale(&b->GroundFx, 0);
+    tween_stop(b->scaleTween);
+    b->scaleTween = tweens_add((TweenConfig){ .props = { { &b->s.scaleX, &b->s.scaleY, Weapon_PArea(w) }, { &b->s.alpha, NULL, 0 } }, .nprops = 2, .duration = 0x78, .delay = fall, .onComplete = B_despawnIfActive, .ctx = b });
+    tween_stop(b->scaleGroundTween);
+    B_Prism_groundDone(b);  // onStop del tween di prima
+    if (fl) b->scaleGroundTween = tweens_add((TweenConfig){ .props = { { &b->GroundFx.scaleX, &b->GroundFx.scaleY, 0x20 * Weapon_PArea(w) } }, .nprops = 1, .duration = 0x78, .delay = fall, .yoyo = 1, .onStart = B_Prism_groundStart, .onComplete = B_Prism_groundDone, .ctx = b });
+    float a = Weapon_PArea(w);
+    tweens_add((TweenConfig){ .props = { { &b->startingPoint.y, NULL, ty }, { &b->radius, NULL, 0x40 + (a > 1 ? 0x10 * (a - 1) : 0) } }, .nprops = 2, .duration = fall, .onComplete = B_Prism_landed, .ctx = b });
+}
+static void B_Prism_DeSpawn(Bullet *b) {
+    Weapon *w = b->weapon;
+    if (w->firstArcana == 2 && w->explodeOnExpire) Weapon_SpawnExplosionAt(w, b->s.x, b->s.y, 0);
+    base_DeSpawn(b);
+}
+static void B_Prism_Update(Bullet *b, float delta) {
+    (void)delta;
+    Ribbon_update(b, b->s.x, b->s.y, 0x18);
+    b->startingAngle += b->angleIncrement;
+    b->s.x = b->startingPoint.x + cosf(b->startingAngle) * b->radius, b->s.y = b->startingPoint.y + sinf(b->startingAngle) * b->radius;
+    b->Pfx->wellX = b->s.x, b->Pfx->wellY = b->s.y - 0x28;
+}
+static void B_Prism_OnHasHitAnObject(Bullet *b, void *o, int isDead) {
+    Weapon *w = b->weapon;
+    if (isDead) return;
+    if (w->firstArcana == 19) Weapon_SpawnExplosionAt(w, b->s.x, b->s.y, 1);
+    else if (w->firstArcana == 14) Bullet_TryFreeze(b, o);
+}
+static const BulletVT B_PrismaticMissile = { "vfx", "HitWhite1.png", B_Prism_ctor, NULL, B_Prism_OnRecycle, B_Prism_OnHasHitAnObject, B_Prism_Update, B_Prism_DeSpawn };
+static const BulletVT B_Luminaire;
+// --- B_Luminaire (0xbf39): il raggio sul nemico a caso ------------------------------------------------------------------------
+static void B_Lum_ctor(Bullet *b) { b->s.blendAdd = 1, b->scaleTween = b->alphaTween = (TweenRef){ -1, 0 }; }  // semplificazione: SCREEN reso come ADD, il motore non ha SCREEN
+static void B_Lum_scaleStart(void *ctx) { Bullet *b = ctx; if (b->weapon->explodeOnExpire) Weapon_SpawnExplosionAt(b->weapon, b->s.x, b->s.y, 0); }
+static void B_Lum_alphaStart(void *ctx) { ((Bullet *)ctx)->s.body.enable = 0; }
+static void B_Lum_OnRecycle(Bullet *b) {
+    static const unsigned C[4] = { 0xff0000, 0xffff00, 0xff, 0xff00ff };
+    static const short D[32] = { 0, 0, 0, 0, 0x258, 0x258, 0x320, 0x320, 0, 0, 0, 0, 0x258, 0x258, 0x320, 0x320, -0x190, -0x190, -0x190, -0x190, 0xc8, 0xc8, 0x190, 0x190, -0x190, -0x190, -0x190, -0x190, 0xc8, 0xc8, 0x190, 0x190 };
+    Weapon *w = b->weapon;
+    Bullet_OnRecycle(b);
+    if (b->alreadyRecycled) return;
+    b->alreadyRecycled = 1;
+    Sprite *t = Bullet_AimForRandomEnemyInScreen(w->lumRect);
+    b->s.x = t ? t->x : Core.Player->s.x, b->s.y = t ? t->y : Core.Player->s.y;
+    Sound_PlaySound("Magic3", 0.15f, 1, D[b->indexInWeapon % 32], 0x190, 7);
+    int fl = po_is("FlashingVFXEnabled");
+    b->s.alpha = fl ? 0.65f : 0.1f, b->s.blendAdd = fl;
+    sprite_setScale(&b->s, 1), sprite_setTint(&b->s, C[b->indexInWeapon % 4]);
+    b->s.body.enable = 1;
+    tween_stop(b->scaleTween), tween_stop(b->alphaTween);
+    b->scaleTween = tweens_add((TweenConfig){ .props = { { &b->s.scaleY, NULL, game_height / 8.0f }, { &b->s.scaleX, NULL, Weapon_PArea(w) } }, .nprops = 2, .duration = 0xc8, .onStart = B_Lum_scaleStart, .ctx = b });
+    b->alphaTween = tweens_add((TweenConfig){ .props = { { &b->s.alpha, NULL, 0 } }, .nprops = 1, .delay = 0xc8, .duration = 0x64, .onStart = B_Lum_alphaStart, .onComplete = B_despawnIfActive, .ctx = b });
+}
+static void B_Lum_DeSpawn(Bullet *b) { base_DeSpawn(b); b->alreadyRecycled = 0; }
+static const BulletVT B_Luminaire = { "vfx", "_phaser.png", B_Lum_ctor, NULL, B_Lum_OnRecycle, B_Prism_OnHasHitAnObject, NULL, B_Lum_DeSpawn };
+
+// --- W_PrismaticMissile (0x9eb3) / W_Luminaire (0xdeff) ---------------------------------------------------------------------------
+static void W_Prism_ctor(Weapon *w) { w->firstArcana = -1; }
+static void W_Prism_Fire(Weapon *w) { base_Fire(w); w->firedTimes++; }
+static Bullet *W_Prism_FireOneBullet(Weapon *w, float x, float y, int index) {
+    (void)index;
+    w->firingCounter = (w->firingCounter + 1) % 7;  // currentIndex
+    return BulletPool_SpawnAt(w->pool, x, y, w, w->firingCounter);
+}
+static void CA_prism(Weapon *w) {
+    if (w->firstArcana == -1) {  // semplificazione: l'originale scorre le arcane nell'ordine di arrivo e l'ultima vince; qui Fuoco, Gioielli, Crepuscolo in ordine fisso
+        if (ARC_T(19)) { w->firstArcana = 19, w->explosionType = "FIREEXPLOSION"; if (FIREW) FIREW->power = 0.5f * w->power; }
+        if (ARC_T(14)) w->firstArcana = 14, w->freezeChance = 0.25f;
+        if (ARC_T(2)) w->firstArcana = 2, w->explosionType = "RAYEXPLOSION", w->explodeOnExpire = 1;
+    }
+    base_CheckArcanas(w);
+}
+static const WeaponVT W_PrismaticMissile = { BASE, .bullet = &B_PrismaticMissile, .ctor = W_Prism_ctor, .Fire = W_Prism_Fire, .FireOneBullet = W_Prism_FireOneBullet, .CheckArcanas = CA_prism };
+static void Pickup_Bless(Pickup *p, float k, int fl) { p->value += k; if (fl) manager_emitParticleAt(Core.PfxEmitter_Pickups, p->s.x, p->s.y); }
+static void W_Lum_ctor(Weapon *w) {
+    w->firstArcana = -1;
+    w->lumRect = (Rectangle){ 0, 0, 0.85f * game_width, 0.85f * game_height };
+}
+static void W_Lum_Update(Weapon *w, float delta) {
+    base_Update(w, delta);
+    if (w->hasBullets) return;  // IsInitialised
+    w->hasBullets = 1;
+    for (int i = 0; i < 9; i++) {
+        Sprite *d = &w->orbs[i];
+        char n[16];
+        snprintf(n, sizeof n, "doi0%d.png", i + 1);
+        sprite_init(d, frame_get("vfx", n), 0.5f * game_width, 0);
+        d->scrollFactor0 = 1, d->blendAdd = 1, d->alpha = 0.05f, d->depth = -0x7ce, d->tint = 0xfff6f6;  // semplificazione: SCREEN come ADD, tinte d'angolo col colore medio
+        children_add(d);
+        tweens_add((TweenConfig){ .props = { { &d->alpha, NULL, 0.15f }, { &d->scaleX, &d->scaleY, 2 + 0.25f * i } }, .nprops = 2, .ease = Ease_SineInOut, .delay = 0x320 * i, .duration = 0xfa0, .repeat = -1, .yoyo = 1 });
+        tweens_add((TweenConfig){ .props = { { &d->angle, NULL, 0x167 } }, .nprops = 1, .delay = 8 * i, .duration = 0x2710, .repeat = -1 });
+    }
+    w->nOrbs = 9;
+    w->pfx = particles_add();
+    w->pfx->scrollFactor0 = 1;
+    w->pfxEmitter = particles_createEmitter(w->pfx, (EmitterConfig){ .frames = { frame_get("vfx", "Beam.png") }, .nframes = 1, .lifespan = EOP(0x7d0), .rotate = EOP(0), .quantity = 1, .scale = ERANGE(3, 0), .scaleY = ERANGE(0x32, 0x32), .hasScaleY = 1,
+        .alpha = ERANGE(0.25f, 0), .hasZoneRect = 1, .zoneRect = { 0, 0, game_width, game_height }, .frequency = 0x190, .blendAdd = 1, .on = 1 });
+}
+static void W_Lum_Fire(Weapon *w) {
+    base_Fire(w);
+    int fl = po_is("FlashingVFXEnabled");
+    if (w->pfxEmitter) { if (fl) emitter_start(w->pfxEmitter); else emitter_stop(w->pfxEmitter); }
+    w->lumRect.x = Core.Player->s.x - 0.5f * w->lumRect.width, w->lumRect.y = Core.Player->s.y - 0.5f * w->lumRect.height;
+    float amount = Weapon_PAmount(w);
+    static const char *const coins[3] = { "COIN", "COINBAG1", "COINBAGMAX" };
+    int nc = 0;
+    PickupSlot *sl[3];
+    for (int k = 0; k < 3; k++) sl[k] = PickupPool_slot(&Core.pickupPool, coins[k]), nc += sl[k]->n_spawned;
+    float kc = nc ? (amount + logf(nc)) / nc : 0;
+    for (int k = 0; k < 3; k++) for (int i = 0; i < sl[k]->n_spawned; i++) {
+        Pickup *p = sl[k]->spawned[i];
+        Pickup_Bless(p, kc, fl);
+        if (p->value >= 0x64) sprite_setFrame(&p->s, frame_get("items", "MoneyBagColor.png"));
+        else if (p->value >= 0x19) sprite_setFrame(&p->s, frame_get("items", "MoneyBagGreen.png"));
+        else if (p->value > 0xa) sprite_setFrame(&p->s, frame_get("items", "MoneyBagRed.png"));
+    }
+    static const char *Gems[11] = { "Gem1.png", "Gem2.png", "Gem3.png", "Gem4.png", "Gem5.png", "Gem6.png", "Gem7.png", "Gem8.png", "Gem9.png", "Gem10.png", "Gem11.png" };
+    for (int i = 10; i > 0; i--) { int j = (int)floorf(frand() * (i + 1)); const char *t = Gems[i]; Gems[i] = Gems[j], Gems[j] = t; }  // RND.shuffle(GEMFRAMES)
+    PickupSlot *gs = PickupPool_slot(&Core.gemsPool, "GEM");
+    int ng = gs->n_spawned;
+    float kg = ng ? (amount + logf(ng)) / ng : 0;
+    for (int i = 0; i < ng; i++) {
+        Pickup *g = gs->spawned[i];
+        Pickup_Bless(g, kg, fl);
+        if (fl) sprite_setFrame(&g->s, frame_get("items", Gems[i % 11]));  // BlessColor
+    }
+}
+static const WeaponVT W_Luminaire = { BASE, .bullet = &B_Luminaire, .ctor = W_Lum_ctor, .Fire = W_Lum_Fire, .Update = W_Lum_Update, .CheckArcanas = CA_prism };
+
+// --- B_Party (0x5d4f): stelle, cuori, triangoli e cerchi che salgono e rimbalzano ------------------------------------------------
+typedef struct PartyData { float velX[12], velY[12]; int angles[20], frames[24], frameI; } PartyData;
+static Animation PartyAnim[4];  // star, heart, triangle, circle: uguali per tutti i colpi
+static void shuffle_i(int *a, int n) { for (int i = n - 1; i > 0; i--) { int j = (int)floorf(frand() * (i + 1)), t = a[i]; a[i] = a[j], a[j] = t; } }
+static void Party_trailDraw(Sprite *s) {  // Graphics: ogni segmento il suo lineStyle, alpha 1 / (i / 20)
+    Bullet *b = s->owner;
+    if (b->npos < 2 || b->trailAlpha <= 0) return;
+    float ox = b->trail.x - camera_scrollX, oy = b->trail.y - camera_scrollY;
+    BeginBlendMode(BLEND_ADDITIVE);
+    for (int i = 1; i < b->npos; i++) {
+        Vector2 p0 = { ox + b->positions[i - 1].x, oy + b->positions[i - 1].y }, p1 = { ox + b->positions[i].x, oy + b->positions[i].y };
+        DrawLineEx(p0, p1, 2, hexc(b->color, fminf(1, 20.0f / i) * b->trailAlpha));
+        DrawLineEx(p0, p1, 1, hexc(0xbbbbbb, fminf(1, 16.0f / i) * b->trailAlpha));
+    }
+    EndBlendMode();
+}
+static void B_Party_ClearObjectsHit(Bullet *b) {
+    if (!b->canClearObjectsHit) return;
+    b->canClearObjectsHit = 0, b->clearObjectTime = 0, b->n_hit = 0;
+}
+static void B_Party_Bounce(void *ctx) { B_Party_ClearObjectsHit(ctx); }
+static void B_Party_ctor(Bullet *b) {
+    PartyData *d = b->party = calloc(1, sizeof(PartyData));
+    b->selfGravity = -1.8f, b->bounceValue = 0.9f;
+    if (!PartyAnim[0].n) {
+        make_anim(&PartyAnim[0], "vfx", "image_004_", 0, 0x17, 4, 0x10, -1);
+        make_anim(&PartyAnim[1], "vfx", "image_003_", 0, 0x17, 4, 0x10, -1);
+        make_anim(&PartyAnim[2], "vfx", "image_005_", 0, 0x17, 4, 0x10, -1);
+        make_anim(&PartyAnim[3], "vfx", "image_002_", 0, 0x17, 4, 0x10, -1);
+    }
+    sprite_init(&b->trail, NULL, 0, 0);
+    b->trail.owner = b, b->trail.draw = Party_trailDraw;
+    children_add(&b->trail);
+    for (int i = 0; i < 12; i++) d->velX[i] = 1 + 0.5f * frand(), d->velY[i] = 1 + 0.5f * frand();
+    for (int i = 1; i < 20; i++) d->angles[i] = 2 * i;
+    shuffle_i(&d->angles[1], 19);  // shuffle + unshift(0)
+    for (int i = 0; i < 0x17; i++) d->frames[i] = i;
+    shuffle_i(d->frames, 0x17);
+    tweens_add((TweenConfig){ .props = { { &b->s.angle, NULL, 0x167 } }, .nprops = 1, .duration = 0x3e8 + 0xc8 * frand(), .repeat = -1 });
+    b->tween = (TweenRef){ -1, 0 };
+    b->ExpireTimer = (Timer){ -1, 0 };
+}
+static void B_Party_FadeOut(void *ctx) {
+    Bullet *b = ctx;
+    tweens_add((TweenConfig){ .props = { { &b->trailAlpha, NULL, 0 }, { &b->s.alpha, NULL, 0 } }, .nprops = 2, .duration = 0x64, .onComplete = B_despawnIfActive, .ctx = b });
+    if (b->weapon->explodeOnExpire) Weapon_SpawnExplosionAt(b->weapon, b->s.x, b->s.y, 0);
+}
+static void B_Party_expire(void *ctx) { Bullet *b = ctx; time_removeEvent(b->ExpireTimer); B_Party_FadeOut(b); }
+static void B_Party_OnRecycle(Bullet *b) {
+    Weapon *w = b->weapon;
+    Bullet_OnRecycle(b);
+    b->enemiesHit = 0;
+    body_setCircle(&b->s.body, 8, b->s.body.offset.x, b->s.body.offset.y);
+    b->_speed = 1, b->selfGravity = 0;
+    tween_stop(b->tween);
+    b->tween = tweens_add((TweenConfig){ .props = { { &b->selfGravity, NULL, -6 * Weapon_PSpeed(w) } }, .nprops = 1, .duration = 0x12c });
+    sprite_setScale(&b->s, 0.65f * Weapon_PArea(w));
+    time_removeEvent(b->ExpireTimer);
+    b->s.body.collideWorldBounds = 1, b->s.body.hasWorldBounce = 1, b->s.body.worldBounce = (Vector2){ b->bounceValue, b->bounceValue };
+    b->s.body.customBounds = &Core.Player->WorldBoxCollider;
+    b->s.body.onWorldBounds = B_Party_Bounce, b->s.body.onWorldBoundsCtx = b;
+    b->trail.x = b->s.x - Core.Player->s.x, b->trail.y = b->s.y - Core.Player->s.y;
+    b->color = (unsigned)(0xffffff * frand());
+    b->trailAlpha = 1, b->s.alpha = 1, b->npos = 0;
+    b->bounceValue = w->level == 1 ? 0.5f : w->level <= 3 ? 0.6f : w->level <= 5 ? 0.7f : w->level <= 7 ? 0.8f : 0.9f;
+    b->ExpireTimer = time_addEvent(Weapon_PDuration(w), 0, 0, B_Party_expire, b);
+}
+static const unsigned PartyColors[2][4][8] = {
+    { { 0xbbbb00, 0xbbbb22, 0xcccc00, 0xaaaa00, 0xbbbb00, 0xbbbb00, 0xbbbb00, 0xbbbb00 }, { 0xbb0066, 0xbb2266, 0xcc0066, 0xaa0066, 0xbb0066, 0xbb0066, 0xbb0066, 0xbb0066 },
+      { 0xbb6600, 0xbb6622, 0xcc6600, 0xaa6600, 0xbb6600, 0xbb6600, 0xbb6600, 0xbb6600 }, { 0xbb0000, 0xbb2222, 0xcc0000, 0xaa0000, 0xbb0000, 0xbb0000, 0xbb0000, 0xbb0000 } },
+    { { 0xbb, 0x22, 0xbbbbbb, 0xaaaabb, 0xbb, 0xbb, 0xbb, 0xbb }, { 0xbb66, 0x2266, 0xbbbb66, 0xaabb66, 0xbb66, 0xbb66, 0xbb66, 0xbb66 },
+      { 0x66bb, 0x6622, 0xbb66bb, 0xaa66bb, 0x66bb, 0x66bb, 0x66bb, 0x66bb }, { 0xbbbb, 0x2222, 0xbbbbbb, 0xaabbbb, 0xbbbb, 0xbbbb, 0xbbbb, 0xbbbb } } };
+static void B_Party_SetType(Bullet *b, int type) {  // 0 stella, 1 cuore, 2 triangolo, 3 cerchio
+    Weapon *w = b->weapon;
+    PartyData *d = b->party;
+    float a = Weapon_PAmount(w);
+    b->bounces = type == 1 ? 1 : type == 3 ? a : 0;
+    b->penetrating = type == 0 ? 0xffff : type == 3 ? 0 : a;
+    b->_speed = type == 1 ? 0.8f : type == 3 ? 1.2f : 1;
+    d->frameI++;
+    if (d->frameI > 0x17) d->frameI = 0;
+    anims_play(&b->s, &PartyAnim[type], d->frames[d->frameI]);
+    w->colorIndex = (w->colorIndex + 1) % 8;
+    b->color = PartyColors[w->frontFiring ? 0 : 1][type][w->colorIndex];
+    sprite_setTint(&b->s, b->color);
+}
+static void B_Party_SetTarget(Bullet *b) {
+    Weapon *w = b->weapon;
+    PartyData *d = b->party;
+    int side = w->frontFiring ? Core.Player->s.flipX : !Core.Player->s.flipX;
+    float a = (side ? 0xd2 : -0x3c) * (PI / 180) + d->angles[b->indexInWeapon % 20] * (PI / 180), v = Bullet_TrueSpeed(b);
+    sprite_setVelocity(&b->s, v * cosf(a), v * sinf(a));
+    b->s.angle = Bullet_AngleFromVelocityRadians(b->s.body.velocity) * (180 / PI);
+    b->s.body.velocity.x *= d->velX[(int)floorf(frand() * 12)];
+}
+static void B_Party_OnHasHitWall(Bullet *b, Tile *t) {
+    b->save_vel_x *= t && (t->faceRight || t->faceLeft) ? -b->bounceValue : b->bounceValue;
+    b->save_vel_y *= t && (t->faceTop || t->faceBottom) ? -b->bounceValue : b->bounceValue;
+    sprite_setVelocity(&b->s, b->save_vel_x, b->save_vel_y);
+    B_Party_ClearObjectsHit(b);
+}
+static void B_Party_DeSpawn(Bullet *b) { time_removeEvent(b->ExpireTimer); base_DeSpawn(b); }
+static void B_Party_trailUpdate(Bullet *b) {
+    memmove(&b->positions[1], &b->positions[0], 0x18 * sizeof(Vector2));
+    b->positions[0] = (Vector2){ b->s.x, b->s.y + 0x18 };
+    if (b->npos < 0x19) b->npos++;
+}
+static void B_Party_Update(Bullet *b, float delta) {
+    b->trail.depth = b->s.y - Core.Player->s.y + 0.5f * game_height;
+    int n = (int)ceilf(delta / 0x10);
+    for (int i = 0; i < n; i++) B_Party_trailUpdate(b);
+    b->clearObjectTime += delta;
+    b->canClearObjectsHit = b->clearObjectTime >= b->weapon->hitBoxDelay;
+    b->save_vel_x = b->s.body.velocity.x == 0 ? b->save_vel_x : b->s.body.velocity.x;
+    b->save_vel_y = b->s.body.velocity.y == 0 ? b->save_vel_y : b->s.body.velocity.y;
+    b->s.body.velocity.y -= b->selfGravity;
+}
+static void B_Party_OnHasHitAnObject(Bullet *b, void *o, int isDead) {
+    (void)o;
+    if (isDead) return;
+    if (b->bounces > 0) {
+        b->bounces--;
+        b->save_vel_x *= -1, b->save_vel_y *= -1;
+        sprite_setVelocity(&b->s, b->save_vel_x, b->save_vel_y);
+        B_Party_ClearObjectsHit(b);
+        return;
+    }
+    if (--b->penetrating <= 0) B_Party_FadeOut(b);
+}
+static const BulletVT B_Party = { "vfx", "party2.png", B_Party_ctor, NULL, B_Party_OnRecycle, B_Party_OnHasHitAnObject, B_Party_Update, B_Party_DeSpawn, NULL, NULL, B_Party_OnHasHitWall };
+
+// --- W_Party (0xa099) / W_Party_Counter ---------------------------------------------------------------------------------------------
+static void W_Party_common(Weapon *w, int front) {
+    w->frontFiring = front;
+    w->pfx = particles_add();
+    w->pfxEmitter = particles_createEmitter(w->pfx, (EmitterConfig){ .frames = { frame_get("vfx", "2Spell1.png"), frame_get("vfx", "WhiteDot.png") }, .nframes = 2, .quantity = 1, .lifespan = EOP(0x7d0), .alpha = ERANGE(1, 0), .scale = ERANGE(2, 0), .blendAdd = 1,
+        .nonRadial = 1, .speed = ERND(0x64, 0xc8), .speedY = ERND(-0x64, -0xc8), .angle = ERND(0xe1, 0x13b), .gravityY = 0x12c, .on = 0 });
+}
+static void W_Party_ctor(Weapon *w) { W_Party_common(w, 1); }
+static void W_PartyC_ctor(Weapon *w) { W_Party_common(w, 0); }
+static void W_Party_Fire(Weapon *w) {
+    w->fireType = (int)floorf(frand() * 5);  // pickType
+    base_Fire(w);
+    Sound_PlaySound("Party", 0.5f, 1, -0x258 * w->critChancesArray[w->critIndex++ % 1000], 0xc8, 0xa);
+    int side = w->frontFiring ? Core.Player->s.flipX : !Core.Player->s.flipX;
+    float k = side ? -1 : 1;
+    w->pfxEmitter->c.speed = ERND(0x64 * k, 0xc8 * k);
+    emitter_emitParticleAt(w->pfxEmitter, Core.Player->s.x, Core.Player->s.y - 0x18, 0x40);
+    if (w->counterWeapon) w->counterWeapon->vt->Fire(w->counterWeapon);
+}
+static Bullet *W_Party_FireOneBullet(Weapon *w, float x, float y, int index) {
+    Bullet *b = BulletPool_SpawnAt(w->pool, x, y - 0x18, w, index);
+    if (!b) return NULL;
+    B_Party_SetType(b, w->fireType == 4 ? (int)floorf(frand() * 4) : w->fireType);
+    B_Party_SetTarget(b);
+    return b;
+}
+static void CA_party(Weapon *w) {
+    if (ARC_T(1)) {
+        if (Core_GetHiddenWeapon("PARTY_COUNTER")) return;
+        Weapon *c = Core_AddHiddenWeapon("PARTY_COUNTER");
+        w->counterWeapon = c;
+        if (c) time_removeEvent(c->firingTimer), c->resetDisabled = 1;  // CleanUp + ResetFiringTimer vuoto: spara solo con l'arma madre
+        while (c && c->level < w->level && Weapon_LevelUp(c)) {}
+    }
+    base_CheckArcanas(w);
+}
+static const WeaponVT W_Party = { BASE, .bullet = &B_Party, .ctor = W_Party_ctor, .Fire = W_Party_Fire, .FireOneBullet = W_Party_FireOneBullet, .CheckArcanas = CA_party };
+static const WeaponVT W_Party_Counter = { BASE, .bullet = &B_Party, .ctor = W_PartyC_ctor, .Fire = W_Party_Fire, .FireOneBullet = W_Party_FireOneBullet, .CheckArcanas = CA_none };
+
+// --- W_Insatiable (0x119ae): il colpo sta sul magnete; il proiettile (0x17282) e' quello di Blood Astronomia ------------------------
+static float W_Insat_PPower(Weapon *w) { return base_PPower(w) * Player_PGreed(Core.Player); }
+static void W_Insat_ctor(Weapon *w) {
+    sprite_init(&w->image, frame_get("vfx", "_Insatiable.png"), Core.Magnet->s.x, Core.Magnet->s.y);
+    w->image.alpha = 0.6f, w->image.depth = 0.5f * -game_height;
+    sprite_setScale(&w->image, Core.Magnet->radius / 0x20);
+    children_add(&w->image);
+    tweens_add((TweenConfig){ .props = { { &w->image.alpha, NULL, 0.2f } }, .nprops = 1, .loop = 1, .yoyo = 1, .duration = 0x3e8, .repeat = -1 });
+}
+static void W_Insat_Fire(Weapon *w) { sprite_setScale(&w->image, Weapon_PArea(w) / 0x20); base_Fire(w); }
+static void W_Insat_Update(Weapon *w, float delta) { base_Update(w, delta); w->image.x = Core.Magnet->s.x, w->image.y = Core.Magnet->s.y; }
+static const WeaponVT W_Insatiable = { BASE, .bullet = &B_BloodAstronomia, .ctor = W_Insat_ctor, .PPower = W_Insat_PPower, .PAmount = one_PAmount, .PArea = W_Astro_PArea, .Fire = W_Insat_Fire, .Update = W_Insat_Update };
+
+// ============================================================================
+// Personaggi di Foscari: 0xb7e6 Eleanor, 0x2470 Maruto, 0x16b6d Keitha, 0xb1f1 Luminaire, 0x7c3 Genevieve, 0x98d5 Je-Ne-Viv, 0x796b Sammy
+// ============================================================================
+static void Foscari_gift(const char *weapon, int spawned) {  // l'arma regalata al livello: sotto il giocatore, con la freccia
+    float x = Core.Player->s.x, y = Core.Player->s.y + 0.45f * game_height;
+    Pickup *p = Core_MakeStagePickup(x, y, "WEAPON", weapon);
+    if (p && spawned) p->hasSpawned = 1;
+    GizmoManager_ShowHighlightAt(x, y);
+}
+static void Foscari_makeAttack(Player *p) {  // spriteAnims.meleeAttack: 'meleeA' o 'rangedA'
+    cJSON *m = cJSON_GetObjectItem(cJSON_GetObjectItem(cJSON_GetArrayItem(p->data, 0), "spriteAnims"), "meleeAttack");
+    if (!m) return;
+    char prefix[64];
+    snprintf(prefix, sizeof prefix, "%s", str(m, "spriteName"));
+    char *e = strstr(prefix, "01.png");
+    if (e) *e = 0;
+    make_anim(&p->meleeA, str(m, "textureName"), prefix, 1, (int)num(m, "framesNumber", 0), 2, num(m, "frameRate", 8), 0);
+}
+
+// --- WorldEaterVFX (0x178dc): il teschio che divora quello che c'e' a schermo -------------------------------------------------
+static struct {
+    int made, playing;
+    Sprite image, fader, rays[0xd];
+    TweenRef t1, t2, t3;
+    void (*callback)(void);
+} WE;
+static void WE_Make(void) {
+    float cx = 0.5f * game_width, cy = 0.5f * game_height;
+    memset(&WE, 0, sizeof WE);
+    WE.made = 1;
+    WE.t1 = WE.t2 = WE.t3 = (TweenRef){ -1, 0 };
+    sprite_init(&WE.image, frame_get("vfx", "2Skull1.png"), cx, cy);
+    WE.image.scrollFactor0 = 1, WE.image.alpha = 0, WE.image.depth = 0x2710;
+    children_add(&WE.image);
+    sprite_init(&WE.fader, frame_get("vfx", "blackDot.png"), 0, 0);
+    sprite_setOrigin(&WE.fader, 0, 0);
+    WE.fader.scrollFactor0 = 1, WE.fader.alpha = 0, WE.fader.depth = 0x270f, WE.fader.scaleX = game_width, WE.fader.scaleY = game_height;
+    children_add(&WE.fader);
+    for (int i = 0; i < 0xd; i++) {
+        Sprite *r = &WE.rays[i];
+        sprite_init(r, frame_get("vfx", "RayRay.png"), cx, cy);
+        sprite_setScale(r, 0);
+        r->scrollFactor0 = 1, r->blendAdd = 1, r->depth = 0x270e;
+        children_add(r);
+    }
+}
+typedef struct { float x, y; } WEHeart;
+static void WE_heart(void *ctx) {
+    WEHeart *h = ctx;
+    Pickup *p = Core_MakePickup(h->x, h->y, "LITTLEHEART");
+    if (p) p->goToPlayer = 1, p->time = 1;
+}
+static void WE_DoSoulSteal(void) {
+    static WEHeart hearts[256];
+    static int hi;
+    for (int i = 0; i < Core.Enemies.n; i++) {
+        Enemy *e = Core.Enemies.items[i]->owner;
+        if (e->res_Rosary || !ContainmentRect_Contains(&Core.containmentRect_Screen, &e->s)) continue;
+        Enemy_GetDamaged(e, fmaxf(0x42, e->maxHp), HIT_NONE, 0, "ROSARY");
+        WEHeart *h = &hearts[hi++ & 255];
+        *h = (WEHeart){ e->s.x, e->s.y };
+        time_addEvent(0xa * i, 0, 0, WE_heart, h);
+    }
+}
+static void WE_eaten(void *ctx) {
+    (void)ctx;
+    WE_DoSoulSteal();
+    Weapon_ScreenShake(0xc);
+    Sound_PlaySound("Attack2", 1, 0.5f, 0, 0, 0);
+    sprite_setFrame(&WE.image, frame_get("vfx", "2Skull2.png"));
+    if (WE.callback) WE.callback();
+}
+static void WE_start2(void *ctx) { (void)ctx; WE.image.alpha = 1; }
+static void WE_over(void *ctx) { (void)ctx; WE.playing = 0; }
+static void WE_CastSoulSteal(void (*callback)(void)) {
+    if (WE.playing) { WE_DoSoulSteal(); return; }
+    WE.playing = 1, WE.callback = callback;
+    Sound_PlaySound("WorldEater", 1, 1, 0, 0, 0);
+    sprite_setScale(&WE.image, 0), WE.image.alpha = 0;
+    sprite_setFrame(&WE.image, frame_get("vfx", "2Skull1.png"));
+    tween_stop(WE.t1), tween_stop(WE.t2), tween_stop(WE.t3);
+    WE.t1 = tweens_add((TweenConfig){ .props = { { &WE.image.scaleX, &WE.image.scaleY, game_height / 256.0f }, { &WE.image.alpha, NULL, 0.75f } }, .nprops = 2, .duration = 0x1f4, .onComplete = WE_eaten });
+    WE.t2 = tweens_add((TweenConfig){ .props = { { &WE.image.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x1f4, .delay = 0x1f4, .onStart = WE_start2, .onComplete = WE_over });
+    WE.t3 = tweens_add((TweenConfig){ .props = { { &WE.fader.alpha, NULL, 0.35f } }, .nprops = 1, .duration = 0x1f4, .yoyo = 1 });
+    for (int i = 0; i < 0xd; i++) {
+        Sprite *r = &WE.rays[i];
+        r->angle = 0x168 * (frand() - 0.5f), r->alpha = 1;
+        sprite_setScale(r, 0);
+        tweens_add((TweenConfig){ .props = { { &r->alpha, NULL, 0 }, { &r->scaleX, &r->scaleY, 2 }, { &r->angle, NULL, 2 * r->angle } }, .nprops = 3, .duration = 0x12c });  // (sic) ogni tween ha un solo bersaglio: lo stagger resta al primo valore
+    }
+}
+
+// --- Luminaire: al level-up il rosario, alla rinascita il bonus ------------------------------------------------------------------
+static struct { Sprite d[9], fog; Animation fogLoop; TweenRef t[9]; } LV;
+static void Lum_Make(Player *p) {
+    float cx = 0.5f * game_width, cy = 0.5f * game_height;
+    for (int i = 0; i < 9; i++) {
+        char n[16];
+        snprintf(n, sizeof n, "doi0%d.png", i + 1);
+        Sprite *d = &LV.d[i];
+        sprite_init(d, frame_get("vfx", n), cx, cy);
+        d->scrollFactor0 = 1, d->blendAdd = 1, d->alpha = 0, d->depth = 0x2710, d->tint = 0xfff6f6;  // semplificazione: tinte d'angolo col colore medio
+        children_add(d);
+        LV.t[i] = (TweenRef){ -1, 0 };
+    }
+    morphVfx.made = 0;
+    MorphVFX_Make(0);
+    sprite_setFrame(&morphVfx.spark, frame_get("vfx", "s_pfx_rainbow_64.png"));
+    sprite_setFrame(&morphVfx.ring, frame_get("vfx", "bubbleSphere.png"));
+    morphVfx.burst.tint = 0x1111;
+    sprite_init(&LV.fog, frame_get("vfx", "fogRays1.png"), 0, 0);
+    sprite_setOrigin(&LV.fog, 0, 0);
+    LV.fog.scaleX = game_width / 160.0f, LV.fog.scaleY = game_height / 100.0f;
+    LV.fog.blendAdd = 1, LV.fog.alpha = 0, LV.fog.visible = 0, LV.fog.scrollFactor0 = 1, LV.fog.depth = ZInGameUI - 4;  // semplificazione: SCREEN come ADD
+    children_add(&LV.fog);
+    make_anim(&LV.fogLoop, "vfx", "fogRays", 1, 2, 0, 0x18, -1);
+    anims_play(&LV.fog, &LV.fogLoop, 0);
+    p->timesRevived = 0;
+}
+static void Lum_RosaryDamage(void *ctx) {
+    (void)ctx;
+    Core_RosaryDamageEx(0);
+    Sound_PlaySound("Rosary", 1.8f, 2, 0, 0x1f4, 2);
+    if (!po_is("FlashingVFXEnabled")) return;
+    for (int i = 0; i < 9; i++) {
+        Sprite *d = &LV.d[i];
+        tween_stop(LV.t[i]);
+        sprite_setScale(d, 0), d->alpha = 0;
+        LV.t[i] = tweens_add((TweenConfig){ .props = { { &d->alpha, NULL, 0.35f + 0.05f * i }, { &d->angle, NULL, 0x168 }, { &d->scaleX, &d->scaleY, 2 + 0.25f * i } }, .nprops = 3, .ease = Ease_SineInOut, .delay = 0xa * i, .duration = 0x64, .yoyo = 1 });
+    }
+}
+static void Lum_Revive(Player *p) {
+    p->timesRevived++;
+    Sound_PlaySound("Morph", 1, 0.5f, 0, 0x7d0, 1);
+    MorphVFX_PlaySparkle();
+    p->ElapsedGFBonusTime = 0;
+    if (p->hasBonus) return;
+    Player_SetInvulForMilliSecondsNonCumulative(p, 0xfa0 + 0x7d0 * p->timesRevived);
+    if (po_is("FlashingVFXEnabled")) LV.fog.visible = 1, LV.fog.alpha = 1;
+    p->hasBonus = 1, p->MightBonus = 2, p->CooldownBonus = -1, p->MoveBonus = fmaxf(0, 2 - p->moveSpeed);
+    p->power += p->MightBonus, p->cooldown += p->CooldownBonus, p->moveSpeed += p->MoveBonus;
+    for (int i = 0; i < Core.n_weapons; i++) if (!Core.Weapons[i]->isPowerUp) Core.Weapons[i]->vt->Fire(Core.Weapons[i]);
+}
+static void Lum_Update(Player *p, float delta) {
+    if (!p->hasBonus) return;
+    p->ElapsedGFBonusTime += delta;
+    float d = 0x3a98 + 0x7d0 * p->timesRevived;
+    if (p->ElapsedGFBonusTime >= d - 0x7d0) LV.fog.alpha = 1 - (p->ElapsedGFBonusTime - (d - 0x7d0)) / 0x3e8;
+    if (p->ElapsedGFBonusTime >= d) {
+        LV.fog.visible = 0;
+        p->hasBonus = 0;
+        p->power -= p->MightBonus, p->cooldown -= p->CooldownBonus, p->moveSpeed -= p->MoveBonus;
+    }
+}
+
+// --- Genevieve e Je-Ne-Viv: Vacuum al level-up, l'ultimo respiro e (la seconda) i muri mangiati -------------------------------------
+static void Gen_vacuum(void *ctx) { (void)ctx; Sound_PlaySound("Vacuum", 0.3f, 1, 0, 0x3e8, 1); Core_TurnOnVacuum(); }
+static struct { unsigned char *removed; int w, h; short queue[512][2]; int n; float eatTimer; ParticleManager *m; ParticleEmitter *smoke, *black; } GE;
+static void Gen_grow(void *ctx) { Player *p = ctx; sprite_setScale(&p->s, p->s.scaleX + 0.1f); }
+static int Gen_isEdible(const char *n) {
+    static const char *const L[6] = { "Walls", "PlayerWall", "Obstacle", "FakeWalls", "Decals", "Overlay1" };
+    for (int i = 0; i < 6; i++) if (n && !strcmp(n, L[i])) return 1;
+    return 0;
+}
+static void Gen_EatTile(int tx, int ty) {
+    TilingTileset *t = Core.Stage->tilingTileset;
+    Tilemap *m = t->MainMap;  // i LayerData sono condivisi dalle copie: una passata vale per tutte
+    LayerContainer *c = &t->layerContainers[0];
+    for (int k = 0; k < c->n; k++) {
+        TilemapLayer *l = c->layers[k];
+        if (!l) continue;
+        for (int i = 0; i < m->n_layers; i++) if (m->layerData[i] == l->data && Gen_isEdible(m->layerName[i])) tilemapLayer_removeTileAt(l, tx, ty);
+    }
+}
+typedef struct { short x, y; } GenTile;
+static void Gen_tileEaten(void *ctx) {
+    GenTile *g = ctx;
+    Player *p = Core.Player;
+    Gen_EatTile(g->x, g->y);
+    float x = g->x * 0x20 + Core.Stage->tilingTileset->current.x, y = g->y * 0x20 + Core.Stage->tilingTileset->current.y;
+    emitter_emitParticleAt(GE.smoke, x, y, 0xa), emitter_emitParticleAt(GE.black, x, y, 0xa);
+    Player_RecoverHp(p, 1, 1, 1);
+    Weapon_ScreenShake(0xc);
+    Sound_PlaySound("Attack2", 1, 1, 0, 0x3e8, 1);
+}
+static void Gen_TryEatingWorld(void) {  // CheckTiles: Magnet contro i muri
+    if (GE.eatTimer <= 0x1388 || !Core.Stage->hasTileset) return;
+    GE.eatTimer = 0, GE.n = 0;
+    Magnet *mg = Core.Magnet;
+    for (int k = 0; k < n_CollisionLayers; k++) {
+        TilemapLayer *l = CollisionLayers[k];
+        Tilemap *m = l->map;
+        if (!GE.removed) GE.w = m->width, GE.h = m->height, GE.removed = calloc(GE.w * GE.h, 1);
+        int x0 = (int)floorf((mg->s.x - mg->radius - l->x) / m->tileWidth), x1 = (int)floorf((mg->s.x + mg->radius - l->x) / m->tileWidth);
+        int y0 = (int)floorf((mg->s.y - mg->radius - l->y) / m->tileHeight), y1 = (int)floorf((mg->s.y + mg->radius - l->y) / m->tileHeight);
+        for (int y = y0 < 0 ? 0 : y0; y <= y1 && y < m->height; y++) for (int x = x0 < 0 ? 0 : x0; x <= x1 && x < m->width; x++) {
+            Tile *t = &l->data[y * m->width + x];
+            if (t->index < 0 || !t->collides || GE.removed[y * GE.w + x] || GE.n >= 512) continue;
+            GE.removed[y * GE.w + x] = 1;
+            GE.queue[GE.n][0] = x, GE.queue[GE.n++][1] = y;
+        }
+    }
+}
+static void Gen_Update(Player *p, float delta) {
+    if (p->level > 1) GE.eatTimer += delta;
+    if (GE.n > 0 && p->s.scaleX < 2) time_addEvent(0x1f4, 0, 0, Gen_grow, p);
+    static GenTile ring[512];
+    static int ri;
+    while (GE.n > 0) {  // StartEatingTile; semplificazione: l'immagine nera dell'originale sta alle coordinate di griglia, fuori dalla vista
+        GE.n--;
+        GenTile *g = &ring[ri++ & 511];
+        *g = (GenTile){ GE.queue[GE.n][0], GE.queue[GE.n][1] };
+        time_addEvent(0x1f4, 0, 0, Gen_tileEaten, g);
+    }
+    if (GE.m) GE.m->wellX = p->s.x, GE.m->wellY = p->s.y - 0x18;
+}
+static void Gen_Make(Player *p) {
+    (void)p;
+    GE.removed = NULL, GE.n = 0, GE.eatTimer = 0;
+    GE.m = particles_add();
+    GE.smoke = particles_createEmitter(GE.m, (EmitterConfig){ .frames = { frame_get("vfx", "Smoke1.png"), frame_get("vfx", "Smoke2.png") }, .nframes = 2, .lifespan = EOP(0x3e8), .rotate = ERND(0, 0x168), .angle = { 0, 0xb4, 3, NULL }, .angleSteps = 0x10,
+        .speed = ERND(0x64, 0xc8), .quantity = 4, .scale = ERANGE(1, 0), .frequency = 4, .alpha = ERANGE(0.65f, 0), .on = 0 });
+    GE.black = particles_createEmitter(GE.m, (EmitterConfig){ .frames = { frame_get("vfx", "blackDot.png") }, .nframes = 1, .lifespan = EOP(0x3e8), .rotate = ERND(0, 0x168), .alpha = ERANGE(0.65f, 0), .angle = { 0, 0x168, 3, NULL }, .angleSteps = 0x10,
+        .speed = ERND(0x32, 0x50), .quantity = 4, .scale = ERANGE(0x20, 0), .frequency = 2, .on = 0 });
+    GE.m->hasWell = 1, GE.m->wellPower = 1 * 0x28, GE.m->wellEpsilon = 0x64 * 0x64;
+}
+
+// --- Sammy: le monete fanno esperienza; al 30 la febbre dell'oro con la sua musica ------------------------------------------------
+static void Sammy_fever(void *ctx) { (void)ctx; GoldFever_Start(0x2710); }
+static void Sammy_t1(void *ctx) {
+    (void)ctx;
+    GoldFever_Start(0x2710);
+    time_addEvent(0x1388, 1, 3, Sammy_fever, NULL);
+    Core_TurnOnVacuumForGold();
+    Sound_StopMusic();
+}
+static void Sammy_t2(void *ctx) { (void)ctx; Sound_PlayMusic("BGM_HB", 0.4f, 0); }
+static void Sammy_t3(void *ctx) { (void)ctx; Sound_StopMusic(); Sound_SetupAndPlayBGM_Banger(1); }
+static void Sammy_30(void *ctx) {
+    (void)ctx;
+    Sound_FadeMusic(0, 0x1f4);
+    time_addEvent(0x1f4, 0, 0, Sammy_t1, NULL);  // setTimeout: qui il tempo di gioco
+    time_addEvent(0x258, 0, 0, Sammy_t2, NULL);
+    time_addEvent(0x7918, 0, 0, Sammy_t3, NULL);
+}
+static void Sammy_OnCoinPickup(Player *p, float value) {
+    float v = value * GoldMultiplier * Player_PGreed(p) * Player_PGrowth(p);
+    p->xp += v * ExperienceMultiplier;  // AddXP_IgnoretGameKiller: senza il moltiplicatore che Game Killer azzera
+    Sound_PlaySound("Gem", 0.1f, 1, 0, 1, 1);
+    PlayerUI_Update();
+}
+
+// --- Gli agganci chiamati dalle funzioni comuni di Player -----------------------------------------------------------------------------
+static void Foscari_MakeLevelOne(Player *p) {
+    if (Player_is(p, "VICTOR")) p->armorBonus = 0, p->armorTime = 0, Foscari_makeAttack(p), p->hasMeleeA = 1;
+    if (Player_is(p, "KEIRA")) Foscari_makeAttack(p), p->hasRangedA = 1;
+    if (Player_is(p, "MEGAGENEVIEVE")) Gen_Make(p);
+}
+static void Foscari_AfterFullInit(Player *p) {
+    if (Player_is(p, "LUMINAIRE")) Lum_Make(p);
+    if (Player_is(p, "GENEVIEVE") || Player_is(p, "MEGAGENEVIEVE")) WE_Make(), p->isLastBreathEnabled = 1;
+    if (Player_is(p, "CTRPCAKE")) {
+        Weapon *h = Core_GetWeapon("STIGRANGATTI");
+        if (h) h->goldChance = 0.165f;
+        p->gfeverMul = 1.25f;
+    }
+}
+static void Foscari_LevelUp(Player *p) {
+    if (Player_is(p, "ELEANOR")) {
+        if (p->level == 0xa) Foscari_gift("SPELL_STREAM", 1);
+        else if (p->level == 0x14) Foscari_gift("SPELL_STRIKE", 1);
+        else if (p->level == 0x1e) Foscari_gift("ACADEMYBADGE", 1);
+    }
+    if ((Player_is(p, "VICTOR") || Player_is(p, "KEIRA")) && p->level == 0x1e) Foscari_gift("ACADEMYBADGE", 0);
+    if (Player_is(p, "LUMINAIRE")) time_addEvent(0x64, 0, 0, Lum_RosaryDamage, NULL);
+    if (Player_is(p, "GENEVIEVE")) time_addEvent(0x64, 0, 0, Gen_vacuum, NULL);
+    if (Player_is(p, "MEGAGENEVIEVE")) {
+        time_addEvent(0x64, 0, 0, Gen_vacuum, NULL);
+        if (p->level == 0xa) Foscari_gift("SPELL_STRING", 1);
+        else if (p->level == 0x14) Foscari_gift("SPELL_STREAM", 1);
+        else if (p->level == 0x1e) Foscari_gift("SPELL_STRIKE", 1);
+        if (p->level % 6 == 0) WE_CastSoulSteal(Gen_TryEatingWorld);
+    }
+    if (Player_is(p, "CTRPCAKE")) {
+        Weapon *h = Core_GetWeapon("STIGRANGATTI");
+        if (h && h->goldChance < 0.65f) h->goldChance += 0.005f;
+        if (p->level == 0x1e) time_addEvent(0xc8, 0, 0, Sammy_30, NULL);
+    }
+}
+static void Foscari_Update(Player *p, float delta) {
+    if (Player_is(p, "VICTOR")) {
+        p->armorTime += delta;
+        if (p->armorTime >= 0x2710) p->armorBonus = 0, p->armorTime = 0;
+    }
+    if (Player_is(p, "LUMINAIRE")) Lum_Update(p, delta);
+    if (Player_is(p, "MEGAGENEVIEVE")) Gen_Update(p, delta);
+}
+static void Foscari_OnLastBreath(Player *p) {
+    if (Player_is(p, "GENEVIEVE")) Player_SetInvulForMilliSecondsNonCumulative(p, 0xbb8), WE_CastSoulSteal(NULL);
+    if (Player_is(p, "MEGAGENEVIEVE")) Player_SetInvulForMilliSecondsNonCumulative(p, 0x7d0), WE_CastSoulSteal(Gen_TryEatingWorld);
+}
+static void Seal_dev(void);
+static void Foscari_dev(void *ctx) {
+    (void)ctx;
+    const char *e = getenv("VS_FOSC");
+    Player *p = Core.Player;
+    if (!strcmp(e, "seal")) { Seal_dev(); return; }
+    if (!strcmp(e, "breath")) Foscari_OnLastBreath(p);
+    else if (!strcmp(e, "revive")) Lum_Revive(p);
+    else p->level = atoi(e), Foscari_LevelUp(p);
+}
+static void Foscari_OnCoinPickup(float value) { if (Player_is(Core.Player, "CTRPCAKE")) Sammy_OnCoinPickup(Core.Player, value); }
+
 static const WeaponVT *weapon_vt(const char *type) {
     cJSON *d = cJSON_GetArrayItem(cJSON_GetObjectItem(data_get("weapons"), type), 0);
     if (cJSON_IsTrue(cJSON_GetObjectItem(d, "isPowerUp"))) return &W_PowerUp;
     if (!strcmp(type, "WHIP")) return &W_Whip;
+    if (!strcmp(type, "SILVERWIND")) return &W_SilverWind;
+    if (!strcmp(type, "SILVERWIND2")) return &W_SilverWind2;
+    if (!strcmp(type, "MIRAGEROBE")) return &W_MirageRobe;
+    if (!strcmp(type, "MIRAGEROBE2")) return &W_MirageRobe2;
+    if (!strcmp(type, "BUBBLES")) return &W_Bubble;
+    if (!strcmp(type, "BUBBLES2")) return &W_Bubble2;
+    if (!strcmp(type, "SUMMONNIGHT")) return &W_SummonNight;
+    if (!strcmp(type, "SUMMONNIGHT2")) return &W_SummonNight2;
+    if (!strcmp(type, "NIGHTSWORD")) return &W_NightSword;
+    if (!strcmp(type, "SWORD")) return &W_Sword;
+    if (!strcmp(type, "SWORD2")) return &W_Legionnaire;
+    if (!strcmp(type, "FLASHARROW")) return &W_FlashArrow;
+    if (!strcmp(type, "FLASHARROW2")) return &W_Millionaire;
+    if (!strcmp(type, "SHADOWSERVANT")) return &W_ShadowServant;
+    if (!strcmp(type, "SHADOWSERVANT_COUNTER")) return &W_ShadowServant_Counter;
+    if (!strcmp(type, "SHADOWSERVANT2")) return &W_Ophion;
+    if (!strcmp(type, "PRISMATICMISS")) return &W_PrismaticMissile;
+    if (!strcmp(type, "PRISMATICMISS2")) return &W_Luminaire;
+    if (!strcmp(type, "PARTY")) return &W_Party;
+    if (!strcmp(type, "PARTY_COUNTER")) return &W_Party_Counter;
+    if (!strcmp(type, "INSATIABLE")) return &W_Insatiable;
+    if (!strcmp(type, "NIGHTSWORD2")) return &W_NightSword2;
+    if (!strcmp(type, "BOCCE")) return &W_Bocce;
+    if (!strcmp(type, "SPELL_STRING")) return &W_Spellstring;
+    if (!strcmp(type, "SPELL_STREAM")) return &W_Spellstream;
+    if (!strcmp(type, "SPELL_STRIKE")) return &W_Spellstrike;
+    if (!strcmp(type, "SPELL_STROM")) return &W_Spellstrom;
+    if (!strcmp(type, "FOURSEASONS")) return &W_FourSeasons;
+    if (!strcmp(type, "FOURSEASONS2")) return &W_FourSeasons2;
     if (!strcmp(type, "WINDOW")) return &W_WindowW;
     if (!strcmp(type, "MAGIC_MISSILE")) return &W_MagicMissile;
     if (!strcmp(type, "KNIFE")) return &W_Knife;
@@ -11433,6 +14259,13 @@ static void Weapon_CleanUp(Weapon *w) {
     while (w->pool && w->pool->group.n) Bullet_DeSpawn(w->pool->group.items[w->pool->group.n - 1]->owner);  // pool.spawned.forEach(DeSpawn)
     for (int i = 0; i < w->n_rays; i++) w->rays[i].visible = 0;  // W_Guns3.CleanUp
     w->image.visible = 0;  // CleanUp di Laurel, Shroud, Garlic, Vortex: image.setVisible(false).destroy()
+    for (int i = 0; i < w->nOrbs; i++) w->orbs[i].visible = 0;  // Bocce, Four Seasons
+    if (w->vt == &W_Millionaire && Core_coinListener == w) Core_coinListener = NULL;
+    if (w->vt == &W_Luminaire && w->pfxEmitter) emitter_stop(w->pfxEmitter);
+    if (w->stormPfx) {  // W_Spellstrom.CleanUp
+        Weapon_CleanUp(w->Weapon_Stream), Weapon_CleanUp(w->Weapon_Strike), Weapon_CleanUp(w->Weapon_String);
+        emitter_stop(w->stormE1), emitter_stop(w->stormE2), emitter_stop(w->circleE);
+    }
     PlayerEvents_remove(w);  // removeListener('Player_LostShield', colorEvent)
     // semplificazione: imageTween/imageTween2 infiniti restano su uno sprite nascosto (2 slot su 4096); stop() se servono gli slot
     for (int k = 0; k < 2; k++) {  // secondaryPool / extraPool (W_Vento2.CleanUp)
@@ -11449,6 +14282,16 @@ static void Core_RemoveWeapon(const char *type) {
         memmove(&Core.Weapons[i], &Core.Weapons[i + 1], (Core.n_weapons - i - 1) * sizeof(Weapon *));
         Core.n_weapons--;
         if (Core.n_RemovedWeapons < 16) Core.RemovedWeapons[Core.n_RemovedWeapons++] = w;
+        return;
+    }
+}
+static void Core_RemoveHiddenWeapon(const char *type) {
+    for (int i = 0; i < Core.n_HiddenWeapons; i++) {
+        Weapon *w = Core.HiddenWeapons[i];
+        if (strcmp(w->bulletType, type)) continue;
+        memmove(&Core.HiddenWeapons[i], &Core.HiddenWeapons[i + 1], (Core.n_HiddenWeapons - i - 1) * sizeof(Weapon *));
+        Core.n_HiddenWeapons--;
+        Weapon_CleanUp(w);
         return;
     }
 }
@@ -11803,7 +14646,12 @@ static int LimitBreakManager_hasLimitBreaks(void) {
 static int Weapon_ApplyLimitBreak(Weapon *w, cJSON *kv) {
     for (cJSON *k = kv ? kv->child : NULL; k; k = k->next) {
         float *f = strcmp(k->string, "rarity") ? Weapon_field(w, k->string) : NULL;
-        if (f && cJSON_IsNumber(k)) *f += (float)k->valuedouble;
+        if (f && cJSON_IsNumber(k)) {
+            *f += (float)k->valuedouble;
+            int seen = 0;
+            for (int i = 0; i < w->nLbKeys; i++) seen |= !strcmp(w->lbKeys[i], k->string);
+            if (!seen && w->nLbKeys < 16) w->lbKeys[w->nLbKeys++] = k->string;  // accumulatedLimitBreaks
+        }
     }
     Weapon_ResetFiringTimer(w);
     w->limitBreakLevel++;
@@ -12108,6 +14956,8 @@ typedef struct {
     Timer _blinkTimeout;
     int hasFired;  // Prop_Window (0x85ba)
     Light2D *light;  // Stage.hasLights: Core.GetLight
+    int sealKind, alreadyDestroyed;  // Prop_FoscariSeal1/2/3
+    Animation destroyAnim;
 } Destructible;
 struct DestructiblePool {
     const char *propType;
@@ -12189,7 +15039,9 @@ static void Destructible_OnDestroyed(Destructible *d) {
     json_inc(cJSON_GetObjectItem(data_get("props"), d->destructibleType), "destroyedAmount");
     if (Arcanas_has(19)) Arcanas_TriggerFire(d->s.x, d->s.y - 0x18);
 }
+static void Seal_GetDamaged(Destructible *d, float amount);
 static void Destructible_GetDamaged(Destructible *d, float amount) {
+    if (d->sealKind) { Seal_GetDamaged(d, amount); return; }
     if (d->isDead) return;
     d->hp -= amount;
     if (d->hp <= 0) { d->isDead = 1; Destructible_OnDestroyed(d); Destructible_OnGetDamaged(d); }
@@ -12290,8 +15142,9 @@ static void RosaryVFX_Play(void) {
     anims_play(&RosaryVFX.burst, &RosaryVFX.enter, 0);
     Sound_PlaySound("Rosary", 1.8f, 2, 0, 0x1f4, 2);  // Play(1.8)
 }
-static void Core_RosaryDamage(void) {
-    RosaryVFX_Play();  // FlashingVFXEnabled
+static void Core_RosaryDamage(void) { Core_RosaryDamageEx(1); }
+static void Core_RosaryDamageEx(int vfx) {
+    if (vfx) RosaryVFX_Play();  // FlashingVFXEnabled
     for (int i = 0; i < Core.Enemies.n; i++) {
         Enemy *e = Core.Enemies.items[i]->owner;
         if (!e->res_Rosary && ContainmentRect_Contains(&Core.containmentRect_Screen, &e->s)) Enemy_GetDamaged(e, fmaxf(0x42, e->maxHp), 0, 0, "ROSARY");
@@ -12714,6 +15567,265 @@ static void E_Crab_Update(Enemy *e) {
     }
 }
 static const EnemyVT E_Crab = { .OnRecycle = E_Crab_OnRecycle, .Update = E_Crab_Update, .DeSpawn = E_Crab_DeSpawn };
+
+// --- MS_EVILSPIRIT (0xe8a9): lo scheletro che sale ondeggiando -----------------------------------------------------
+static void E_EvilSpirit_Update(Enemy *e) {
+    if (e->isDead) return;
+    e->s.depth = e->s.y - Core.Player->s.y;
+    if (e->IsTimeStopped) return;
+    if (!e->FixedDirection || (e->_currentDirection.x == 0 && e->_currentDirection.y == 0)) {
+        e->_currentDirection.x = e->target->x - e->s.x, e->_currentDirection.y = e->target->y - e->s.y;
+        float l = sqrtf(e->_currentDirection.x * e->_currentDirection.x + e->_currentDirection.y * e->_currentDirection.y);
+        if (l > 0) e->_currentDirection.x /= l, e->_currentDirection.y /= l;
+    }
+    e->medusaElapsed += 0.05f;
+    e->_currentDirection.x = sinf(e->medusaElapsed);
+    float k = e->receivingDamage ? -e->knockback * e->damageKB : 1, v = EnemySpeed * e->speed * k * e->slow;
+    e->s.flipX = e->_currentDirection.x > 0;
+    sprite_setVelocity(&e->s, v * e->_currentDirection.x, v * e->_currentDirection.y);
+    e->s.angle = TweenAngles[e->moveTweenIndex];
+}
+static const EnemyVT E_EvilSpirit = { .Update = E_EvilSpirit_Update };
+
+// --- MS_GOSHADOKURO (0x16676): lo scheletro gigante, braccia e testa a parte; a tratti gira e accelera, e chiama gli spiriti ------
+typedef struct {
+    Sprite frontArm, backArm, head;
+    Animation armIdle, armDie, headIdle, headDie;
+    float speedMul, SummonTime, SummonDelay, defaultSpeed;
+    Timer SpinTimer;
+    TweenRef spin1, spin2, speed1, speed2;
+    EnemyPool *SkeletonPool;
+} GashaX;
+static void Gasha_PlayDeathAnimations(Enemy *e) {
+    GashaX *g = e->x;
+    anims_play(&g->frontArm, &g->armDie, 0), anims_play(&g->backArm, &g->armDie, 0), anims_play(&g->head, &g->headDie, 0);
+}
+static void Gasha_AndSpinnn(void *ctx) {
+    Enemy *e = ctx;
+    GashaX *g = e->x;
+    tween_stop(g->spin1), tween_stop(g->spin2), tween_stop(g->speed1), tween_stop(g->speed2);
+    g->spin1 = tweens_add((TweenConfig){ .props = { { &g->backArm.angle, NULL, -0x167 } }, .nprops = 1, .duration = 0x1f4, .repeat = 0x13 });
+    g->spin2 = tweens_add((TweenConfig){ .props = { { &g->frontArm.angle, NULL, 0x167 } }, .nprops = 1, .duration = 0x1f4, .repeat = 0x13 });
+    g->speed1 = tweens_add((TweenConfig){ .props = { { &g->speedMul, NULL, 7 } }, .nprops = 1, .duration = 0x7d0 });
+    g->speed2 = tweens_add((TweenConfig){ .props = { { &g->speedMul, NULL, 1 } }, .nprops = 1, .duration = 0x7d0, .delay = 0x1f40 });
+}
+static void Gasha_summon(void *ctx) {
+    Enemy *e = ctx;
+    GashaX *g = e->x;
+    if (!g->SkeletonPool) g->SkeletonPool = EnemyPool_new("MS_EVILSPIRIT");
+    float step = game_width / (float)0x20, wrap = 0x20 * floorf(step), x0 = Core.Player->s.x - 0.5f * game_width, y0 = Core.Player->s.y + 0x30 + 0.5f * game_height;
+    for (int i = 0; i < 0x50; i++) {
+        float d = step * i;
+        EnemyPool_SpawnAt(g->SkeletonPool, x0 + fmodf(d, wrap), y0 + 0x30 * floorf(d / wrap));
+    }
+}
+static void Gasha_DrownerWarning(Enemy *e) {
+    Sprite *r = ui_image("vfx", "WhiteLine.png", 0, game_height);  // RedWarning
+    r->scaleX = game_width, r->scaleY = 1, sprite_setOrigin(r, 0, 1), r->depth = 0x2328, r->alpha = 0.25f, sprite_setTint(r, 0xff0000);
+    tweens_add((TweenConfig){ .props = { { &r->alpha, NULL, 0.5f } }, .nprops = 1, .duration = 0xc8, .repeat = 3, .yoyo = 1, .onComplete = Crab_redOut, .ctx = r });
+    Crab_SingleWarning(0.25f * game_width);
+    time_addEvent(0xc8, 0, 0, Crab_warn2, NULL);
+    time_addEvent(0x190, 0, 0, Crab_warn3, NULL);
+    time_addEvent(0x3e8, 0, 0, Gasha_summon, e);
+}
+static void E_Gasha_OnRecycle(Enemy *e) {
+    GashaX *g = e->x;
+    if (!g) {  // costruttore
+        g = e->x = calloc(1, sizeof(GashaX));
+        g->SummonDelay = 0xbb8;
+        g->defaultSpeed = num(enemy_data(e), "speed", 0);
+        g->SpinTimer = (Timer){ -1, 0 };
+        g->spin1 = g->spin2 = g->speed1 = g->speed2 = (TweenRef){ -1, 0 };
+        sprite_init(&g->frontArm, frame_get("moonspellChars", "Gash_arm_i01.png"), e->s.x, e->s.y);
+        sprite_init(&g->backArm, frame_get("moonspellChars", "Gash_arm_i01.png"), e->s.x, e->s.y);
+        sprite_init(&g->head, frame_get("moonspellChars", "Gash_head_i01.png"), e->s.x, e->s.y);
+        sprite_setOrigin(&g->frontArm, 0.85f, 13.0f / 60), sprite_setOrigin(&g->backArm, 0.85f, 13.0f / 60), sprite_setOrigin(&g->head, 0, 0);
+        children_add(&g->frontArm), children_add(&g->backArm), children_add(&g->head);
+        make_anim(&g->armIdle, "moonspellChars", "Gash_arm_i", 1, 5, 2, 0x18, -1);
+        make_anim(&g->armDie, "moonspellChars", "Gash_arm_", 0, 0x1d, 0, 0x1e, 0);
+        make_anim(&g->headIdle, "moonspellChars", "Gash_head_i", 1, 5, 2, 0x18, -1);
+        make_anim(&g->headDie, "moonspellChars", "Gash_head_", 0, 0x1d, 0, 0x1e, 0);
+    }
+    base_EnemyOnRecycle(e);
+    g->speedMul = 1, e->isTeleportOnCull = 1, e->hasLostTreasure = 0, g->SummonTime = 0;
+    g->frontArm.visible = g->backArm.visible = g->head.visible = 1;
+    anims_play(&g->frontArm, &g->armIdle, 0), anims_play(&g->backArm, &g->armIdle, 0), anims_play(&g->head, &g->headIdle, 0);
+    sprite_setScale(&g->frontArm, e->s.scaleX), sprite_setScale(&g->backArm, e->s.scaleX), sprite_setScale(&g->head, e->s.scaleX);
+    g->frontArm.angle = g->backArm.angle = 0;
+    time_removeEvent(g->SpinTimer);
+    g->SpinTimer = time_addEvent(0x3a98, 1, 0, Gasha_AndSpinnn, e);
+    if (getenv("VS_BOSSHP")) e->hp = e->maxHp = atof(getenv("VS_BOSSHP"));  // sviluppo
+}
+static void E_Gasha_Die(Enemy *e) {
+    base_EnemyDie(e);
+    Gasha_PlayDeathAnimations(e);
+    if (e->hasLostTreasure) return;  // MakeTreasureChest
+    e->hasLostTreasure = 1;
+    static cJSON *t;
+    if (!t) {
+        static const char *const P[5] = { "EVOLUTION", "EXISTING_ANY", "EXISTING_ANY", "EXISTING_ANY", "EXISTING_ANY" };
+        static const double C[3] = { 0.1, 1, 0x64 };
+        t = cJSON_CreateObject();
+        cJSON_AddItemToObject(t, "prizeTypes", cJSON_CreateStringArray(P, 5));
+        cJSON_AddItemToObject(t, "chances", cJSON_CreateDoubleArray(C, 3));
+    }
+    int lv = 1;
+    Stage_SetTreasureLevelFromChance(t, &lv);
+    Core_MakeTreasure(e->s.x, e->s.y, t, lv);
+}
+static void E_Gasha_Disappear(Enemy *e) { base_EnemyDisappear(e); Gasha_PlayDeathAnimations(e); }
+static void E_Gasha_DeSpawn(Enemy *e) {
+    GashaX *g = e->x;
+    time_removeEvent(g->SpinTimer);
+    tween_stop(g->spin1), tween_stop(g->spin2), tween_stop(g->speed1), tween_stop(g->speed2);
+    g->frontArm.visible = g->backArm.visible = g->head.visible = 0;
+    base_EnemyDeSpawn(e);
+}
+static void E_Gasha_Update(Enemy *e) {
+    GashaX *g = e->x;
+    e->speed = fminf(g->defaultSpeed * g->speedMul, 0x1f4);
+    base_EnemyUpdate(e);
+    e->s.angle = 0;
+    float sx = e->s.scaleX, sy = e->s.scaleY, dir = e->s.flipX ? -1 : 1, x0 = e->s.x - 0x1f * sx, y0 = e->s.y - 0x31 * sy;
+    g->frontArm.scaleX = g->backArm.scaleX = sx * dir;
+    g->frontArm.scaleY = g->backArm.scaleY = sx;
+    g->head.flipX = e->s.flipX;
+    g->frontArm.x = x0 + (e->s.flipX ? 0x2c : 0x15) * sx, g->frontArm.y = y0 + 0xa * sy, g->frontArm.depth = e->s.depth + 2;
+    g->backArm.x = x0 + (e->s.flipX ? 0x3d : 4) * sx, g->backArm.y = y0 + 0x16 * sy, g->backArm.depth = e->s.depth - 1;
+    g->head.x = x0 + (e->s.flipX ? 0x34 : -0x1a) * sx, g->head.y = y0 - 0x15 * sy, g->head.depth = e->s.depth + 1;
+    g->SummonTime += Enemies_delta;
+    if (g->SummonTime >= g->SummonDelay) Gasha_DrownerWarning(e), g->SummonTime = 0;
+    g->SummonDelay = 0x1388 + e->hp / e->maxHp * 0x61a8;
+}
+static const EnemyVT E_Gasha = { .OnRecycle = E_Gasha_OnRecycle, .Die = E_Gasha_Die, .Update = E_Gasha_Update, .DeSpawn = E_Gasha_DeSpawn, .Disappear = E_Gasha_Disappear };
+
+// --- MS_OROCHIMARIO (0x1331e) con le otto MS_OROCHIHEAD (0xf9c7): le teste sul collo a rope, attaccano allungandosi verso il giocatore ---
+static float FrameFreeze_ms;
+typedef struct { Sprite s; const Frame *frame; Vector2 pts[6]; } OroNeck;
+typedef struct {
+    Enemy *owner;
+    OroNeck *neck;
+    int headIndex;
+    float AttackTime, AttackDelay, attackLerp;
+    Vector2 targetVector, startingPosition;
+    TweenRef attack, retreat, fade;
+} HeadX;
+typedef struct { Enemy *heads[8]; int n; EnemyPool *HeadPool; } OrochiX;
+static void OroNeck_draw(Sprite *s) {
+    OroNeck *n = (OroNeck *)s;
+    if (s->visible) Rope_drawH(n->pts, 6, n->frame, 1, s->alpha, 0, 0);
+}
+static void OroHead_SetRandomStartingPosition(Enemy *e) {
+    HeadX *h = e->x;
+    if (h->headIndex == 0) { h->startingPosition = (Vector2){ 0, -0x2a }; return; }
+    float d = e->s.flipX ? -1 : 1;
+    h->startingPosition = (Vector2){ 0x40 * (frand() - 0.25f) * d, -0x2c * e->s.scaleY - 0x2d * frand() };
+}
+static void E_OroHead_OnRecycle(Enemy *e) {
+    HeadX *h = e->x;
+    if (!h) {  // costruttore: il collo (RibbonTrail su flagName)
+        h = e->x = calloc(1, sizeof(HeadX));
+        h->attack = h->retreat = h->fade = (TweenRef){ -1, 0 };
+        h->neck = calloc(1, sizeof(OroNeck));
+        sprite_init(&h->neck->s, NULL, e->s.x, e->s.y);
+        h->neck->s.draw = OroNeck_draw;
+        h->neck->frame = frame_get(str(enemy_data(e), "textureName"), str(enemy_data(e), "flagName"));
+        children_add(&h->neck->s);
+    }
+    base_EnemyOnRecycle(e);
+    e->isCullable = 0;
+    tween_stop(h->fade);
+    h->neck->s.alpha = 1;
+    h->AttackTime = frand() * 0x1388, h->AttackDelay = 0x1388 + frand() * 0x1388;
+    OroHead_SetRandomStartingPosition(e);
+}
+static void OroHead_warnBack(void *ctx) { Sprite *w = ctx; tweens_add((TweenConfig){ .props = { { &w->scaleX, &w->scaleY, 0 } }, .nprops = 1, .duration = 0xc8, .delay = 0xc8, .onComplete = E_ui_hide, .ctx = w }); }
+static void OroHead_attackDone(void *ctx) { OroHead_SetRandomStartingPosition(ctx); }
+static void OroHead_Attack(Enemy *e) {
+    HeadX *h = e->x;
+    if (e->IsTimeStopped) return;
+    h->targetVector = (Vector2){ Core.Player->s.x, Core.Player->s.y };
+    tween_stop(h->attack);
+    h->attack = tweens_add((TweenConfig){ .props = { { &h->attackLerp, NULL, 1 } }, .nprops = 1, .duration = 0xc8, .yoyo = 1, .delay = 0x1f4, .onComplete = OroHead_attackDone, .ctx = e });
+    tween_stop(h->retreat);
+    h->retreat = tweens_add((TweenConfig){ .props = { { &h->attackLerp, NULL, 0 } }, .nprops = 1, .duration = 0x190, .delay = 0x2bc });
+    Sprite *w = calloc(1, sizeof(Sprite));  // SingleWarning(x, y - 16)
+    sprite_init(w, frame_get("UI", "ExclamationMark.png"), e->s.x, e->s.y - 0x10);
+    sprite_setScale(w, 0), sprite_setOrigin(w, 0.5f, 1), w->depth = 0x2328;
+    children_add(w);
+    Sound_PlaySound("Pizza", 0.7f, 1, 0x1f4 * frand(), 0x96, 2);
+    tweens_add((TweenConfig){ .props = { { &w->scaleX, &w->scaleY, 1 } }, .nprops = 1, .duration = 0xc8, .onComplete = OroHead_warnBack, .ctx = w });
+}
+static void E_OroHead_Update(Enemy *e) {
+    HeadX *h = e->x;
+    base_EnemyUpdate(e);
+    Enemy *o = h->owner;
+    e->s.depth = o->s.depth + 9;
+    h->neck->s.depth = e->s.depth - 8;
+    float x = o->s.x + h->startingPosition.x, y = o->s.y + h->startingPosition.y;
+    e->s.x = x + (h->targetVector.x - x) * h->attackLerp, e->s.y = y + (h->targetVector.y - y) * h->attackLerp;  // SetCurrentVector
+    h->AttackTime += Enemies_delta;
+    if (h->AttackTime >= h->AttackDelay) OroHead_Attack(e), h->AttackTime = 0;
+    Vector2 neck = { o->s.x, o->s.y - 0x36 };  // headOffset e inv_headOffset coincidono
+    float a = h->attackLerp * (5 + (e->s.flipX ? -1 : 0) * 0xa), sn = sinf(a), cs = cosf(a), rx = e->s.x - neck.x, ry = e->s.y - neck.y;  // (sic) gradi passati come radianti
+    Vector2 p0 = { e->s.x, e->s.y - 0x10 }, p1 = { rx * cs - ry * sn + neck.x, rx * sn + ry * cs + neck.y };
+    for (int i = 0; i < 6; i++) {  // QuadraticBezier.getPoints(5)
+        float t = i / 5.0f, u = 1 - t;
+        h->neck->pts[i] = (Vector2){ u * u * p0.x + 2 * u * t * p1.x + t * t * neck.x, u * u * p0.y + 2 * u * t * p1.y + t * t * neck.y };
+    }
+}
+static void E_OroHead_GetDamaged(Enemy *e, float amount, int hitVFX, float kb, const char *t) {
+    HeadX *h = e->x;
+    if (h->owner) Enemy_GetDamaged(h->owner, amount, HIT_NONE, 0, t);
+    base_EnemyGetDamaged(e, amount, hitVFX, kb, t);
+}
+static void E_OroHead_Die(Enemy *e) {
+    HeadX *h = e->x;
+    base_EnemyDie(e);
+    tween_stop(h->fade);
+    h->fade = tweens_add((TweenConfig){ .props = { { &h->neck->s.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x12c });
+    Sound_PlaySound("Crystal12", 1, 1, -0x258 * frand(), 0x3e8, 2);
+    FrameFreeze_ms = 0x78;  // SceneManager.FrameFreeze
+}
+static const EnemyVT E_OroHead = { .OnRecycle = E_OroHead_OnRecycle, .Die = E_OroHead_Die, .GetDamaged = E_OroHead_GetDamaged, .Update = E_OroHead_Update };
+static void E_Orochi_OnRecycle(Enemy *e) {
+    OrochiX *o = e->x;
+    if (!o) {
+        o = e->x = calloc(1, sizeof(OrochiX));
+        o->HeadPool = EnemyPool_new("MS_OROCHIHEAD");
+    }
+    base_EnemyOnRecycle(e);
+    e->isTeleportOnCull = 1;
+    if (o->n < 8) {
+        for (int i = 0; i < 8; i++) {
+            Enemy *h = EnemyPool_SpawnAt(o->HeadPool, e->s.x, e->s.y);
+            if (!h) continue;
+            o->heads[o->n++] = h;
+            HeadX *x = h->x;
+            x->owner = e, x->headIndex = i;  // setHeadIndex
+            if (i == 0) h->maxHp *= 2, h->hp = h->maxHp;
+        }
+    }
+    for (int i = 0; i < o->n; i++) e->maxHp += o->heads[i]->maxHp;
+    e->hp = e->maxHp;
+    if (getenv("VS_BOSSHP")) e->hp = e->maxHp = atof(getenv("VS_BOSSHP"));  // sviluppo
+}
+static void E_Orochi_Die(Enemy *e) {
+    OrochiX *o = e->x;
+    base_EnemyDie(e);
+    int n = o->n;
+    o->n = 0;  // HeadEnemies = []: prima dei Die delle teste, che richiamano il proprietario
+    for (int i = 0; i < n; i++) if (!o->heads[i]->isDead) Enemy_Die(o->heads[i]);
+}
+static void E_Orochi_Disappear(Enemy *e) {
+    OrochiX *o = e->x;
+    base_EnemyDisappear(e);
+    int n = o->n;
+    o->n = 0;
+    for (int i = 0; i < n; i++) if (!o->heads[i]->isDead) Enemy_Disappear(o->heads[i]);
+}
+static void E_Orochi_Update(Enemy *e) { base_EnemyUpdate(e); e->s.angle = 0; }
+static const EnemyVT E_Orochi = { .OnRecycle = E_Orochi_OnRecycle, .Die = E_Orochi_Die, .Update = E_Orochi_Update, .Disappear = E_Orochi_Disappear };
 
 // --- BULLET_W (0xa3ee): l'acqua del Drowner, un rettangolo largo quanto lo schermo con 1500 bolle; sotto la superficie si soffre ---
 typedef struct { Blitter *blitter; float elapsed; TweenRef waveTween; } WaveX;
@@ -15490,7 +18602,10 @@ static void Rash_Update(float delta) {
         if (b->y > Rash.d[i].top || b->y < Rash.d[i].bottom) Rash.d[i].vy *= -1;
     }
 }
-static const FancyBG FB_Rash = { Rash_Create, Rash_Update, NULL, NULL };
+static void Rash_OnInitCompleted(void) { Core_SetHardBounds(0x200, 0x200, 0x600, 0x600); }
+static const FancyBG FB_Rash = { Rash_Create, Rash_Update, NULL, NULL, Rash_OnInitCompleted };
+static void Moonspell_OnInitCompleted(void) { Core_SetHardBounds(0x100, 0x100, 0x2700, 0x2700); }  // 0x7a95
+static const FancyBG FB_Moonspell = { .OnInitCompleted = Moonspell_OnInitCompleted };
 
 static const FancyBG FB_GreenAcres;  // dopo BGMan
 
@@ -16574,7 +19689,10 @@ static void Machine_devStart(void *c) {  // sviluppo: VS_DIRECTER=1 la battaglia
 }
 static const FancyBG FB_Machine = { Machine_Create, Machine_Update, NULL, NULL, NULL, Machine_HasMovingBG, Machine_DisableMovingBackground };
 
+static const FancyBG FB_Foscari, FB_Foscari2;
 static const FancyBG *Stage_fancyBG(const char *stageType) {
+    if (!strcmp(stageType, "FOSCARI")) return &FB_Foscari;
+    if (!strcmp(stageType, "FOSCARI2")) return &FB_Foscari2;
     if (!strcmp(stageType, "FOREST")) return &FB_Forest;
     if (!strcmp(stageType, "LIBRARY")) return &FB_Library;
     if (!strcmp(stageType, "WAREHOUSE")) return &FB_Plant;
@@ -16584,6 +19702,7 @@ static const FancyBG *Stage_fancyBG(const char *stageType) {
     if (!strcmp(stageType, "BONEZONE")) return &FB_BoneZone;
     if (!strcmp(stageType, "SINKING")) return &FB_Moon;
     if (!strcmp(stageType, "RASH")) return &FB_Rash;
+    if (!strcmp(stageType, "MOONSPELL")) return &FB_Moonspell;
     if (!strcmp(stageType, "BATCOUNTRY")) return &FB_Bat;
     if (!strcmp(stageType, "ASTRALSTAIR")) return &FB_Astral;
     if (!strcmp(stageType, "GREENACRES")) return &FB_GreenAcres;
@@ -16832,7 +19951,7 @@ static struct {
     float cloudAngle[4][12];
     unsigned char cloudFlip[4][12];
 } ChS;
-static struct { int on; float k; Enemy *e; Sprite s; } CamPan;  // StopCamera + scrollX/Y in tween + startFollow: la camera fra il giocatore e un nemico
+static struct { int on, hasFrom; float k, fromX, fromY; Enemy *e; const Sprite *sp; Sprite s; } CamPan;  // StopCamera + scrollX/Y in tween + startFollow: la camera fra il giocatore e un nemico
 static cJSON *Chapel_minute30(void) { return cJSON_GetArrayItem(cJSON_GetObjectItem(data_get("stages"), "CHAPEL"), 0x1e); }
 static void Chapel_setMinute30(int secret) {  // dataStages[CHAPEL][30].enemies / bosses
     cJSON *m = Chapel_minute30();
@@ -17046,6 +20165,1080 @@ static void Chapel_CheckMinute(int m) {  // CheckMinute_SummonReapers (solo col 
     else if (m == 0x1e) Chapel_EnterTheBossi();
     if (r) sprite_setScale(&r->s, 0);  // drowner / stalker .setScale(0)
 }
+static void Core_OnTickerEvent(void *ctx);
+static const Sprite *CamPan_target(void);
+static int SM_restart;  // SceneManager.RestartMainScene
+// ============================================================================
+// Foscari: nemici propri, boss, sigilli e i due stage (0xf7e2 Lake Foscari, 0xba51 Abyss Foscari)
+// ============================================================================
+// --- FS_SNAK* (0x1026f, 0x11e22): vanno dove guardano ---------------------------------------------------------------------------
+static void Snak_angle(Enemy *e) { e->s.angle = -0x5a + atan2f(e->s.body.velocity.y, e->s.body.velocity.x - 1) * (180 / PI); }
+static void E_Snak_OnRecycle(Enemy *e) {
+    static const unsigned T[3] = { 0x44bbff, 0x88ffff, 0x44ffbb };
+    base_EnemyOnRecycle(e);
+    sprite_setOrigin(&e->s, 0.5f, 0.5f);
+    e->saveTint = T[(int)floorf(frand() * 3)], e->s.tint = e->saveTint;
+}
+static void E_Snak_Update(Enemy *e) { base_EnemyUpdate(e); Snak_angle(e); }
+static const EnemyVT E_Snak = { .OnRecycle = E_Snak_OnRecycle, .Update = E_Snak_Update };
+static void E_SnakS_endShield(void *ctx) { Enemy *e = ctx; e->sineF = 0; e->hp -= e->firetime; }  // hasShield = sineF, shieldDamage = firetime
+static void E_SnakS_OnRecycle(Enemy *e) {
+    base_EnemyOnRecycle(e);
+    float d = num(enemy_data(e), "shieldDuration", 0);
+    e->fireDelay = d ? d : 0x7d0, e->firetime = 0, e->sineF = 1;
+    time_removeEvent(e->shieldTimer);
+    e->shieldTimer = time_addEvent(e->fireDelay, 0, 0, E_SnakS_endShield, e);
+}
+static void E_SnakS_GetDamaged(Enemy *e, float amount, int hitVFX, float kb, const char *t) {  // come Jeneviv: lo scudo conta il danno, non lo toglie
+    (void)t;
+    if (amount > 0 && po_is("DamageNumbersEnabled")) Core_ShowDamageAt(e->s.x, e->s.y, amount);
+    if (e->sineF) e->firetime += amount; else e->hp -= amount;
+    if (e->hp <= 0) Enemy_Die(e); else e->damageKB = kb;
+    Sound_PlaySound("Hit", 0.5f, 1, 0x1f4 * (frand() - 0.5f), 0x96, 3);
+    if (hitVFX != HIT_NONE) Core_ShowHitVFXAt(e->s.x, e->s.y, hitVFX);
+    Enemy_OnGetDamaged(e, hitVFX);
+}
+static const EnemyVT E_SnakShield = { .OnRecycle = E_SnakS_OnRecycle, .GetDamaged = E_SnakS_GetDamaged, .Update = E_Snak_Update };
+// --- FS_SCALING_SALMON (0xa1f6) -------------------------------------------------------------------------------------------------
+static void E_Salmon2_OnRecycle(Enemy *e) {
+    base_EnemyOnRecycle(e);
+    sprite_setScale(&e->s, 0);
+    float k = 0.5f * (frand() - 0.2f);
+    tween_stop(e->OnEnterTween);
+    e->OnEnterTween = tweens_add((TweenConfig){ .props = { { &e->s.scaleX, &e->s.scaleY, e->scaleMul + k } }, .nprops = 1, .duration = 0xc8 });
+    e->maxHp *= k, e->hp = e->maxHp;
+}
+static const EnemyVT E_Salmon2 = { .OnRecycle = E_Salmon2_OnRecycle };
+// --- 0x1593c (FS_BROWN, FS_HTROW, FS_LAMB, FS_GEF): Song of Mana... FLOWER cura e da' esperienza -----------------------------------
+static void E_Flowerfed_GetDamaged(Enemy *e, float amount, int hitVFX, float kb, const char *t) {
+    if (t && !strcmp(t, "FLOWER")) {
+        e->hp += amount;
+        Player_AddXP(Core.Player, 0.001f * Core.Player->level);
+        Core_ShowRecoveryAt(e->s.x, e->s.y, amount);
+        return;
+    }
+    base_EnemyGetDamaged(e, amount, hitVFX, kb, t);
+}
+static const EnemyVT E_Flowerfed = { .GetDamaged = E_Flowerfed_GetDamaged };
+// --- FS_CAKE (0x1459f): corre in orizzontale; lascia una torta ------------------------------------------------------------------------
+static void E_Cake_setOwner(Enemy *e) {
+    e->s.y = Core.Player->s.y + (frand() - 0.5f) * game_height;
+    e->s.x = Core.Player->s.x + (frand() >= 0.5f ? 0.55f * game_width : -0.55f * game_width);
+    e->speed *= 1 + frand();
+}
+static void E_Cake_Die(Enemy *e) {
+    if (!e->isDead && frand() < 0.21f * Player_PLuck(Core.Player)) {
+        Pickup *p = Core_MakePickup(e->s.x, e->s.y, "ROAST");
+        if (p) sprite_setFrame(&p->s, frame_get("items", "pie.png")), p->goToPlayer = 1, p->time = 1;
+    }
+    base_EnemyDie(e);
+    e->s.body.enable = 0;
+}
+static void E_Cake_Update(Enemy *e) {
+    if (e->isDead) return;
+    e->s.depth = e->s.y - Core.Player->s.y;
+    if (e->IsTimeStopped) return;
+    if (!e->FixedDirection || (e->_currentDirection.x == 0 && e->_currentDirection.y == 0)) {
+        float dx = e->target->x - e->s.x;
+        e->_currentDirection.x = dx > 0 ? 1 : dx < 0 ? -1 : 0;
+    }
+    e->_currentDirection.y = 0;
+    float k = e->receivingDamage ? -e->knockback * e->damageKB : 1, v = EnemySpeed * e->speed * k * e->slow;
+    e->s.flipX = e->_currentDirection.x > 0;
+    sprite_setVelocity(&e->s, v * e->_currentDirection.x, 0);
+}
+static const EnemyVT E_Cake = { .GetDamaged = E_Flowerfed_GetDamaged, .Die = E_Cake_Die, .Update = E_Cake_Update, .setOwner = E_Cake_setOwner };
+// --- FS_MUSH_PATROL, FS_BLINDER_PATROL (0x4332): pattugliano attorno al loro padrone -----------------------------------------------------
+static void E_Patrol_OnRecycle(Enemy *e) {
+    base_EnemyOnRecycle(e);
+    cJSON *d = enemy_data(e);
+    e->activated = 1;  // isPatrolling
+    e->defaultSpeed = num(d, "speed", 0), e->fireDelay = num(d, "patrolDuration", 0) ? num(d, "patrolDuration", 0) : 0x7d0, e->sineF = 1;
+    sprite_setScale(&e->s, 0);
+    if (tween_get(e->OnEnterTween)) { tween_restart(e->OnEnterTween); if (tween_get(e->OnSineTween)) tween_restart(e->OnSineTween); }
+    else {
+        e->OnEnterTween = tweens_add((TweenConfig){ .props = { { &e->s.scaleX, &e->s.scaleY, e->scaleMul } }, .nprops = 1, .duration = 0x3e8, .persist = 1 });
+        tween_restartOrAdd(&e->OnSineTween, (TweenConfig){ .props = { { &e->sineF, NULL, -1 } }, .nprops = 1, .delay = 0x64, .duration = e->fireDelay, .repeat = -1, .yoyo = 1, .ease = Ease_SineInOut });
+    }
+}
+static void E_Patrol_DeSpawn(Enemy *e) { base_EnemyDeSpawn(e); tween_stop(e->OnEnterTween); }
+static void E_Patrol_Update(Enemy *e) {
+    if (!e->activated) { base_EnemyUpdate(e); return; }
+    if (e->owner && e->owner->s.body.enable) {
+        e->target = &e->owner->s;
+        e->speed = e->defaultSpeed * e->sineF;
+        base_EnemyUpdate(e);
+        e->s.flipX = e->_currentDirection.x < 0;
+    } else e->speed = e->defaultSpeed, e->target = &Core.Player->s, e->activated = 0;
+}
+static const EnemyVT E_Patrol = { .OnRecycle = E_Patrol_OnRecycle, .DeSpawn = E_Patrol_DeSpawn, .Update = E_Patrol_Update };
+// --- FS_MUSH_HP (0xbbf2) ---------------------------------------------------------------------------------------------------------------
+static void E_MushHP_OnRecycle(Enemy *e) {
+    static const unsigned T[5] = { 0xffaa88, 0xffcc88, 0xffccee, 0xffffff, 0xcccc66 };
+    base_EnemyOnRecycle(e);
+    e->saveTint = T[(int)floorf(frand() * 5)], e->s.tint = e->saveTint;
+}
+static const EnemyVT E_MushHP = { .OnRecycle = E_MushHP_OnRecycle };
+// --- FS_CRATE_HP (0xa34b, su 0x2037): rotta, una moneta che vola ---------------------------------------------------------------------------
+static void E_Crate_OnRecycle(Enemy *e) { E_Molisano_OnRecycle(e); e->s.flipX = 0, e->isCullable = 1; }
+static void E_Crate_Update(Enemy *e) { E_Molisano_Update(e); e->s.angle = 0; }
+static void E_Crate_Die(Enemy *e) {
+    E_Molisano_Die(e);
+    Pickup *p = Core_MakePickup(e->s.x, e->s.y, "COIN");
+    if (p) p->time = 1, p->goToPlayer = 1;
+}
+static const EnemyVT E_Crate = { .OnRecycle = E_Crate_OnRecycle, .Die = E_Crate_Die, .GetDamaged = E_Molisano_GetDamaged, .Update = E_Crate_Update };
+// --- FS_POT_HP, FS_ANFORA_HP (0x9fb3): maxHp e' il numero di colpi --------------------------------------------------------------------------
+static void E_Pot_OnRecycle(Enemy *e) {
+    base_EnemyOnRecycle(e);
+    e->s.flipX = 0, e->firetime = 0, e->activated = 0, e->isCullable = 1, e->speed = 0;  // firetime = hitsTaken, activated = isInvul
+    sprite_setScale(&e->s, 0);
+    tween_stop(e->OnEnterTween);
+    e->OnEnterTween = tweens_add((TweenConfig){ .props = { { &e->s.scaleX, &e->s.scaleY, e->scaleMul }, { &e->speed, NULL, 0 } }, .nprops = 2, .duration = 0x12c });
+    int inv = po_is("SelectedInverse") && po_is("VisuallyInvertStages");
+    e->s.flipY = inv;
+    sprite_setOrigin(&e->s, 0.5f, inv ? 0 : 1);
+}
+static void E_Pot_Update(Enemy *e) { e->s.angle = 0; if (!e->isDead) e->s.depth = e->s.y - Core.Player->s.y; }
+static void E_Pot_Die(Enemy *e) { base_EnemyDie(e); e->s.body.enable = 0; }
+static void E_Pot_endInvul(void *ctx) { ((Enemy *)ctx)->activated = 0; }
+static void E_Pot_GetDamaged(Enemy *e, float amount, int hitVFX, float kb, const char *t) {
+    (void)amount, (void)kb, (void)t;
+    if (e->isDead || e->activated) return;
+    e->activated = 1, e->firetime++;
+    if (e->firetime >= e->maxHp) Sound_PlaySound("Pot", 0.3f, 1, -0x258 * frand() - 0x1f4, 0x64, 4), Enemy_Die(e);
+    else Sound_PlaySound("Bumper2", 0.2f, 1, 0x64 * e->firetime - 0x1f4, 0x64, 4);
+    time_addEvent(0x1f4, 0, 0, E_Pot_endInvul, e);
+    Enemy_OnGetDamaged(e, hitVFX);
+}
+static const EnemyVT E_Pot = { .OnRecycle = E_Pot_OnRecycle, .Die = E_Pot_Die, .GetDamaged = E_Pot_GetDamaged, .Update = E_Pot_Update };
+// --- BOSS_XLBLINDER (0x10d67): lo Stalker senza tinta (l'uscita a Panini e' di un tasto che la Vita non ha) --------------------------------
+static void E_Blinder_OnRecycle(Enemy *e) { E_Stalker_OnRecycle(e); sprite_setTint(&e->s, 0xffffff); }
+// --- FS_BOSS_AGAEA (0x3263): il boss del lago: si rianima col conto delle uccisioni -------------------------------------------------------
+typedef struct { int isInvul, bonusTimes, recoveredTimes, defeated; EnemyPool *summonPool, *summonPool2; Timer SummonEvent; } AgaeaX;
+static void Agaea_summon(void *ctx) {
+    Enemy *e = ctx;
+    AgaeaX *x = e->x;
+    if (e->isDead) { time_removeEvent(x->SummonEvent); return; }
+    if (!x->summonPool) x->summonPool = EnemyPool_new("FS_GGHOST"), x->summonPool2 = EnemyPool_new("FS_GGGHOST");
+    float ex = e->s.x, ey = e->s.y;
+    EnemyPool_SpawnAt(x->summonPool, ex + 8, ey - 8), EnemyPool_SpawnAt(x->summonPool, ex - 8, ey + 8), EnemyPool_SpawnAt(x->summonPool, ex, ey);
+    EnemyPool_SpawnAt(x->summonPool2, ex + 8, ey + 8), EnemyPool_SpawnAt(x->summonPool2, ex - 8, ey - 8), EnemyPool_SpawnAt(x->summonPool2, ex, ey);
+}
+static void Agaea_blink(void *ctx) { sprite_setTint(&((Enemy *)ctx)->s, 0xffffff); }
+typedef struct { Enemy *e; Sprite skull, heart; } AgaeaToken;
+static void Agaea_tokenUpdate(void *ctx) { AgaeaToken *t = ctx; t->heart.alpha = 1 - t->skull.alpha; }
+static void Agaea_tokenDone(void *ctx) {
+    AgaeaToken *t = ctx;
+    Enemy *e = t->e;
+    AgaeaX *x = e->x;
+    children_remove(&t->skull), children_remove(&t->heart);
+    Sound_PlaySound("Roast", 0.6f, 0.65f, 0, 0x1f4, 1);
+    x->recoveredTimes++;
+    sprite_setTintFill(&e->s, 0xff00);
+    Core_ShowDamageAt(e->s.x, e->s.y, -0x3e8);
+    time_removeEvent(e->_blinkTimeout);
+    e->_blinkTimeout = time_addEvent(0x78, 0, 0, Agaea_blink, e);
+    sprite_setScale(&e->s, 1 + x->recoveredTimes / 100.0f);
+    free(t);
+}
+static void Agaea_token(void *ctx) {  // GetEnemyToken: dal contatore delle uccisioni al boss
+    Enemy *e = ctx;
+    AgaeaToken *t = calloc(1, sizeof *t);
+    t->e = e;
+    float x = Core.Player->s.x - 0.5f * game_width + MainUI.KillsIcon.x - 8, y = Core.Player->s.y - 0.5f * game_height + MainUI.KillsIcon.y;
+    sprite_init(&t->skull, frame_get("items", "SkullToken.png"), x, y);
+    sprite_init(&t->heart, frame_get("items", "HeartMini.png"), x, y);
+    sprite_setScale(&t->skull, 2), t->skull.depth = t->heart.depth = ZInGameUI - 2, t->heart.alpha = 0;
+    children_add(&t->skull), children_add(&t->heart);
+    tweens_add((TweenConfig){ .props = { { &t->skull.scaleX, &t->skull.scaleY, 1 }, { &t->skull.alpha, NULL, -1 }, { &t->skull.x, NULL, e->s.x } }, .nprops = 3, .duration = 0x1f4, .onUpdate = Agaea_tokenUpdate, .ctx = t });
+    tweens_add((TweenConfig){ .props = { { &t->skull.y, NULL, e->s.y - 0x18 }, { &t->heart.x, NULL, e->s.x }, { &t->heart.y, NULL, e->s.y - 0x18 } }, .nprops = 3, .duration = 0x1f4 });
+    tweens_add((TweenConfig){ .props = { { &t->heart.scaleX, &t->heart.scaleY, 2 } }, .nprops = 1, .duration = 0x1f4, .onComplete = Agaea_tokenDone, .ctx = t });
+}
+static void Agaea_start(void *ctx) {
+    Enemy *e = ctx;
+    AgaeaX *x = e->x;
+    Stage *st = Core.Stage;
+    static const char *const G[2] = { "FS_GGHOST", "FS_GGGHOST" };
+    st->enemies = cJSON_CreateStringArray(G, 2);
+    st->minimum = 0x96;
+    Stage_updateEnemyPools(st);
+    time_removeEvent(x->SummonEvent);
+    x->SummonEvent = time_addEvent(0x1388, 1, 0x64, Agaea_summon, e);
+    x->isInvul = 0;
+}
+static void Agaea_tokens(void *ctx) {
+    Enemy *e = ctx;
+    AgaeaX *x = e->x;
+    time_addEvent(0xc8, 1, x->bonusTimes - 1, Agaea_token, e);
+    time_addEvent(0x7d0 + fminf(0x2710, 0xc8 * x->bonusTimes), 0, 0, Agaea_start, e);
+}
+static void E_Agaea_OnRecycle(Enemy *e) {
+    base_EnemyOnRecycle(e);
+    if (!e->x) e->x = calloc(1, sizeof(AgaeaX));
+    AgaeaX *x = e->x;
+    x->bonusTimes = fmaxf(1, ceilf(Core.kills / 1000.0f));
+    e->maxHp += 0x3e8 * x->bonusTimes;
+    if (po_is("SelectedGoldenEggs")) {
+        cJSON *d = cJSON_GetObjectItem(po("EggData"), po_str("SelectedCharacter"));
+        if (d) e->power += num(d, "power", 0), e->maxHp += num(d, "maxHp", 0);
+    }
+    e->hp = e->maxHp;
+    if (!x->isInvul) time_addEvent(0x1f40, 0, 0, Agaea_tokens, e), x->isInvul = 1;  // StartInvulTimer
+    if (!e->ringSprite) {
+        e->ringSprite = calloc(1, sizeof(Sprite));
+        fx_init(e->ringSprite, "sPFX_ring_64.png", 1), e->ringSprite->visible = 1, sprite_setScale(e->ringSprite, 0);
+    }
+}
+static void Banger_later(void *ctx) { (void)ctx; Sound_SetupAndPlayBGM_Banger(1); }
+static void E_Agaea_DeSpawn(Enemy *e) { time_addEvent(0x3e8, 0, 0, Banger_later, NULL); base_EnemyDeSpawn(e); }
+static void E_Agaea_GetDamaged(Enemy *e, float amount, int hitVFX, float kb, const char *t) { if (!((AgaeaX *)e->x)->isInvul) base_EnemyGetDamaged(e, amount, hitVFX, kb, t); }
+static void E_Agaea_Update(Enemy *e) {
+    if (e->isDead) return;
+    e->s.depth = game_height;
+    if (!e->FixedDirection || (e->_currentDirection.x == 0 && e->_currentDirection.y == 0)) {
+        float dx = e->target->x - e->s.x, dy = e->target->y - e->s.y, l = sqrtf(dx * dx + dy * dy);
+        e->_currentDirection = l > 0 ? (Vector2){ dx / l, dy / l } : (Vector2){ 0, 0 };
+    }
+    float k = e->receivingDamage ? -e->knockback * e->damageKB : 1, v = EnemySpeed * e->speed * k * e->slow;
+    e->s.flipX = e->_currentDirection.x > 0;
+    sprite_setVelocity(&e->s, v * e->_currentDirection.x, v * e->_currentDirection.y);
+    e->s.angle = 0;
+}
+static void Ring_scream(Sprite *r, float x, float y) {
+    r->x = x, r->y = y, r->scaleX = r->scaleY = 0, r->visible = 1;
+    tweens_add((TweenConfig){ .props = { { &r->scaleX, &r->scaleY, 0x10 } }, .nprops = 1, .duration = 0x12c, .repeat = 1, .onComplete = Sprite_hide, .ctx = r });
+}
+static void E_Agaea_Die(Enemy *e) {
+    base_EnemyDie(e);
+    Sound_PlaySound("Deathscream", 4, 1, 0, 0x96, 2);
+    Ring_scream(e->ringSprite, e->s.x, e->s.y);
+}
+static const EnemyVT E_Agaea = { .OnRecycle = E_Agaea_OnRecycle, .DeSpawn = E_Agaea_DeSpawn, .GetDamaged = E_Agaea_GetDamaged, .Update = E_Agaea_Update, .Die = E_Agaea_Die };
+
+// --- DamagingZone (0x8fbf, pool 0x8b6e): cerchio d'avviso, poi esplosione che fa danno; aggiornate dal fancyBG ---------------------------------
+typedef struct { Sprite s, GroundFx, Snake; float damage, duration, radius; Timer HitboxTimer; int hasHit, activateDamage, used; TweenRef SnakeT, dispT, disp2T, explT, durT; } FZone;
+static FZone FZones[32];
+static void FZone_despawn(void *ctx) {
+    FZone *z = ctx;
+    z->used = 0, z->activateDamage = 0;
+    time_removeEvent(z->HitboxTimer);
+    z->GroundFx.visible = 0, z->s.visible = 0, z->Snake.visible = 0;
+}
+static void FZone_reset(void *ctx) { ((FZone *)ctx)->hasHit = 0; }
+static void FZone_alpha0(void *ctx) { ((FZone *)ctx)->s.alpha = 0; }
+static void FZone_noDamage(void *ctx) { ((FZone *)ctx)->activateDamage = 0; }
+static void FZone_Explode2(void *ctx) {
+    FZone *z = ctx;
+    Sound_PlaySound("Explosion", 0.5f, 1, 0x1f4 * frand(), 0x96, 3);
+    tween_stop(z->SnakeT), tween_stop(z->dispT), tween_stop(z->disp2T), tween_stop(z->explT);
+    z->Snake.alpha = 1;
+    z->explT = tweens_add((TweenConfig){ .props = { { &z->s.scaleX, &z->s.scaleY, 4 }, { &z->Snake.scaleX, &z->Snake.scaleY, 4 }, { &z->Snake.alpha, NULL, 0 } }, .nprops = 3, .duration = 0xc8, .onComplete = FZone_noDamage, .ctx = z });
+    z->s.alpha = 0;
+    tweens_add((TweenConfig){ .props = { { &z->s.alpha, NULL, 1 } }, .nprops = 1, .duration = 0xc8, .onComplete = FZone_alpha0, .ctx = z });
+    tweens_add((TweenConfig){ .delay = 0xc8, .props = { { &z->s.alpha, NULL, 0 } }, .nprops = 1, .duration = 0xc8, .onStart = FZone_alpha0, .onComplete = FZone_despawn, .ctx = z });
+}
+static void FZone_Implode(void *ctx) {
+    FZone *z = ctx;
+    tweens_add((TweenConfig){ .props = { { &z->s.scaleX, &z->s.scaleY, 0 }, { &z->s.alpha, NULL, 1 } }, .nprops = 2, .duration = 0x64, .onComplete = FZone_Explode2, .ctx = z });
+}
+static void FZone_grown(void *ctx) {
+    FZone *z = ctx;
+    z->activateDamage = 1;
+    z->disp2T = tweens_add((TweenConfig){ .props = { { &z->s.scaleX, &z->s.scaleY, 0.9f } }, .nprops = 1, .duration = 0x64, .yoyo = 1, .repeat = -1 });
+}
+static void FZone_Explode(void *ctx) {
+    FZone *z = ctx;
+    Sound_PlaySound("Explosion", 0.5f, 1, 0x1f4 * (frand() - 0.5f), 0x96, 3);
+    z->s.visible = 1, z->Snake.visible = 1, z->Snake.x = z->s.x, z->Snake.y = z->s.y;
+    tween_stop(z->SnakeT), tween_stop(z->dispT), tween_stop(z->disp2T);
+    z->Snake.alpha = 0, sprite_setScale(&z->Snake, 0);
+    z->SnakeT = tweens_add((TweenConfig){ .props = { { &z->Snake.scaleX, &z->Snake.scaleY, 1 }, { &z->Snake.alpha, NULL, 0.65f } }, .nprops = 2, .duration = 0x1f4 });
+    sprite_setScale(&z->s, 0);
+    z->dispT = tweens_add((TweenConfig){ .props = { { &z->s.scaleX, &z->s.scaleY, 2 }, { &z->s.alpha, NULL, 0.65f } }, .nprops = 2, .duration = 0x1f4, .onComplete = FZone_grown, .ctx = z });
+    z->durT = tweens_add((TweenConfig){ .props = { { &z->GroundFx.x, NULL, z->GroundFx.x } }, .nprops = 1, .duration = z->duration, .onComplete = FZone_Implode, .ctx = z });
+}
+static void FZone_SpawnAt(float x, float y, float radius, float dmg, float duration, float hitDelay) {
+    FZone *z = NULL;
+    for (int i = 0; i < 32 && !z; i++) if (!FZones[i].used) z = &FZones[i];
+    if (!z) return;  // semplificazione: 32 zone bastano al ritmo del boss (13 al massimo in volo)
+    if (!z->s.frame) {
+        static Animation loop;
+        if (!loop.n) make_anim(&loop, "vfx", "Ophion", 0, 0x1f, 4, 0x10, -1);
+        sprite_init(&z->s, frame_get("vfx", "_OPBubble.png"), 0, 0);
+        fx_init(&z->GroundFx, NULL, 1), z->GroundFx.draw = Circle_draw, z->GroundFx.tint = 0xff0000;
+        fx_init(&z->Snake, "Ophion0000.png", 0);
+        anims_play(&z->Snake, &loop, 0);
+        z->HitboxTimer = (Timer){ -1, 0 };
+        z->SnakeT = z->dispT = z->disp2T = z->explT = z->durT = (TweenRef){ -1, 0 };
+    }
+    children_remove(&z->s), children_add(&z->s);
+    z->used = 1, z->s.visible = 0, z->s.alpha = 0.2f;
+    z->s.x = z->GroundFx.x = x, z->s.y = z->GroundFx.y = y, z->radius = radius, z->GroundFx.width = radius;
+    z->damage = dmg, z->duration = duration, z->hasHit = 0, z->activateDamage = 0;
+    sprite_setScale(&z->GroundFx, 1), sprite_setScale(&z->s, 0), sprite_setScale(&z->Snake, 0);
+    z->GroundFx.depth = 1, z->GroundFx.alpha = 0, z->GroundFx.visible = 1;
+    time_removeEvent(z->HitboxTimer);
+    z->HitboxTimer = time_addEvent(hitDelay, 1, 0, FZone_reset, z);
+    tweens_add((TweenConfig){ .props = { { &z->GroundFx.alpha, NULL, 0.5f } }, .nprops = 1, .yoyo = 1, .repeat = 2, .duration = 0x12c, .onComplete = FZone_Explode, .ctx = z });
+    Sound_PlaySound("Pizza", 0.9f, 1, 0x1f4 * frand(), 0x96, 2);
+}
+static void FZones_Update(void) {
+    for (int i = 0; i < 32; i++) {
+        FZone *z = &FZones[i];
+        if (!z->used || z->hasHit || !z->activateDamage) continue;
+        float dx = Core.Player->s.x - z->s.x, dy = Core.Player->s.y - z->s.y;
+        if (dx * dx + dy * dy <= z->radius * z->radius) z->hasHit = 1, Player_GetDamaged(Core.Player, z->damage);
+    }
+}
+
+// --- FS_BOSS_JENEVIV (0x4ad9) ------------------------------------------------------------------------------------------------------------------
+typedef struct {
+    int isActivated, isInvul, PainInTheAss, SpecialDeath, hasShield, hasOnActivated;
+    float shieldDamage, totalTime, scitheTime, activationDistance, _defaultSpeed;
+    Timer shieldTimer, DamagingZonesEvent, SummonSnakesEvent;
+    Sprite BreakFree, rays[0xd];
+    Animation Break, NoEle, NoColor;
+    void (*OnActivated)(void);
+} JenX;
+static Enemy *Jeneviv;
+static void Jen_shieldOff(void *ctx) { Enemy *e = ctx; JenX *x = e->x; x->hasShield = 0; e->hp -= x->shieldDamage; }
+static void Jen_RestoreShield(Enemy *e) {
+    JenX *x = e->x;
+    x->shieldDamage = 0, x->hasShield = 1;
+    time_removeEvent(x->shieldTimer);
+    x->shieldTimer = time_addEvent(0xafc8, 0, 0, Jen_shieldOff, e);
+}
+static void E_Jen_OnRecycle(Enemy *e) {
+    base_EnemyOnRecycle(e);
+    if (!e->x) e->x = calloc(1, sizeof(JenX));
+    JenX *x = e->x;
+    x->_defaultSpeed = num(enemy_data(e), "speed", 0);
+    sprite_setScale(&e->s, 2);
+    e->isTeleportOnCull = 0, e->isCullable = 0;
+    x->totalTime = 0, x->scitheTime = 0x1388, x->activationDistance = 0x11170, x->shieldTimer = x->DamagingZonesEvent = x->SummonSnakesEvent = (Timer){ -1, 0 };
+    if (!e->ringSprite) {
+        e->ringSprite = calloc(1, sizeof(Sprite));
+        fx_init(e->ringSprite, "sPFX_ring_64.png", 1), e->ringSprite->visible = 1, sprite_setScale(e->ringSprite, 0);
+    }
+    Jen_RestoreShield(e);
+    sprite_init(&x->BreakFree, NULL, e->s.x, e->s.y);
+    sprite_setOrigin(&x->BreakFree, 0.5f, 1);
+    x->BreakFree.visible = 0;
+    children_add(&x->BreakFree);
+    make_anim(&x->Break, "foscariChars", "stJeneviv_", 0, 0x1b, 0, 0x10, 0);
+    make_anim(&x->NoColor, "foscariChars", "uJeneviv_i0", 1, 5, 0, 4, -1);
+    make_anim(&x->NoEle, "foscariChars", "noJeneviv_i0", 1, 5, 0, 8, -1);
+    e->s.body.immovable = 1;
+    x->isInvul = 0, x->PainInTheAss = 0, x->isActivated = 0, x->SpecialDeath = 0;
+    Jeneviv = e;
+    memset(FZones, 0, sizeof FZones);
+}
+static void E_Jen_GetDamaged(Enemy *e, float amount, int hitVFX, float kb, const char *t) {
+    JenX *x = e->x;
+    if (!x->isActivated || x->isInvul) return;
+    if (t && (!strcmp(t, "PRISMATICMISS") || !strcmp(t, "GUNS3"))) amount *= 5;
+    if (t && !strcmp(t, "PRISMATICMISS2")) amount *= 0x32;
+    if (amount > 0 && po_is("DamageNumbersEnabled")) Core_ShowDamageAt(e->s.x, e->s.y, amount);
+    if (x->hasShield) x->shieldDamage += amount; else e->hp -= amount;
+    if (e->hp <= 0) Enemy_Die(e); else e->damageKB = kb;
+    Sound_PlaySound("Hit", 0.5f, 1, 0x1f4 * (frand() - 0.5f), 0x96, 3);
+    if (hitVFX != HIT_NONE) Core_ShowHitVFXAt(e->s.x, e->s.y, hitVFX);
+    Enemy_OnGetDamaged(e, hitVFX);
+}
+static void Jen_SummonSnakes(int a, int b) {
+    PlayCircle(0, a, "FS_SNAKSHIELD", 1.5f);
+    PlayCircle(0, b, "FS_SNAKBOMB", 1.5f);
+}
+static void Jen_snakesCb(void *ctx) { (void)ctx; Jen_SummonSnakes(6, 6); }
+typedef struct { float spread; } JenOphion;
+static void Jen_zone(void *ctx) {
+    float spread = *(float *)ctx;
+    FZone_SpawnAt(Core.Player->s.x + (frand() - 0.5f) * spread, Core.Player->s.y + (frand() - 0.5f) * spread, 0x40, 0x14, 0x7d0, 0x2ee);
+}
+static void Jen_FireOphion(float step, float spread, float n) {
+    static float spreads[64];
+    static int si;
+    for (int i = 0; i < n; i++) {
+        float *s = &spreads[si++ & 63];
+        *s = spread;
+        time_addEvent(step * i, 0, 0, Jen_zone, s);
+    }
+}
+static void Jen_zonesCb(void *ctx) { (void)ctx; Jen_FireOphion(0x3c + 0x3c * frand(), 0x64 + 0xc8 * frand(), 2 + 8 * frand()); }
+static void Jen_StartVerySmartAI(void *ctx) {
+    Enemy *e = ctx;
+    JenX *x = e->x;
+    e->speed = x->_defaultSpeed * (po_is("SelectedHyper") ? 1 : 1.2f);
+    x->isInvul = 0;
+    Jen_SummonSnakes(0xc, 0x18);
+    Jen_FireOphion(0x32, 0x190, 0xd);
+    time_removeEvent(x->SummonSnakesEvent);
+    x->SummonSnakesEvent = time_addEvent(0x1a2d, 1, 0, Jen_snakesCb, e);
+    time_removeEvent(x->DamagingZonesEvent);
+    x->DamagingZonesEvent = time_addEvent(0x20a1, 1, 0, Jen_zonesCb, e);
+}
+static void E_Jen_Update(Enemy *e) {
+    JenX *x = e->x;
+    e->s.depth = Core.Player->s.y + game_height;
+    x->BreakFree.depth = e->s.depth + 1;
+    if (x->PainInTheAss) Core_SetHardBounds(e->s.x - 0.5f * game_width, e->s.y - 0.5f * game_height, e->s.x + 0.5f * game_width, e->s.y + 0.5f * game_height);  // physics.world.setBounds attorno al boss
+    if (!x->isActivated) {
+        float dx = Core.Player->s.x - e->s.x, dy = Core.Player->s.y - e->s.y;
+        if (dx * dx + dy * dy >= x->activationDistance) return;
+        x->isActivated = 1;
+        if (x->OnActivated) {
+            e->isTeleportOnCull = 1;
+            x->OnActivated(), x->OnActivated = NULL;
+            Jen_StartVerySmartAI(e);
+            e->maxHp = 0x12c * Core.Player->level + 0x3e8, e->hp = e->maxHp;  // ActivatedByDistance
+        }
+    }
+    base_EnemyUpdate(e);
+    if (e->isDead) return;
+    float v = x->hasShield ? e->maxHp - x->shieldDamage : e->hp;
+    x->scitheTime = 0x1f4 + fmaxf(0, v / e->maxHp * 0xfa0);
+    x->totalTime += Enemies_delta;
+    if (x->totalTime > x->scitheTime) x->totalTime = 0;
+}
+static void Jen_DeathScream(void *ctx) {
+    Enemy *e = ctx;
+    Sound_PlaySound("Deathscream", 4, 1, 0, 0x96, 2);
+    Ring_scream(e->ringSprite, e->s.x, e->s.y);
+}
+static void Jen_camBack(void *ctx) { (void)ctx; CamPan.on = 0; }
+static void Jen_restoreTint(void *ctx) { Player_restoreTint(Core.Player); (void)ctx; }
+static void Jen_treasureOrHand(void *ctx) {
+    Enemy *e = ctx;
+    JenX *x = e->x;
+    anims_play(&e->s, &e->die, 0);
+    if (!x->SpecialDeath) {
+        int lv = 0;
+        Stage_SetTreasureLevelFromChance(Stalker_treasure(), &lv);
+        Core_MakeTreasure(e->s.x, e->s.y, Stalker_treasure(), lv);
+        return;
+    }
+    WhiteHand_Summon();
+    float limit = num(cJSON_GetObjectItem(cJSON_GetArrayItem(cJSON_GetObjectItem(data_get("stages"), po_str("SelectedStage")), 0), "mods"), "TimeLimit", 0x708);
+    if (Core.SurvivedSeconds < 0x3c + limit) Core.SurvivedSeconds = 0x3c + limit;
+    tweens_add((TweenConfig){ .props = { { &CamPan.k, NULL, 0 } }, .nprops = 1, .duration = 0xc8, .onComplete = Jen_camBack });
+    while (Core.n_weapons > 0) Core_RemoveWeapon(Core.Weapons[0]->bulletType);
+    if (Player_is(Core.Player, "ELEANOR")) tweens_add((TweenConfig){ .props = { { &Core.Player->s.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x4e20 });
+}
+static void E_Jen_Die(Enemy *e) {
+    JenX *x = e->x;
+    if (e->isDead) return;
+    base_EnemyDie(e);
+    time_removeEvent(x->DamagingZonesEvent), time_removeEvent(x->SummonSnakesEvent);
+    sprite_setVelocity(&e->s, 0, 0);
+    for (int i = 0; i < 32; i++) if (FZones[i].used) FZone_despawn(&FZones[i]);
+    if (x->SpecialDeath) {
+        time_removeEvent(Core.tickerEvent);
+        for (int i = 0; i < Core.Enemies.n; i++) Enemy_Disappear(Core.Enemies.items[i]->owner);
+        PlayerUI.hpBarBG.visible = PlayerUI.hpBar.visible = 0;
+        Sound_FadeMusic(0, 0x1f4);
+        Player_SetInvulForMilliSeconds(Core.Player, 0x7530);
+        Player_restoreTint(Core.Player);
+        time_addEvent(0x64, 0, 0, Jen_restoreTint, NULL);
+    }
+    anims_stop(&e->s);
+    Jen_DeathScream(e);
+    time_addEvent(0x3e8, 1, 4, Jen_DeathScream, e);
+    time_addEvent(0x1388, 0, 0, Jen_treasureOrHand, e);
+}
+static void E_Jen_Disappear(Enemy *e) { (void)e; }
+static const EnemyVT E_Jeneviv = { .OnRecycle = E_Jen_OnRecycle, .GetDamaged = E_Jen_GetDamaged, .Update = E_Jen_Update, .Die = E_Jen_Die, .Disappear = E_Jen_Disappear };
+static void Jen_SealInStone(Enemy *e) {
+    JenX *x = e->x;
+    x->activationDistance = 0;
+    e->speed = 0, e->isTeleportOnCull = 0, x->SpecialDeath = 1, x->isInvul = 1;
+    anims_play(&e->s, &x->NoColor, 0), anims_stop(&e->s);
+    sprite_setScale(&e->s, 1);
+    e->maxHp += 0x3e8, e->hp = e->maxHp;
+    for (int i = 0; i < 0xd; i++) {
+        Sprite *r = &x->rays[i];
+        sprite_init(r, frame_get("vfx", "RayRay.png"), 0.5f * game_width, 0.5f * game_height);
+        sprite_setScale(r, 0);
+        r->scrollFactor0 = 1, r->blendAdd = 1, r->depth = 0x270e;
+        children_add(r);
+    }
+    WE_Make();
+}
+static void Jen_BreakAnim(Enemy *e) {
+    JenX *x = e->x;
+    x->BreakFree.x = e->s.x, x->BreakFree.y = e->s.y, x->BreakFree.visible = 1;
+    anims_play(&x->BreakFree, &x->Break, 0);
+}
+static void Jen_BreakFree1(void *ctx) { Enemy *e = Jeneviv; (void)ctx; Jen_BreakAnim(e); e->maxHp = 0x12c * Core.Player->level + 0x3e8, e->hp = e->maxHp; }
+static void Jen_StartMoving(void *ctx) {
+    Enemy *e = Jeneviv;
+    JenX *x = e->x;
+    (void)ctx;
+    Jen_BreakAnim(e);
+    e->isTeleportOnCull = 1, x->isActivated = 1, e->speed = 0.1f * x->_defaultSpeed, x->PainInTheAss = 1;
+    anims_play(&e->s, &x->NoColor, 0);
+}
+static void Jen_BreakFree2(void *ctx) { Enemy *e = Jeneviv; (void)ctx; Jen_BreakAnim(e); anims_play(&e->s, &((JenX *)e->x)->NoEle, 0); e->speed = ((JenX *)e->x)->_defaultSpeed; }
+static void Jen_ChargeWorldEater(void *ctx) {
+    Enemy *e = Jeneviv;
+    JenX *x = e->x;
+    (void)ctx;
+    anims_play(&e->s, &x->NoEle, 0);
+    e->speed = 0;
+    for (int i = 0; i < 0xd; i++) {
+        Sprite *r = &x->rays[i];
+        r->angle = 0x168 * (frand() - 0.5f), r->alpha = 1, sprite_setScale(r, 0);
+        tweens_add((TweenConfig){ .props = { { &r->alpha, NULL, 0 }, { &r->scaleX, &r->scaleY, 2 }, { &r->angle, NULL, 0x19 * r->angle } }, .nprops = 3, .duration = 0xfa0 });
+    }
+}
+static void Jen_StealHeart(void *ctx);
+static void Jen_heartDone(void *ctx) {
+    Sprite *s = ctx;
+    children_remove(s), free(s);
+    Sound_PlaySound("Roast", 0.3f, 0.65f, 0, 0x1f4, 1);
+    if (Jeneviv) Core_ShowDamageAt(Jeneviv->s.x, Jeneviv->s.y, -6);
+}
+static void Jen_StealHeart(void *ctx) {
+    Enemy *e = Jeneviv;
+    (void)ctx;
+    Sprite *s = calloc(1, sizeof(Sprite));
+    sprite_init(s, frame_get("items", "HeartMini.png"), Core.Player->s.x, Core.Player->s.y);
+    s->depth = ZInGameUI - 2;
+    children_add(s);
+    tweens_add((TweenConfig){ .props = { { &s->scaleX, &s->scaleY, 2 }, { &s->x, NULL, e->s.x }, { &s->y, NULL, e->s.y - 0x18 } }, .nprops = 3, .duration = 0x1f4, .onComplete = Jen_heartDone, .ctx = s });
+}
+static void Jen_DevourEleanor(Enemy *e) {
+    if (!Player_is(Core.Player, "ELEANOR")) return;
+    Core_RemoveWeapon("SPELL_STRING"), Core_RemoveWeapon("SPELL_STREAM"), Core_RemoveWeapon("SPELL_STRIKE"), Core_RemoveWeapon("SPELL_STROM");
+    static const char *const I[4] = { "2SpellString.png", "2SpellStream.png", "2SpellStrike.png", "2SpellStrom.png" };
+    static Sprite spell[4];
+    float px = Core.Player->s.x, py = Core.Player->s.y, a = 2 * PI / 4;
+    for (int i = 0; i < 4; i++) {
+        Sprite *s = &spell[i];
+        sprite_init(s, frame_get("items", I[i]), px, py);
+        sprite_setOrigin(s, 0.5f, 1);
+        s->depth = 0x2328;
+        children_add(s);
+        tweens_add((TweenConfig){ .props = { { &s->x, NULL, px + cosf(0.5f + a * i) * 0x3c }, { &s->y, NULL, py + sinf(0.5f + a * i) * 0x3c } }, .nprops = 2, .duration = 0x3e8, .ease = Ease_SineInOut, .delay = 0x320 + 0x64 * i });
+        tweens_add((TweenConfig){ .props = { { &s->scaleX, NULL, 0 }, { &s->scaleY, NULL, 0xa }, { &s->x, NULL, e->s.x } }, .nprops = 3, .duration = 0x1f4, .ease = Ease_SineInOut, .delay = 0x320 + 0x64 * i + 0x3e8 + 0x3e8 + 0x64 * i, .onComplete = Sprite_hide, .ctx = s });
+    }
+    cJSON *d = cJSON_GetArrayItem(cJSON_GetObjectItem(data_get("characters"), "ELEANOR"), 0);
+    static Animation uwalk;
+    char prefix[64];
+    snprintf(prefix, sizeof prefix, "u%s", str(d, "spriteName"));
+    char *c = strstr(prefix, "01.png");
+    if (c) *c = 0;
+    make_anim(&uwalk, str(d, "textureName"), prefix, 1, (int)num(d, "walkingFrames", 0), 2, num(d, "walkFrameRate", 8) ? num(d, "walkFrameRate", 8) : 8, -1);
+    anims_play(&Core.Player->s, &uwalk, 0);
+}
+static void Jen_CastWorldEater(void *ctx) {
+    Enemy *e = Jeneviv;
+    JenX *x = e->x;
+    (void)ctx;
+    e->speed = 0.5f * x->_defaultSpeed;
+    Sound_PlaySound("WorldEater", 2, 1, 0, 0, 0);
+    tweens_add((TweenConfig){ .props = { { &SFXVolumeFactor, NULL, 1 } }, .nprops = 1, .duration = 0x1f4 });
+    WE_CastSoulSteal(NULL);  // PlayWorldEater: lo stesso teschio
+    tweens_add((TweenConfig){ .props = { { &e->s.scaleX, &e->s.scaleY, 2 } }, .nprops = 1, .duration = 0x3a98 });
+    time_addEvent(0xc8, 1, 0x4b, Jen_StealHeart, NULL);
+    Jen_DevourEleanor(e);
+    anims_play(&e->s, &e->idle, 0);
+}
+
+// --- I sigilli (Prop_FoscariSeal1 0x28be, 2 0x169f6, 3 0xdcc): si rompono solo col personaggio giusto e la sua evoluzione -----------------------
+static struct { Weapon *saved[32]; int n; const char *eventW[16]; int nEvent; Sprite Darkness, Fog; int hasFx; } FoscariRun;
+static const struct { const char *ch, *weapon; } SealKey[3] = { { "KEIRA", "FLASHARROW2" }, { "VICTOR", "SWORD2" }, { "ELEANOR", "SPELL_STROM" } };
+static void Seal_MakeLevelOne(Destructible *d) {
+    int k = d->sealKind - 1;
+    char prefix[16];
+    snprintf(prefix, sizeof prefix, "Seal%d_", k + 1);
+    make_anim(&d->idle, "items", prefix, 1, 4, 0, 4, -1);
+    snprintf(prefix, sizeof prefix, "Seal%d_d_", k + 1);
+    make_anim(&d->destroyAnim, "items", prefix, 0, 0x13, 0, 8, 0);
+    sprite_setOrigin(&d->s, 0.5f, 0.5f);
+    d->alreadyDestroyed = 0;
+    anims_play(&d->s, &d->idle, 0);
+    body_setCircle(&d->s.body, 0x26, 0, 0x20);
+    d->s.depth = k == 2 ? 0x7d0 : game_height;
+    tweens_add((TweenConfig){ .props = { { &d->s.y, NULL, d->s.y - 8 } }, .nprops = 1, .duration = 0x3e8, .ease = Ease_SineInOut, .loop = -1, .yoyo = 1 });
+}
+static void Seal_shake(int repeat) {
+    camera_followOffsetX = -2;
+    tweens_add((TweenConfig){ .props = { { &camera_followOffsetX, NULL, 2 } }, .nprops = 1, .duration = 0x10, .yoyo = 1, .repeat = repeat, .onComplete = Weapon_ScreenShake_done });
+}
+static void Seal_camArrived(void *ctx) {
+    Destructible *d = ctx;
+    Sound_PlaySound("Crystal12", 0.5f, 1, -0x258 * frand(), 0, 0);
+    FrameFreeze_ms = 0x78;
+    Seal_shake(6);
+    anims_stop(&d->s);
+    sprite_setScale(&d->s, 2);
+    anims_play(&d->s, &d->destroyAnim, 0);
+}
+static void Seal_panTo(Destructible *d) {
+    CamPan.on = 1, CamPan.k = 0, CamPan.e = NULL, CamPan.sp = &d->s;
+    tweens_add((TweenConfig){ .props = { { &CamPan.k, NULL, 1 } }, .nprops = 1, .duration = 0x7d0, .onComplete = Seal_camArrived, .ctx = d });
+}
+static void Seal_common(Destructible *d) {
+    json_inc(cJSON_GetObjectItem(data_get("props"), d->destructibleType), "destroyedAmount");
+    d->alreadyDestroyed = 1, d->s.visible = 1;
+    PlayerOptions_Save();
+    for (int i = 0; i < Core.Enemies.n; i++) Enemy_Disappear(Core.Enemies.items[i]->owner);
+    Sound_FadeMusic(0, 0x5dc);
+    Core.canInterrupt = 0, Core.canPause = 0;
+    PlayerUI.hpBarBG.visible = PlayerUI.hpBar.visible = 0;
+    time_removeEvent(Core.tickerEvent), time_removeEvent(Core.Stage->SpawnTimer);
+    Player_SetInvulForMilliSeconds(Core.Player, 0x7530);
+    Player_restoreTint(Core.Player);
+    time_addEvent(0x64, 0, 0, Jen_restoreTint, NULL);
+    Seal_panTo(d);
+}
+static void Foscari_stashWeapons(void) {  // playerWeapons: via dalle liste, tenute per il riepilogo
+    while (Core.n_weapons > 0 && FoscariRun.n < 32) {
+        Weapon *w = Core.Weapons[--Core.n_weapons];
+        Weapon_CleanUp(w);
+        FoscariRun.saved[FoscariRun.n++] = w;
+        if (FoscariRun.nEvent < 16) FoscariRun.eventW[FoscariRun.nEvent++] = w->bulletType;
+    }
+    while (Core.n_HiddenWeapons > 0 && FoscariRun.n < 32) {
+        Weapon *w = Core.HiddenWeapons[--Core.n_HiddenWeapons];
+        Weapon_CleanUp(w);
+        FoscariRun.saved[FoscariRun.n++] = w;
+    }
+}
+// Sigillo 1: il lago si prosciuga e si cade nell'abisso, con la stessa partita (RestartMainScene su FOSCARI2)
+static void Seal1_shakeEarth(void *ctx) { (void)ctx; Seal_shake(0x271); }
+static float *FoscariWaterAlpha, *FoscariWaterScale;
+static void Seal1_removeWater(void *ctx) {
+    (void)ctx;
+    Sound_PlayMusic("TheEndIndeed", 1.5f, 1);
+    if (FoscariWaterAlpha) tweens_add((TweenConfig){ .props = { { FoscariWaterAlpha, NULL, 0 }, { FoscariWaterScale, NULL, 8 } }, .nprops = 2, .duration = 0xfa0 });
+}
+static void Seal1_restart(void *ctx) { (void)ctx; SM_restart = 1; }
+static void Seal1_toggleUI(void *ctx) {
+    (void)ctx;
+    po_sets("SelectedStage", "FOSCARI2"), po_sets("SelectedBGM", "BGM_Foscari2"), po_sets("SelectedBGMMod", "Normal");
+    time_addEvent(0x1388, 0, 0, Seal1_restart, NULL);
+}
+static void Seal1_changeStage(void *ctx) {
+    (void)ctx;
+    Sound_PlaySound("Scream", 0.5f, 1, 0, 0, 0);
+    Sprite *f = &FoscariRun.Fog, *b = &FoscariRun.Darkness;
+    sprite_init(b, frame_get("vfx", "blackDot.png"), 0, 0), sprite_setOrigin(b, 0, 0), b->scrollFactor0 = 1, b->scaleX = game_width, b->scaleY = game_height, b->alpha = 0, b->depth = 0x1771;
+    sprite_init(f, frame_get("vfx", "fog.png"), 0, 0), sprite_setOrigin(f, 0, 0), f->scrollFactor0 = 1, f->scaleX = game_width / 160.0f, f->scaleY = game_height / 100.0f, f->alpha = 0, f->depth = 0xbb9;
+    children_add(b), children_add(f);
+    tweens_add((TweenConfig){ .props = { { &f->alpha, NULL, 1 }, { &b->alpha, NULL, 1 } }, .nprops = 2, .duration = 0x1f4, .onComplete = Seal1_toggleUI });
+}
+static void Seal_OnDestroyed(Destructible *d);
+static void Seal2_shake(void *ctx) { (void)ctx; Sound_PlayMusic("TheEndIndeed", 1.5f, 1); Seal_shake(312); }
+static void Seal2_panBack(void *ctx) { (void)ctx; tweens_add((TweenConfig){ .props = { { &CamPan.k, NULL, 0 } }, .nprops = 1, .duration = 0x1f4, .onComplete = Jen_camBack }); }
+static void Fosc2_OnSeal2Destroyed(void);
+static void Seal2_done(void *ctx) {
+    (void)ctx;
+    Fosc2_OnSeal2Destroyed();
+    Core.canInterrupt = 1, Core.canPause = 1;
+    PlayerUI.hpBarBG.visible = PlayerUI.hpBar.visible = 1;
+    Core.tickerEvent = time_addEvent(0x3e8, 1, 0, Core_OnTickerEvent, NULL);  // RestoreTickerEvent
+    Stage_startTimers(Core.Stage);
+}
+static void Fosc2_FreeJeneviv(void *ctx);
+static void Seal_OnDestroyed(Destructible *d) {
+    if (d->alreadyDestroyed) return;
+    if (d->sealKind == 1) {
+        if (!po_has("UnlockedStages", "FOSCARI2")) po_push("UnlockedStages", "FOSCARI2");
+        FoscariRun.n = 0, FoscariRun.nEvent = 0;
+        Foscari_stashWeapons();
+        Seal_common(d);
+        time_addEvent(0x1388, 0, 0, Seal1_shakeEarth, NULL);
+        time_addEvent(0x1770, 0, 0, Seal1_removeWater, NULL);
+        time_addEvent(0x3a98, 0, 0, Seal1_changeStage, NULL);
+    } else if (d->sealKind == 2) {
+        Seal_common(d);
+        time_addEvent(0x1388, 0, 0, Seal2_shake, NULL);
+        time_addEvent(0x1b58, 0, 0, Seal2_panBack, NULL);
+        time_addEvent(0x2710, 0, 0, Seal2_done, NULL);
+    } else {
+        Seal_common(d);
+        tweens_add((TweenConfig){ .props = { { &SFXVolumeFactor, NULL, 0.1f } }, .nprops = 1, .duration = 0x9c4 });
+        time_addEvent(0x1388, 0, 0, Fosc2_FreeJeneviv, d);
+    }
+}
+static void Seal_dev(void) {  // sviluppo: VS_FOSC=seal rompe il sigillo presente
+    for (int i = 0; i < Core.n_destructiblesPools; i++) for (int k = 0; k < Core.destructiblesPools[i]->n_spawned; k++) {
+        Destructible *d = Core.destructiblesPools[i]->spawned[k];
+        if (d->sealKind == (getenv("VS_F2OPEN") ? 3 : d->sealKind)) { Seal_OnDestroyed(d); return; }
+    }
+}
+static void Seal_GetDamaged(Destructible *d, float amount) {  // bullet nel chiamante (Destructible_hitBy)
+    int k = d->sealKind - 1;
+    if (d->isDead || !Destructible_hitBy || !Player_is(Core.Player, SealKey[k].ch) || strcmp(Destructible_hitBy, SealKey[k].weapon)) return;
+    if (fabsf(d->s.x - Core.Player->s.x) >= 0.45f * game_width || fabsf(d->s.y - Core.Player->s.y) >= 0.45f * game_height) return;
+    d->hp -= amount;
+    if (d->hp <= 0) { d->isDead = 1; Seal_OnDestroyed(d); } else Destructible_OnGetDamaged(d);
+}
+
+// --- Lake Foscari (0xf7e2): l'acqua: lo shader finche' c'e' il primo sigillo, poi l'animazione ---------------------------------------------------
+#ifdef __vita__
+#define WATER_DIV 4        // 1/4 di risoluzione sulla Vita: misurato a 60 fps
+#else
+#define WATER_DIV 1
+#endif
+static const char WATER_FS[] =
+    "uniform float time;\nuniform vec2 resolution;\n"
+    "vec4 water(vec2 fragCoord) {\n"
+    "    float varTime = time * .5 + 23.0;\n"
+    "    vec2 uv = fragCoord.xy / resolution.xy;\n"
+    "    vec2 p = mod(uv * 6.28318530718, 6.28318530718) - 250.0;\n"
+    "    vec2 i = vec2(p);\n    float c = 1.0;\n    float inten = .005;\n"
+    "    for (int n = 0; n < 5; n++) {\n"
+    "        float t = varTime * (1.0 - (3.5 / float(n + 1)));\n"
+    "        i = p + vec2(cos(t - i.x) + sin(t + i.y), sin(t - i.y) + cos(t + i.x));\n"
+    "        c += 1.0 / length(vec2(p.x / (sin(i.x + t) / inten), p.y / (cos(i.y + t) / inten)));\n"
+    "    }\n"
+    "    c /= float(5);\n    c = 1.17 - pow(c, 1.4);\n"
+    "    vec3 colour = vec3(pow(abs(c), 8.0));\n"
+    "    colour = clamp(colour + vec3(0.0, 0.35, 0.5), 0.0, 1.0);\n"
+    "    return vec4(colour, 1.0);\n}\n";
+static struct { Shader sh; RenderTexture2D rt; int locTime, locRes, ok; float time; Sprite image; } Water;
+static void Water_draw(Sprite *s) {  // image di 'rt_waterFoscari': scala 2 sulla sua meta' schermo
+    if (!s->visible || s->alpha <= 0 || !Water.ok) return;
+    float res[2] = { (float)Water.rt.texture.width, (float)Water.rt.texture.height };
+    SetShaderValue(Water.sh, Water.locTime, &Water.time, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(Water.sh, Water.locRes, res, SHADER_UNIFORM_VEC2);
+    EndShaderMode();
+    float w = Water.rt.texture.width * WATER_DIV * s->scaleX, h = Water.rt.texture.height * WATER_DIV * s->scaleY;
+    DrawTexturePro(Water.rt.texture, (Rectangle){ 0, 0, Water.rt.texture.width, -Water.rt.texture.height }, (Rectangle){ s->x - w / 2, s->y - h / 2, w, h }, (Vector2){ 0, 0 }, 0, (Color){ 255, 255, 255, (unsigned char)(255 * fminf(1, s->alpha)) });
+}
+static void Water_InitVFX(void) {
+    if (!Water.ok) {
+        char fs[4096];
+#ifdef __vita__
+        snprintf(fs, sizeof fs, "#version 100\nprecision mediump float;\nvarying vec2 fragTexCoord;\n%svoid main() { gl_FragColor = water(gl_FragCoord.xy); }\n", WATER_FS);
+#else
+        snprintf(fs, sizeof fs, "#version 330\nin vec2 fragTexCoord;\nout vec4 finalColor;\n%svoid main() { finalColor = water(gl_FragCoord.xy); }\n", WATER_FS);
+#endif
+        Water.sh = LoadShaderFromMemory(NULL, fs);
+        Water.locTime = GetShaderLocation(Water.sh, "time"), Water.locRes = GetShaderLocation(Water.sh, "resolution");
+        Water.rt = LoadRenderTexture(game_width / 2 / WATER_DIV, game_height / 2 / WATER_DIV);
+        Water.ok = 1;
+    }
+    sprite_init(&Water.image, NULL, 0.5f * game_width, 0.5f * game_height);
+    sprite_setScale(&Water.image, 2);
+    Water.image.draw = Water_draw, Water.image.scrollFactor0 = 1, Water.image.depth = -0x2710;
+    children_add(&Water.image);
+    FoscariWaterAlpha = &Water.image.alpha, FoscariWaterScale = &Water.image.scaleX;
+}
+static void Water_render(float delta) {  // la Shader di Phaser si ridisegna a ogni frame nella sua texture
+    Water.time += delta / 1000;
+    if (!Water.ok || Water.image.alpha <= 0) return;
+    float res[2] = { (float)Water.rt.texture.width, (float)Water.rt.texture.height };
+    SetShaderValue(Water.sh, Water.locTime, &Water.time, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(Water.sh, Water.locRes, res, SHADER_UNIFORM_VEC2);
+    BeginTextureMode(Water.rt);
+    BeginShaderMode(Water.sh);
+    DrawRectangle(0, 0, Water.rt.texture.width, Water.rt.texture.height, WHITE);
+    EndShaderMode();
+    EndTextureMode();
+}
+static struct { TileSprite water; Texture2D frames[8]; float clock; int hasMagic; } FL;
+static Vector2 Scripts_pos(const char *name, float dx, float dy) {  // getObjectLayer('Scripts'), con il valore di riserva dell'originale
+    cJSON *o;
+    cJSON_ArrayForEach(o, tilemap_getObjectLayerObjects(Core.Stage->tilingTileset->MainMap, "Scripts"))
+        if (str(o, "name") && !strcmp(str(o, "name"), name)) return (Vector2){ num(o, "x", dx), num(o, "y", dy) };
+    return (Vector2){ dx, dy };
+}
+static int Ach_achieved(const char *key) { return cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetObjectItem(data_get("achievements"), key), "achieved")) || po_has("Achievements", key); }
+static void Foscari_Create(void) {
+    FL.hasMagic = !Ach_achieved("FOSC10_BreakSeal1");
+    FoscariWaterAlpha = NULL;
+    if (FL.hasMagic) Water_InitVFX();
+    else {
+        char n[16];
+        for (int i = 0; i < 8; i++) snprintf(n, sizeof n, "water%d.png", i + 1), FL.frames[i] = frame_texture("background_Foscari", n);
+        sprite_init(&FL.water.s, NULL, 0.5f * game_width, 0.5f * game_height);
+        FL.water.s.draw = TileSprite_draw, FL.water.s.scrollFactor0 = 1, FL.water.s.depth = -0x2711, FL.water.s.tint = 0xffffff;
+        FL.water.tex = frame_texture("background_Foscari", "bg_foscari.png"), FL.water.w = game_width, FL.water.h = game_height;
+        children_add(&FL.water.s);
+        FL.clock = 0;
+    }
+    Vector2 p = Scripts_pos("FS_SEAL1", 0x2260, 0x680);
+    if (FL.hasMagic) {
+        Destructible *d = Core_MakeDestructibleAt("FOSCARI_SEAL_1", p);
+        if (d) d->sealKind = 1, Seal_MakeLevelOne(d);
+    } else Core_MakeStagePickup(p.x, p.y, "WEAPON", "ACADEMYBADGE");
+}
+static void FLake_Update(float delta) {
+    if (FL.hasMagic) { Water_render(delta); return; }
+    FL.clock += delta;  // setFrame(waterAnim.frame.name): l'acqua cambia a 8 fps
+    FL.water.tex = FL.frames[(int)(FL.clock / 125) % 8];
+    FL.water.tilePositionX = Core.Player->s.x, FL.water.tilePositionY = Core.Player->s.y;
+}
+static void Foscari_OnInitCompleted(void) { Core_SetHardBounds(0x100, 0x100, 0x2700, 0x2700); }
+static const FancyBG FB_Foscari = { .Create = Foscari_Create, .Update = FLake_Update, .OnInitCompleted = Foscari_OnInitCompleted };
+
+// --- Abyss Foscari (0xba51): il battito ferma i nemici; il muro nero, il secondo e il terzo sigillo, Jeneviv -------------------------------------
+static struct {
+    TileSprite water;
+    Sprite sDarkness, sBlackWall, sFader, PizzaSprite;
+    ParticleManager *pm, *shadowPm;
+    ParticleEmitter *glitch1, *glitch2, *Shadow;
+    EnemyPool *poolJeneviv;
+    int isBeating, beats, canPizza, isJenevivSealed, isPathBlocked, CheckForLuminaire;
+    float tilingOffset, waterOffset, pizzaX, pizzaY;
+    Timer beatEvent, luminairePathEvent;
+    char saveBGM[48], saveBGMMod[48];
+    Sprite luminaire;
+    Animation lumWalk;
+} F2;
+static void Fosc2_ResumeEnemiesMovement(void) {
+    for (int i = 0; i < Core.Enemies.n; i++) {
+        Enemy *e = Core.Enemies.items[i]->owner;
+        anims_resume(&e->s);
+        e->conditional_canMove = 1;
+    }
+    Enemy_beatMode = 1;
+}
+static void Fosc2_onBeat(void *ctx) {
+    (void)ctx;
+    F2.beats++;
+    if (F2.beats % 2 == 0) {
+        Enemy_beatMode = 1;
+        for (int i = 0; i < Core.Enemies.n; i++) {
+            Enemy *e = Core.Enemies.items[i]->owner;
+            if (e->isDead) continue;
+            anims_pause(&e->s);
+            e->conditional_canMove = 0;
+            sprite_setVelocity(&e->s, 0, 0);
+        }
+    } else Fosc2_ResumeEnemiesMovement();
+}
+static void Fosc2_StopBeat(void) {
+    if (!F2.isBeating) return;
+    F2.isBeating = 0;
+    time_removeEvent(F2.beatEvent);
+    Core.Stage->StageModifiers.EnemySpeed -= 1;
+    Stage_CalculateEnemySpeed(Core.Stage);
+}
+static void Fosc2_OnJenevivActivation(void) { Fosc2_StopBeat(), Fosc2_ResumeEnemiesMovement(); }
+static void Fosc2_ForceSpoopyMusic(void) { po_sets("SelectedBGM", "BGM_Foscari2"), po_sets("SelectedBGMMod", "Normal"); Sound_SetupAndPlayBGM_Banger(1); }
+static void Fosc2_SetBoundsBeforeSeal2(void) {
+    if (po_is("SelectedInverse")) Core_SetHardBounds(0x100, 0x100, 0x1500, 0x2700), F2.sBlackWall.x = 0x1400;
+    else Core_SetHardBounds(0x1400, 0x100, 0x2700, 0x2700);
+}
+static void Fosc2_wallGone(void *ctx) { (void)ctx; F2.sBlackWall.visible = 0; }
+static void Fosc2_openBounds(void *ctx) {
+    (void)ctx;
+    Core_SetHardBounds(0x100, 0x100, 0x2700, 0x2700);
+    tweens_add((TweenConfig){ .props = { { &F2.sBlackWall.x, NULL, F2.sBlackWall.x - 0x400 }, { &F2.sBlackWall.alpha, NULL, 0 } }, .nprops = 2, .duration = 0x1388, .onComplete = Fosc2_wallGone });
+}
+static void Fosc2_OnSeal2Destroyed(void) {
+    Fosc2_ForceSpoopyMusic();
+    F2.isPathBlocked = 0;
+    tweens_add((TweenConfig){ .props = { { &F2.sBlackWall.x, NULL, F2.sBlackWall.x - 0x100 } }, .nprops = 1, .duration = 0x1388, .onComplete = Fosc2_openBounds });
+}
+static void Fosc2_SummonSnakes(void *ctx) {
+    (void)ctx;
+    PlayCircle(0, 0x32, "FS_SNAKSHIELD", 1.4f);
+    PlayCircle(0, 0x32, "FS_SNAKSHIELD", 1.5f);
+    Seal_shake(6);
+}
+static void Fosc2_wave1(void *ctx) { (void)ctx; if (po_is("SelectedGoldenEggs")) EggManager_RemoveBonuses(); Fosc2_SummonSnakes(NULL); }  // DevourEggs: semplificazione: le uova che volano sono solo un effetto; il bonus sparisce davvero
+static const char *const Fosc2_starters[2] = { "WHIP", "MAGIC_MISSILE" };
+static void Fosc2_OnWorldEater(void *ctx) {
+    (void)ctx;
+    Jen_CastWorldEater(NULL);
+    FoscariRun.n = 0, FoscariRun.nEvent = 0;
+    for (int i = 0; i < Core.n_weapons; i++) MainUI_Remove(Core.Weapons[i]->bulletType);
+    Foscari_stashWeapons();  // l'originale tiene i PowerUp: non sparano comunque
+    float px = Core.Player->s.x, py = Core.Player->s.y, d = 0.6f * game_height;
+    for (int k = 0; k < 2; k++) {  // CreateWeapons
+        Pickup *p = Core_MakeStagePickup(k ? px + 0xc8 : px - 0xc8, py + d, "WEAPON", Fosc2_starters[k]);
+        if (p) p->despawnOnUnavailable = 0, p->hasSpawned = 1;
+    }
+}
+static void Fosc2_luminaireTick(void *ctx) {
+    (void)ctx;
+    float x = Core.Player->s.x, y = Core.Player->s.y + 0.25f * game_height;
+    Weapon *pm = Core_GetWeapon("PRISMATICMISS");
+    Weapon *g = Core_GetWeapon("GROWTH");
+    const char *give = !pm || pm->level < 8 ? "PRISMATICMISS" : !g || g->level < 5 ? "GROWTH" : NULL;
+    if (give) {
+        Pickup *p = Core_MakeStagePickup(x, y, "WEAPON", give);
+        if (p) p->despawnOnUnavailable = 0, GizmoManager_ShowHighlightAt(x, y), p->hasSpawned = 1;
+        return;
+    }
+    int lv = 0;
+    Stage_SetTreasureLevelFromChance(Stalker_treasure(), &lv);  // [0.1, 5, 100]: mai letti, come per lo Stalker
+    Core_MakeTreasure(x, y, Stalker_treasure(), lv);
+    GizmoManager_ShowHighlightAt(x, y);
+    F2.CheckForLuminaire = 1;
+}
+static void Fosc2_light(void *ctx) {
+    (void)ctx;
+    Core.canInterrupt = 1, Core.canPause = 1;
+    time_removeEvent(F2.luminairePathEvent);
+    F2.luminairePathEvent = time_addEvent(0x2710, 1, 0, Fosc2_luminaireTick, NULL);
+}
+static void Fosc2_lumBGM(void *ctx) { (void)ctx; po_sets("SelectedBGM", "BGM_Luminaire"), po_sets("SelectedBGMMod", "Normal"); Sound_SetupAndPlayBGM_Banger(1); }
+static void Fosc2_lumArrived(void *ctx) { (void)ctx; MainUI.SurvivedSecondsText.s.visible = 0; }
+static void Fosc2_LuminaireArrives(void) {
+    Jen_RestoreShield(Jeneviv);
+    time_removeEvent(F2.luminairePathEvent);
+    F2.CheckForLuminaire = 0;
+    Sound_FadeMusic(0, 0x1f4);
+    Core.canInterrupt = 0, Core.canPause = 0;
+    time_addEvent(0x3e8, 0, 0, Fosc2_lumBGM, NULL);
+    Sprite *s = &F2.luminaire;
+    make_anim(&F2.lumWalk, "foscariChars", "Luminaire_i0", 1, 5, 0, 8, -1);
+    sprite_init(s, NULL, 0.25f * game_width, 1.2f * game_height);
+    sprite_setScale(s, 2), s->scrollFactor0 = 1;
+    children_add(s);
+    anims_play(s, &F2.lumWalk, 0);
+    tweens_add((TweenConfig){ .props = { { &s->scaleX, &s->scaleY, 1 }, { &s->x, NULL, 0.5f * game_width }, { &s->y, NULL, 0x20 } }, .nprops = 3, .ease = Ease_SineInOut, .duration = 0x5dc, .onComplete = Fosc2_lumArrived });
+}
+static void Fosc2_camFollow(void *ctx) { (void)ctx; }
+static void Fosc2_FreeJeneviv(void *ctx) {
+    (void)ctx;
+    Fosc2_StopBeat(), Fosc2_ResumeEnemiesMovement();
+    CamPan.fromX = CamPan_target()->x, CamPan.fromY = CamPan_target()->y, CamPan.hasFrom = 1, CamPan.on = 1, CamPan.k = 0, CamPan.sp = NULL, CamPan.e = Jeneviv;
+    tweens_add((TweenConfig){ .props = { { &CamPan.k, NULL, 1 } }, .nprops = 1, .duration = 0x1f4, .onComplete = Fosc2_camFollow });
+    po_sets("SelectedBGM", "BGM_Genevieve"), po_sets("SelectedBGMMod", "Normal");
+    Sound_SetupAndPlayBGM_Banger(1);
+    Core.canInterrupt = 0, Core.canPause = 0;
+    time_addEvent(0x1b58, 0, 0, Fosc2_wave1, NULL);
+    time_addEvent(0x34bc, 0, 0, Fosc2_SummonSnakes, NULL);
+    time_addEvent(0x5014, 0, 0, Fosc2_SummonSnakes, NULL);
+    time_addEvent(0x7530, 0, 0, Jen_BreakFree1, NULL);
+    time_addEvent(0x82dc, 0, 0, Jen_StartMoving, NULL);
+    time_addEvent(0x9088, 0, 0, Jen_BreakFree2, NULL);
+    time_addEvent(0xb798, 0, 0, Jen_ChargeWorldEater, NULL);
+    time_addEvent(0xc350, 0, 0, Fosc2_OnWorldEater, NULL);
+    time_addEvent(0xfde8, 0, 0, Jen_StartVerySmartAI, Jeneviv);
+    time_addEvent(0x11170, 0, 0, Fosc2_light, NULL);
+}
+static void Fosc2_CheckPizzas(void) {
+    if (!F2.canPizza || !F2.PizzaSprite.frame) return;
+    float dx = Core.Player->s.x - F2.pizzaX, dy = Core.Player->s.y - F2.pizzaY;
+    if (dx * dx + dy * dy > 0x10 * 0x10) return;
+    F2.canPizza = 0;
+    Fosc2_StopBeat(), Fosc2_ResumeEnemiesMovement();
+    Sound_PlaySound("Bumper", 1, 1, 0, 0x64, 4);
+    F2.PizzaSprite.alpha = 0.65f;
+    tweens_add((TweenConfig){ .props = { { &F2.PizzaSprite.scaleX, &F2.PizzaSprite.scaleY, 1.5f }, { &F2.PizzaSprite.alpha, NULL, 0 } }, .nprops = 2, .ease = Ease_BounceOut, .duration = 0x12c, .onComplete = Sprite_hide, .ctx = &F2.PizzaSprite });
+}
+static void Fosc2_Create(void) {
+    memset(&F2, 0, sizeof F2);
+    F2.canPizza = 1, F2.isJenevivSealed = 1, F2.isPathBlocked = 1;
+    F2.beatEvent = F2.luminairePathEvent = (Timer){ -1, 0 };
+    Rectangle top = { -0x40, 0, game_width, 0x40 }, bot = { -0x40, game_height - 0x40, game_width, 0x40 };
+    F2.pm = particles_add();
+    F2.pm->scrollFactor0 = 1;
+    for (int k = 0; k < 2; k++) {
+        ParticleEmitter *e = particles_createEmitter(F2.pm, (EmitterConfig){ .frames = { frame_get("vfx", "trueBlack.png") }, .nframes = 1, .lifespan = ERND(0x64, 0x96), .quantity = 0x64, .scale = ERANGE(1, game_width), .scaleY = ERANGE(1, 1), .hasScaleY = 1,
+            .alpha = ERANGE(0.25f, 1), .hasZoneRect = 1, .zoneRect = k ? bot : top, .frequency = 0x64, .on = 0 });
+        if (k) F2.glitch2 = e; else F2.glitch1 = e;
+    }
+    static Vector2 line[0x40];
+    for (int i = 0; i < 0x40; i++) line[i] = (Vector2){ 0, -game_height + i * (3.0f * game_height / 0x3f) };
+    F2.shadowPm = particles_add();
+    F2.Shadow = particles_createEmitter(F2.shadowPm, (EmitterConfig){ .frames = { frame_get("vfx", "Smoke1.png"), frame_get("vfx", "Smoke2.png") }, .nframes = 2, .lifespan = ERND(0x64, 0x96), .speed = ERND(0x64, 0x96), .quantity = 0x64, .scale = ERANGE(1, 2),
+        .alpha = ERANGE(1, 0), .tint = 0x000001, .edge = line, .nEdge = 0x40, .frequency = 0x64, .on = 0 });  // zona: una linea; 0x000001: tint 0 vuol dire "nessuna"
+    F2.pm->s.depth = F2.shadowPm->s.depth = 0x2710;
+    F2.poolJeneviv = EnemyPool_new("FS_BOSS_JENEVIV");
+    if (Ach_achieved("FOSC11_BreakSeal2") || getenv("VS_F2OPEN")) F2.isPathBlocked = 0;  // VS_F2OPEN: sviluppo, senza il secondo sigillo
+    if (Ach_achieved("FOSC12_BreakSeal3")) F2.isJenevivSealed = Player_is(Core.Player, "ELEANOR");
+    snprintf(F2.saveBGM, sizeof F2.saveBGM, "%s", po_str("SelectedBGM"));
+    snprintf(F2.saveBGMMod, sizeof F2.saveBGMMod, "%s", po_str("SelectedBGMMod"));
+    F2.waterOffset = po_is("SelectedInverse") ? 0.05f : -0.05f;
+    sprite_init(&F2.water.s, NULL, 0.5f * game_width, 0.5f * game_height);
+    F2.water.s.draw = TileSprite_draw, F2.water.s.scrollFactor0 = 1, F2.water.s.depth = -0xdbb9f, F2.water.s.tint = 0xffffff;
+    F2.water.tex = frame_texture("background_Foscari", po_is("SelectedInverse") ? "bg_foscari_inv.png" : "bg_foscari.png"), F2.water.w = game_width, F2.water.h = game_height;
+    children_add(&F2.water.s);
+    sprite_init(&F2.sDarkness, frame_get("vfx", "stageShadows.png"), 0, 0);
+    sprite_setOrigin(&F2.sDarkness, 0, 0);
+    F2.sDarkness.scrollFactor0 = 1, F2.sDarkness.scaleX = game_width / 160.0f, F2.sDarkness.scaleY = game_height / 100.0f, F2.sDarkness.depth = 0x2710;
+    children_add(&F2.sDarkness);
+    sprite_init(&F2.sBlackWall, frame_get("vfx", "trueBlack.png"), 0, 0);
+    sprite_setOrigin(&F2.sBlackWall, 0, 0);
+    F2.sBlackWall.scaleX = 0x1400, F2.sBlackWall.scaleY = 0x2800, F2.sBlackWall.depth = 0x2710;
+    children_add(&F2.sBlackWall);
+    F2.beatEvent = time_addEvent(0x19b, 1, 0, Fosc2_onBeat, NULL);  // gimmeAbeat
+    F2.isBeating = 1;
+    Core.Stage->StageModifiers.EnemySpeed += 1;
+    Stage_CalculateEnemySpeed(Core.Stage);
+    if (FoscariRun.nEvent > 0) {  // le armi lasciate al lago, in cerchio
+        float step = 0x168 / (float)FoscariRun.nEvent;
+        for (int i = 0; i < FoscariRun.nEvent; i++) {
+            const char *t = FoscariRun.eventW[i];
+            cJSON *d = cJSON_GetArrayItem(cJSON_GetObjectItem(data_get("weapons"), t), 0), *from = cJSON_GetObjectItem(d, "evolvesFrom");
+            if (cJSON_IsTrue(cJSON_GetObjectItem(d, "isEvolution")) && cJSON_GetArrayItem(from, 0)) t = cJSON_GetArrayItem(from, 0)->valuestring;
+            Core_MakeStagePickup(Core.Player->s.x + cosf(step * i) * 0xc8, Core.Player->s.y + sinf(step * i) * 0xc8, "WEAPON", t);
+        }
+        FoscariRun.nEvent = 0;
+        sprite_init(&F2.sFader, frame_get("vfx", "blackDot.png"), 0, 0);
+        sprite_setOrigin(&F2.sFader, 0, 0);
+        F2.sFader.scrollFactor0 = 1, F2.sFader.scaleX = game_width, F2.sFader.scaleY = game_height, F2.sFader.depth = 0x2710;
+        children_add(&F2.sFader);
+        tweens_add((TweenConfig){ .props = { { &F2.sFader.alpha, NULL, 0 } }, .nprops = 1, .duration = 0x3e8 });
+    }
+    if (F2.isPathBlocked) {
+        Destructible *d = Core_MakeDestructibleAt("FOSCARI_SEAL_2", Scripts_pos("FS_SEAL2", 0x2260, 0x680));
+        if (d) d->sealKind = 2, Seal_MakeLevelOne(d);
+    } else F2.sBlackWall.visible = 0, Core_MakeStagePickup(Scripts_pos("FS_SEAL2", 0x2260, 0x680).x, Scripts_pos("FS_SEAL2", 0x2260, 0x680).y, "WEAPON", "ACADEMYBADGE");
+    Vector2 jp = Scripts_pos("FS_JENEVIV", 0x2260, 0x680);
+    if (F2.isJenevivSealed) {
+        Fosc2_ForceSpoopyMusic();
+        Destructible *d = Core_MakeDestructibleAt("FOSCARI_SEAL_3", Scripts_pos("FS_SEAL3", 0x2260, 0x680));
+        if (d) d->sealKind = 3, Seal_MakeLevelOne(d);
+        Enemy *e = EnemyPool_SpawnAt(F2.poolJeneviv, jp.x, jp.y);
+        if (e) Jen_SealInStone(e);
+    } else {
+        Vector2 s = Scripts_pos("FS_SEAL3", 0x2260, 0x680);
+        Core_MakeStagePickup(s.x, s.y, "WEAPON", "SHADOWSERVANT");
+        Vector2 pz = Scripts_pos("FS_PIZZA", Core.Player->s.x, Core.Player->s.y - 0xc8);
+        F2.pizzaX = pz.x, F2.pizzaY = pz.y;
+        sprite_init(&F2.PizzaSprite, frame_get("items", "PizzaTime.png"), pz.x, pz.y);
+        F2.PizzaSprite.depth = -game_height;
+        children_add(&F2.PizzaSprite);
+        Enemy *e = EnemyPool_SpawnAt(F2.poolJeneviv, jp.x, jp.y);
+        if (e) ((JenX *)e->x)->OnActivated = Fosc2_OnJenevivActivation;
+    }
+}
+static void Fosc2_CheckMinute(int m) {
+    if (m == 0x19) {
+        emitter_start(F2.glitch1), emitter_start(F2.glitch2);
+        Sound_PlaySound("WorldEater", 1.5f, 0.5f, 0, 0, 0), Sound_PlaySound("WorldEater", 1.5f, 0.25f, 0, 0, 0);
+        Sound_PlaySound("Haha", 1.5f, 0.5f, 0, 0, 0), Sound_PlaySound("Haha", 1.5f, 0.25f, 0, 0, 0);
+    } else if (m == 0x1a) emitter_stop(F2.glitch1), emitter_stop(F2.glitch2);
+}
+static void Fosc2_Update(float delta) {
+    F2.tilingOffset += F2.waterOffset * delta;
+    F2.water.tilePositionX = Core.Player->s.x;
+    F2.water.tilePositionY = Core.Player->s.y + F2.tilingOffset;
+    if (F2.canPizza) Fosc2_CheckPizzas();
+    if (F2.isPathBlocked) emitter_emitParticleAt(F2.Shadow, 0x1400, Core.Player->s.y, 0);
+    if (F2.CheckForLuminaire && Core_GetWeapon("PRISMATICMISS2")) Fosc2_LuminaireArrives();
+    FZones_Update();
+}
+static void Fosc2_OnInitCompleted(void) {
+    if (F2.isPathBlocked) Fosc2_SetBoundsBeforeSeal2();
+    else Core_SetHardBounds(0x100, 0x100, 0x2700, 0x2700);
+    if (!po_has("CollectedItems", "RELIC_BANGER")) Sound_StopMusic();
+}
+static const FancyBG FB_Foscari2 = { .Create = Fosc2_Create, .Update = Fosc2_Update, .CheckMinute = Fosc2_CheckMinute, .OnInitCompleted = Fosc2_OnInitCompleted };
+static void Foscari_OnDestroy(void) {  // fancyBG.OnDestroy
+    Enemy_beatMode = 0;
+    if (!Core.Stage || strcmp(Core.Stage->stageType, "FOSCARI2")) return;
+    if (F2.saveBGM[0]) po_sets("SelectedBGM", F2.saveBGM), po_sets("SelectedBGMMod", F2.saveBGMMod);
+    time_removeEvent(F2.beatEvent);
+    for (int i = 0; i < FoscariRun.n && Core.n_weapons < 16; i++) {  // playerWeapons: tornano nelle statistiche del riepilogo
+        Weapon *w = FoscariRun.saved[i];
+        int known = 0;
+        for (int k = 0; k < Core.n_weapons; k++) known |= Core.Weapons[k] == w;
+        if (!known && !w->isPowerUp && !Core_GetHiddenWeapon(w->bulletType)) Core.Weapons[Core.n_weapons++] = w;
+    }
+    FoscariRun.n = 0;
+}
 static void Chapel_SecretCreate(void) {
     memset(&ChS, 0, sizeof(ChS));
     memset(&CamPan, 0, sizeof(CamPan));
@@ -17120,8 +21313,10 @@ static void E_Ender_Die(Enemy *e) {
 }
 static const EnemyVT E_Ender = { .OnRecycle = E_Ender_OnRecycle, .Die = E_Ender_Die, .GetDamaged = E_Ender_GetDamaged, .Update = E_Ender_Update };
 static const Sprite *CamPan_target(void) {
-    if (!CamPan.on || !CamPan.e) return &Core.Player->s;
-    CamPan.s.x = Core.Player->s.x + (CamPan.e->s.x - Core.Player->s.x) * CamPan.k, CamPan.s.y = Core.Player->s.y + (CamPan.e->s.y - Core.Player->s.y) * CamPan.k;
+    const Sprite *t = !CamPan.on ? NULL : CamPan.sp ? CamPan.sp : CamPan.e ? &CamPan.e->s : NULL;
+    if (!t) return &Core.Player->s;
+    float fx = CamPan.hasFrom ? CamPan.fromX : Core.Player->s.x, fy = CamPan.hasFrom ? CamPan.fromY : Core.Player->s.y;  // hasFrom: da dov'era la camera (Jeneviv)
+    CamPan.s.x = fx + (t->x - fx) * CamPan.k, CamPan.s.y = fy + (t->y - fy) * CamPan.k;
     return &CamPan.s;
 }
 
@@ -18990,6 +23185,12 @@ static void Core_InitGame(const char *character) {
     if (opn && !strncmp(opn, "item=", 5)) Core.FoundWeaponQueue[Core.n_FoundWeaponQueue++] = opn + 5;
     if (getenv("VS_CHEST"))  // sviluppo: VS_CHEST=1..3 forziere (dati del minuto 1) sotto il giocatore
         Core_MakeTreasure(Core.Player->s.x, Core.Player->s.y, cJSON_GetObjectItem(cJSON_GetArrayItem(cJSON_GetObjectItem(data_get("stages"), "FOREST"), 1), "treasure"), atoi(getenv("VS_CHEST")));
+    Foscari_AfterFullInit(Core.Player);
+    if (getenv("VS_FOSC")) time_addEvent(0xbb8, 0, 0, Foscari_dev, NULL);  // sviluppo: VS_FOSC=<livello>|breath|revive a 3 s
+    if (Player_is(Core.Player, "SYUUTO")) {  // 0xbc52: la Night Sword nascosta spara solo per ritorsione
+        Weapon *ns = Core_GetHiddenWeapon("NIGHTSWORD");
+        if (ns) W_NightSword_SetAsRetaliatoryOnly(ns), ns->skipAddingEvolution = 1;
+    }
     LootManager_Init();  // Player.AfterFullInitialization, LootManager.Init + RecalculateLoot
     LootManager_RecalculateLoot();
     BGMan_MakeBackground(Core.Stage->BGTextureName, Core.Stage);
@@ -20307,12 +24508,21 @@ static int strin_removed(const char *t) {  // Core.RemovedWeapons.find(bulletTyp
 }
 static void WeaponSelectScene_open(void) {  // SceneManager.EnterWeaponSelection: pausa, musica giu', scena sopra
     static const char *const evo[] = { "VAMPIRICA", "HOLY_MISSILE", "THOUSAND", "SCYTHE", "HEAVENSWORD", "VESPERS", "HELLFIRE", "VORTEX", "BORA", "ROCHER",
-        "LOOP", "SIRE", "GUNS3", "STIGRANGATTI", "MANNAGGIA", "TRAPANO2", "SILF3", "VENTO2", "TRIASSO3" };  // getEvolvedWeapons (DLC: Moonspell)
+        "LOOP", "SIRE", "GUNS3", "STIGRANGATTI", "MANNAGGIA", "TRAPANO2", "SILF3", "VENTO2", "TRIASSO3" };  // getEvolvedWeapons
+    static const struct { const char *dlc, *ach, *w; } evoDlc[] = {
+        { "Moonspell", "MOON03_EvolveSilverWind", "SILVERWIND2" }, { "Moonspell", "MOON05_EvolveFourSeasons", "FOURSEASONS2" },
+        { "Moonspell", "MOON07_EvolveSummonNight", "SUMMONNIGHT2" }, { "Moonspell", "MOON09_EvolveMirageRobe", "MIRAGEROBE2" },
+        { "Moonspell", "MOON15_EvolveNightSword", "NIGHTSWORD2" }, { "Moonspell", "MOON17_EvolveBubbles", "BUBBLES2" },
+        { "Foscari", "FOSC05_UniteSpells", "SPELL_STROM" }, { "Foscari", "FOSC07_EvolveEskizzibur", "SWORD2" },
+        { "Foscari", "FOSC09_EvolveFlashArrow", "FLASHARROW2" }, { "Foscari", "FOSC14_EvolvePrismatic", "PRISMATICMISS2" },
+        { "Foscari", "FOSC16_EvolveShadow", "SHADOWSERVANT2" } };
     memset(&WS, 0, sizeof(WS));
     WS.active = 1;
     if (Core.WeaponSelectionEvo) {
         for (size_t i = 0; i < sizeof(evo) / sizeof(evo[0]); i++)
             if (!Core_GetWeapon(evo[i]) && !strin_removed(evo[i]) && WS.n < 95) WS.types[WS.n++] = evo[i];
+        for (size_t i = 0; i < sizeof(evoDlc) / sizeof(evoDlc[0]); i++)
+            if (DLC_Has(evoDlc[i].dlc) && achieved(evoDlc[i].ach) && !Core_GetWeapon(evoDlc[i].w) && !strin_removed(evoDlc[i].w) && WS.n < 95) WS.types[WS.n++] = evoDlc[i].w;
     } else {
         int n;
         const char *const *b = Weapon_baseList(&n);  // getBaseWeapons
@@ -21324,6 +25534,7 @@ static void Player_Revive(Player *p, float k) {
     p->hasLastBreath = 1;
     PlayerUI_Update();
     if (Player_is(p, "PAVONE")) Core_RosaryDamage();  // 0x14f3e
+    if (Player_is(p, "LUMINAIRE")) Lum_Revive(p);
 }
 // ============================================================================
 // 0xc450: AchievementManager (achievement e segreti sbloccati a fine partita; i premi: armi, personaggi, stage,
@@ -21359,6 +25570,7 @@ static void AchievementManager_UnlockAchievement(const char *k) {
     if (!a) { TraceLog(LOG_INFO, "VS: %s", k); return; }
     if (cJSON_IsTrue(cJSON_GetObjectItem(a, "achieved"))) return;
     obj_set(a, "achieved", cJSON_CreateTrue());
+    trophies_unlock(k);
     AM_grant(a);  // (sic) qui le armi restano hidden; UnlockSecret le mostra
     if (!po_has("Achievements", k)) po_push("Achievements", k);
     if (AM_nNew < 160) AM_NewAchievements[AM_nNew++] = cJSON_GetObjectItem(data_get("achievements"), k)->string;
@@ -21558,6 +25770,51 @@ static void AchievementManager_GetNewAchievementsEarnedOnThisRun(void) {
     if (Core.kills >= 0x186a0 && !strcmp(po_str("SelectedCharacter"), "SIGMA")) U("Defeat100kWithSigma");  // RunEnemies
     if (LUF.n_banished >= 0xa) U("Banish10Items");
     if (LUF.n_banished >= 0x14) U("Banish20Items");
+    if (DLC_Has("Foscari")) {  // CheckAchievements_Foscari
+        if (po_has("UnlockedCharacters", "ELEANOR")) U("FOSC01_FindCoffin");
+        if (killed("FS_BOSS_AGAEA") >= 1 && stageIs("FOSCARI")) U("FOSC20_DefeatBossLake");
+        if (killed("FS_BOSS_JENEVIV") >= 1 && stageIs("FOSCARI2")) U("FOSC21_DefeatBossAbyss");
+        if (secs >= 0x384 && charIs("ELEANOR")) U("FOSC02_Survive15Eleanor");
+        if (secs >= 0x384 && charIs("VICTOR")) U("FOSC06_Survive15Viktor");
+        if (secs >= 0x384 && charIs("KEIRA")) U("FOSC08_Survive15Keira");
+        if (secs >= 0x384 && charIs("LUMINAIRE")) U("FOSC13_Survive15Luminaire");
+        if (secs >= 0x384 && charIs("GENEVIEVE")) U("FOSC15_Survive15Genevieve");
+        Weapon *fw = Core_GetWeapon("SPELL_STREAM");
+        if (fw && fw->level >= 6) U("FOSC03_GetStreamToLevel6");
+        fw = Core_GetWeapon("SPELL_STRIKE");
+        if (fw && fw->level >= 6) U("FOSC04_GetStrikeToLevel6");
+        if (Core_GetWeapon("SPELL_STROM")) U("FOSC03_GetStreamToLevel6"), U("FOSC04_GetStrikeToLevel6"), U("FOSC05_UniteSpells");
+        if (Core_GetWeapon("SWORD2")) U("FOSC07_EvolveEskizzibur");
+        if (Core_GetWeapon("FLASHARROW2")) U("FOSC09_EvolveFlashArrow");
+        if (Core_GetWeapon("PRISMATICMISS2")) U("FOSC14_EvolvePrismatic");
+        if (Core_GetWeapon("SHADOWSERVANT2")) U("FOSC16_EvolveShadow");
+        if (Core.kills >= 0x186a0 && !strcmp(po_str("SelectedCharacter"), "GENEVIEVE")) U("FOSC17_Defeat100kGenevieve");
+        if (killed("FS_CAKE") >= 0x1770) U("FOSC18_Defeat6kFairy");
+        if (killed("FS_ROTGHOUL") >= 0x1770) U("FOSC19_Defeat6kHorror");
+        static const char *const seal[3] = { "FOSCARI_SEAL_1", "FOSCARI_SEAL_2", "FOSCARI_SEAL_3" }, *const sa[3] = { "FOSC10_BreakSeal1", "FOSC11_BreakSeal2", "FOSC12_BreakSeal3" };
+        for (int k = 0; k < 3; k++) if (num(cJSON_GetObjectItem(data_get("props"), seal[k]), "destroyedAmount", 0) >= 1) U(sa[k]);
+        if (hasItem("RELIC_MAP_FS")) U("FOSC22_FindMap_Foscari");
+    }
+    if (DLC_Has("Moonspell")) {  // CheckAchievements_Moonspell
+        if (po_has("UnlockedCharacters", "MIANG")) U("MOON01_FindCoffin");
+        if (killed("MS_OROCHIMARIO") >= 1 && stageIs("MOONSPELL")) U("MOON16_DefeatBossRuins");
+        if (secs >= 0x384 && charIs("MIANG")) U("MOON02_Survive15Miang");
+        if (secs >= 0x384 && charIs("MENYA")) U("MOON04_Survive15Menya");
+        if (secs >= 0x384 && charIs("SYUUTO")) U("MOON06_Survive15Syuuto");
+        if (secs >= 0x384 && charIs("ONNA")) U("MOON08_Survive15BabiOnna");
+        if (secs >= 0x384 && charIs("MCCOY")) U("MOON10_Survive15McCoy");
+        if (Core_GetWeapon("SILVERWIND2")) U("MOON03_EvolveSilverWind");
+        if (Core_GetWeapon("FOURSEASONS2")) U("MOON05_EvolveFourSeasons");
+        if (Core_GetWeapon("SUMMONNIGHT2")) U("MOON07_EvolveSummonNight");
+        if (Core_GetWeapon("MIRAGEROBE2")) U("MOON09_EvolveMirageRobe");
+        if (Core_GetWeapon("NIGHTSWORD2")) U("MOON15_EvolveNightSword");
+        if (Core_GetWeapon("BUBBLES2")) U("MOON17_EvolveBubbles");
+        if (Core.kills >= 0x186a0 && !strcmp(po_str("SelectedCharacter"), "MENYA")) U("MOON11_Defeat100kVanya");  // RunEnemies
+        if (Core.kills >= 0x186a0 && !strcmp(po_str("SelectedCharacter"), "SYUUTO")) U("MOON12_Defeat100kVadjouel");
+        if (killed("MS_KAPPA") >= 0x1770) U("MOON13_Defeat6kWater");
+        if (cJSON_IsTrue(cJSON_GetObjectItem(tbl0("weapons", "NIGHTSWORD"), "seen"))) U("MOON14_FindNightSword");
+        if (hasItem("RELIC_MAP_MS")) U("MOON18_FindMap_Moonspell");
+    }
 }
 #undef U
 static void AchievementManager_GetNewSecretsEarnedOnThisRun(void) {
@@ -21825,12 +26082,14 @@ static void Core_OnPlayerQuit(void) {
     GoldFever_CheckResults();
     IsHalloween = 0;
     Chapel_OnDestroy();  // fancyBG.OnDestroy
+    Foscari_OnDestroy();
 }
 static void PostGameScene_start(void) {  // scene.launch(PostGameScene)
     memset(&PG, 0, sizeof(PG));
     PG.active = 1;
     PG.tQuit = -1;
     Chapel_OnDestroy();  // create: fancyBG.OnDestroy
+    Foscari_OnDestroy();
     PostGameScene_SaveResults();
 }
 // SceneManager.GameOver: pausa della MainScene, musica a 0, poi GameOverScene
@@ -24083,6 +28342,11 @@ static void scene_update(float delta) {
     if (Core.Stage->fancyBG && Core.Stage->fancyBG->Update) Core.Stage->fancyBG->Update(delta);
     ShootingStars_Update(delta);  // StageEventManager.Update
     PlayDiamond_Update();
+    if (HasHardBounds) {
+        Sprite *p = &Core.Player->s;
+        if (p->x < HardBounds.x) p->x = HardBounds.x; else if (p->x > HardBounds.width) p->x = HardBounds.width;
+        if (p->y < HardBounds.y) p->y = HardBounds.y; else if (p->y > HardBounds.height) p->y = HardBounds.height;
+    }
 }
 
 // ============================================================================
@@ -25022,7 +29286,8 @@ static void StageStatsPanel_AssignData(const char *id) {
     obj_copy(mods, "tips", cJSON_GetObjectItem(s, "tips"));
     int shown = 0;
     for (int i = 0; i < 14; i++) {
-        if (!SS.stats[i].name || !(m = cJSON_GetObjectItem(mods, SS.stats[i].name))) continue;
+        if (!SS.stats[i].name) continue;
+        if (!(m = cJSON_GetObjectItem(mods, SS.stats[i].name))) { snprintf(SS.stats[i].nameText, sizeof(SS.stats[i].nameText), "--"); continue; }  // i DLC non hanno tips
         cJSON *d = SS.stats[i].def;
         int same = (cJSON_IsNumber(m) && cJSON_IsNumber(d) && m->valuedouble == d->valuedouble) || (cJSON_IsString(m) && cJSON_IsString(d) && !strcmp(m->valuestring, d->valuestring))
                 || (cJSON_IsNull(m) && cJSON_IsNull(d));  // value == default
@@ -25380,6 +29645,8 @@ static void StageSelectionScene_create(void) {
     SS.hasGoldenEggs = po_has("CollectedItems", "RELIC_GOLDENEGG");
     SS.hasBanger = po_has("CollectedItems", "RELIC_BANGER");
     SS.hasRandomOptions = po_has("CollectedItems", "RELIC_TRISECTION");
+    static int stageOnce;
+    if (getenv("VS_STAGE") && !stageOnce++) po_sets("SelectedStage", getenv("VS_STAGE"));  // sviluppo; una volta sola: il primo sigillo cambia stage
     SS.Highlighted = po_str("SelectedStage");
     if (!SS_stage(SS.Highlighted)) TraceLog(LOG_INFO, "VS: %s not found, defaulting to Forest", SS.Highlighted), SS.Highlighted = "FOREST";
     UIButton_set(&SS.bg, "MenuBackground", 20, 62, 360, 428, 1, 0, 0);  // Vita: lista a sinistra, scheda a destra
@@ -25876,7 +30143,6 @@ static struct {
     char title[96];  // Vita: il conteggio nel titolo della barra in alto
 } CW;
 static void SceneManager_BackFromCollection(void);
-static int DLC_Has(const char *d) { (void)d; return 0; }  // 0x1679c: nessun DLC registrato
 static const char *lang2(const char *key, const char *a0, const char *a1) {  // getLang con due parametri (%0 e %1)
     static char o[256];
     const char *s = lang1(key, a0), *p = strstr(s, "%1");
@@ -26320,7 +30586,7 @@ static void CollectionAchievementsScene_draw(void) {
 // ============================================================================
 // 0x1712b: CollectionBestiaryScene (Bestiario, con la Guida di Gouda) + 0xd386 CollectionBestiaryPanel + 0x297e CollectionBestiaryDescPanel
 // ============================================================================
-#define BE_MAX 128
+#define BE_MAX 192
 #define BE_SPR 24
 #define BE_SKETA 120
 typedef struct {  // un oggetto di sprites: createEnemyAnimation e i create* lo modificano e le modifiche restano (come in JS)
@@ -26369,6 +30635,9 @@ static struct {
     float descX, descY, descOX, descWrap;
     int descScaled, unknownVisible;
     BestAnim A[16];
+    Vector2 necks[8][6];  // createOROCHIMARIO
+    const Frame *neckFrame;
+    int nNecks;
     Sprite sk[BE_SKETA];
     Animation skA[BE_SKETA];
     int nSk, skOn, nEyes, trinaOn, rbOn, rbBlue, rb[6], nRb;
@@ -26607,6 +30876,50 @@ static void BE_createCRABBINO(BestEntry *e) {
     p2->x += -0x1b * p2->scaleX, p2->y += -0x1c * p2->scaleY;
     for (int i = 0; i < 3; i++) BE.A[i].s.y += 0xf * BE.A[i].s.scaleX;
 }
+static void BE_createGASHADOKURO(BestEntry *e) {
+    BestSprite *s = &e->spr[0];
+    BE_prefixI(s);
+    s->scale = 1, s->tint = 0xffffff, s->alpha = 1;
+    Sprite *body = BE_createEnemyAnimation(&BE.A[1], s, 0, 0);
+    body->x = BE_FX + 0x28;
+    BestSprite part = { .textureName = "moonspellChars", .startFrameCount = 1, .endFrameCount = 5, .zeroPad = 2, .frameRate = 8, .tint = 0xffffff, .scale = 1, .alpha = 1 };
+    snprintf(part.prefix, sizeof(part.prefix), "Gash_arm_i");
+    Sprite *a3 = BE_createEnemyAnimation(&BE.A[3], &part, 0, 0), *a0 = BE_createEnemyAnimation(&BE.A[0], &part, 0, 0);
+    sprite_setOrigin(a3, 0.85f, 13.0f / 60), a3->x = BE_FX - 0x1a + 0x28, a3->y = BE_FY - 0x1c;
+    a0->x = BE_FX - 0x96 + 0x28, a0->y = BE_FY - 0x14;
+    snprintf(part.prefix, sizeof(part.prefix), "Gash_head_i");
+    Sprite *h = BE_createEnemyAnimation(&BE.A[2], &part, 0, 0);
+    sprite_setOrigin(a0, 0, 0);  // (sic) l'origine di testa vale sul braccio
+    h->x = BE_FX - 0x52 + 0x28, h->y = BE_FY + 0x13;
+    BE.A[0].ignoreAngle = BE.A[1].ignoreAngle = BE.A[2].ignoreAngle = BE.A[3].ignoreAngle = 1;
+}
+static void BE_createOROCHIMARIO(BestEntry *e) {
+    BestAnim *body = &BE.A[0];
+    char f[64];
+    snprintf(f, sizeof(f), "%s", e->spr[0].frameName);
+    char *z = strstr(f, "0.png");
+    if (z) snprintf(z, sizeof(f) - (z - f), "i01.png");
+    anims_stop(&body->s);
+    sprite_setFrame(&body->s, frame_get(e->spr[0].textureName, f));
+    sprite_setScale(&body->s, 2), sprite_setOrigin(&body->s, 0.5f, 0.5f), sprite_setTint(&body->s, 0xffffff);
+    body->s.x = BE_FX, body->s.y = BE_FY + 0x2d, body->s.alpha = 1, body->s.visible = 1, body->s.flipX = body->s.flipY = 0, body->ignoreAngle = 1;
+    cJSON *d = tbl0("enemies", "MS_OROCHIHEAD");
+    const char *n0 = cJSON_GetStringValue(cJSON_GetArrayItem(cJSON_GetObjectItem(d, "frameNames"), 0));
+    BestSprite hd = { .textureName = str(d, "textureName"), .frameName = n0, .startFrameCount = 1, .endFrameCount = (int)num(d, "idleFrameCount", 1), .zeroPad = 2, .frameRate = 8, .tint = 0xffffff, .scale = 1, .alpha = 1 };
+    BE_prefixI(&hd);
+    BE.neckFrame = frame_get(str(d, "textureName"), str(d, "flagName"));
+    Vector2 neck = { body->s.x + 0xa, body->s.y - 0x1e };
+    for (int i = 0; i < 8; i++) {
+        Sprite *s = BE_createEnemyAnimation(&BE.A[i + 1], &hd, 0, 0);
+        s->x = BE_FX - 0x50 + 0xa0 * frand(), s->y = BE_FY - 0x28 + 0x32 * frand();
+        Vector2 p0 = { s->x, s->y - 0x14 };  // rotate_point di angolo 0 modifica lo stesso vettore: controllo = inizio
+        for (int k = 0; k < 6; k++) {
+            float t = k / 5.0f, u = 1 - t;
+            BE.necks[i][k] = (Vector2){ (u * u + 2 * u * t) * p0.x + t * t * neck.x, (u * u + 2 * u * t) * p0.y + t * t * neck.y };
+        }
+    }
+    BE.nNecks = 8;
+}
 static void BE_createMASK(BestEntry *e, const char *maskKey, int a, int b, float px, float py) {
     BestSprite *s = &e->spr[0];
     BE_prefixI(s);
@@ -26624,6 +30937,7 @@ static void BE_createMASK(BestEntry *e, const char *maskKey, int a, int b, float
     sprite_setOrigin(o, 0.5f, oy), o->flipX = o->flipY = 0, BE.A[a].ignoreAngle = BE.A[b].ignoreAngle = 0;
 }
 static void BE_assignEnemyImageAnim(BestEntry *e) {
+    BE.nNecks = 0;  // orochimarioContainer.removeAll
     BE.trinaOn = BE.rbOn = 0, BE.nEyes = 0;  // customTween.stop, removeEvent(RedBlueTimer), eyeSprites.destroy
     for (int i = 0; i < 16; i++) BE.A[i].s.visible = 0, anims_stop(&BE.A[i].s);
     BE.skOn = 0;
@@ -26638,7 +30952,8 @@ static void BE_assignEnemyImageAnim(BestEntry *e) {
     if (!strcmp(k, "SKETAMARI")) { BE_createSKETAMARI(); return; }
     if (!strcmp(k, "DIRECTER")) { BE_createDIRECTER(e); return; }
     if (!strcmp(k, "TRINACRIA")) { BE_createTRINACRIA(e); return; }
-    // MS_GOSHADOKURO e MS_OROCHIMARIO sono del DLC: non ci sono nei dati
+    if (!strcmp(k, "MS_GOSHADOKURO")) { BE_createGASHADOKURO(e); return; }
+    if (!strcmp(k, "MS_OROCHIMARIO")) { BE_createOROCHIMARIO(e); return; }
     if (!strcmp(k, "MOON_CRABBINO") || !strcmp(k, "MOON_BOSS_CRABBINO") || !strcmp(k, "BOSS_XLCRAB")) { BE_createCRABBINO(e); return; }
     if (!strcmp(k, "MOON_MASK3")) {
         int v = BE_pickPos(5);
@@ -26702,6 +31017,7 @@ static void CollectionBestiaryScene_create(void) {
     BE.scY = 0, BE.scMinY = 0, BE.scMaxY = fmaxf(0, BE.n * BE_ROW + 8 - 420);
     CollectionBestiaryScene_MakeUIGrid();
     if (BE.n) BE_OnPanelClicked(0, 0);
+    if (getenv("VS_BESEL")) for (int i = 0; i < BE.n; i++) if (!strcmp(BE.e[i].key, getenv("VS_BESEL"))) BE.e[i].killed = 1, BE_OnPanelClicked(i, i + 1);  // sviluppo: mostra una voce
     snprintf(BE.title, sizeof(BE.title), "%s", lang2("bestiary_header", TextFormat("%d", BE.obtained), TextFormat("%d", BE.count)));
     TB_title = BE.title;
     OV.OnL = BE_onKeyUp, OV.OnR = BE_onKeyDown;
@@ -26793,7 +31109,13 @@ static void CollectionBestiaryDescPanel_draw(void) {  // Vita: scheda a destra, 
         text_at(val[i], lx + lw, y, fit_size(val[i], 18, cw - (lx - cx) - lw), 0, 0.5f, WHITE);
     }
     menu_clip(BE_FX - 0.5f * 0x12c + 4, BE_FY - 0.5f * 0xb4 + 4, 0x12c - 8, 0xb4 - 8);  // myMask
-    for (int i = 0; i < 16; i++) BE_drawSprite(&BE.A[i].s, dy);
+    if (BE.nNecks) BE_drawSprite(&BE.A[0].s, dy);  // orochimarioContainer: corpo e colli sotto le teste
+    for (int i = 0; i < BE.nNecks; i++) {
+        Vector2 p[6];  // Rope_drawH toglie la camera: qui sono coordinate dello schermo
+        for (int k = 0; k < 6; k++) p[k] = (Vector2){ BE.necks[i][k].x + camera_scrollX, BE.necks[i][k].y + camera_scrollY + dy };
+        Rope_drawH(p, 6, BE.neckFrame, 1, 1, 0, 0);
+    }
+    for (int i = BE.nNecks ? 1 : 0; i < 16; i++) BE_drawSprite(&BE.A[i].s, dy);
     if (BE.skOn) {  // sketamariContainer in (myFrame.x, myFrame.y), scala 0.5 -> 4 in 60 s, angle += 0.5 a ogni frame
         float k = lerp01(BE.t, BE.skT0, 0xea60), sc = 0.5f + 3.5f * k, a = BE.skAngle * DEG2RAD;
         for (int i = 0; i < BE.nSk; i++) {
@@ -26950,14 +31272,10 @@ static int PS_requiresYellowSign(const EvoItem *e) {
 }
 static void EvolutionPanel_create(float y, float h) {
     PS.evoExists = 1, PS.evoY = y, PS.evoH = h, PS.nEvo = 0, PS.pagesCurrent = 0;
-    static const char *const DLC[] = { "SILVERWIND2", "FOURSEASONS2", "SUMMONNIGHT2", "MIRAGEROBE2", "NIGHTSWORD2", "BUBBLES2", "SPELL_STROM", "SWORD2", "FLASHARROW2", "PRISMATICMISS2", "SHADOWSERVANT2" };
     cJSON *w;
-    cJSON_ArrayForEach(w, data_get("weapons")) {  // createEvolutionList (niente DLC)
+    cJSON_ArrayForEach(w, data_get("weapons")) {  // createEvolutionList (le evoluzioni dei DLC non installati non sono nei dati)
         cJSON *b = cJSON_GetArrayItem(w, 0);
         if (!b || !strcmp(w->string, "BONE2") || !cJSON_GetObjectItem(b, "evolvesFrom")) continue;
-        int dlc = 0;
-        for (size_t i = 0; i < sizeof(DLC) / sizeof(*DLC); i++) dlc |= !strcmp(w->string, DLC[i]);
-        if (dlc) continue;
         EvoItem e = { w->string, cJSON_GetObjectItem(b, "evolvesFrom"), cJSON_GetObjectItem(b, "requires") };
         if (PS_requiresYellowSign(&e) || !strcmp(e.weapon, "TRIASSO3") || !PS_visibleItem(&e) || PS.nEvo >= EVO_MAX) continue;
         PS.evo[PS.nEvo++] = e;
@@ -27418,9 +31736,7 @@ static void SceneManager_RecoveryFromOptions(void);
 static void Opt_onRestore(void *c) {  // ChangeRestoreButtonToConfirm, poi RecoveryConfirmed
     (void)c;
     Sound_PlaySimple("ClickIn", 0);
-    if (OP.restoreState == 2) { SceneManager_RecoveryFromOptions(); return; }
-    OP.restoreState = 1, OP.restoreAt = OP.t + 0x1f4;
-    UIButton_off(&OP.RestoreBackupButton);
+    SceneManager_RecoveryFromOptions();  // Vita: la conferma a due tocchi resta solo sulle azioni che cancellano
 }
 static void SceneManager_ResumeFromPause(void);
 static void SceneManager_QuitFromPauseMenu(void);
@@ -27541,7 +31857,7 @@ static void Options_create(int pause) {
             UIButton_on(&OP.langs[OP.nLangs], Opt_onLangPick, (void *)(intptr_t)OP.nLangs);
         }
         UIButton_set(&OP.RestoreBackupButton, "BackButton", 612, 428, 316, 50, 1, 0, 0);
-        OP.RestoreBackupButton.visible = SaveSystem_HasBackup();
+        OP.RestoreBackupButton.visible = 1;  // Vita: da qui si importa anche il salvataggio del PC
         if (OP.RestoreBackupButton.visible) UIButton_on(&OP.RestoreBackupButton, Opt_onRestore, NULL);
         TB_title = tr("options_header");
     }
@@ -27644,7 +31960,8 @@ static void SceneManager_QuitFromPauseMenu(void) {  // pausa, statistiche, game 
 // con la conferma a due tocchi (500 ms), poi SaveSystem.RestoreBackup e il gioco riparte.
 // Vita: il bottone entra nella griglia del pad (l'originale ci mette solo Indietro) e sotto c'e' la spiegazione.
 // ============================================================================
-static struct { int active, confirm, hasLastRun; float t, armAt; UIButton LastRunButton; } RC;
+static struct { int active, confirm, hasLastRun, imState, delArmed; float t, armAt, delAt; UIButton LastRunButton, ImportButton, DelSaveButton, DelAllButton; char *imText; char imInfo[96]; } RC;
+enum { IM_OFF, IM_WAIT, IM_READY, IM_BAD, IM_NONET };
 static void RC_cancel(void) { if (TB.BackButton.onDown) TB.BackButton.onDown(TB.BackButton.ctx); }
 static void RC_onLastRun(void *c) {  // ChangeLastRunButtonToConfirm, poi DisableAll + RestoreBackup
     (void)c;
@@ -27658,38 +31975,160 @@ static void RC_onLastRun(void *c) {  // ChangeLastRunButtonToConfirm, poi Disabl
     RC.confirm = 1, RC.armAt = RC.t + 0x1f4;
     UIButton_off(&RC.LastRunButton);
 }
+// Vita: importazione del salvataggio del PC (saveimport.c): il browser carica il file, qui si controlla e si conferma.
+static void RC_onImport(void *c);
+static void RC_grid(UIButton *sel) {
+    Overlay_DestroyGrid();
+    int last = RC.hasLastRun && RC.imState == IM_OFF, imp = RC.imState == IM_OFF || RC.imState == IM_READY, del = RC.imState == IM_OFF ? 2 : 0, r = 1;
+    Overlay_MakeUIGrid(1, 1 + last + imp + del, 0);
+    UIGrid_SetContents(0, 0, &TB.BackButton, 0);
+    if (last) UIGrid_SetContents(0, r++, &RC.LastRunButton, 0);
+    if (imp) UIGrid_SetContents(0, r++, &RC.ImportButton, 0);
+    if (del) UIGrid_SetContents(0, r++, &RC.DelSaveButton, 0), UIGrid_SetContents(0, r++, &RC.DelAllButton, 0);
+    Overlay_ToggleCursorsVisibility(1);
+    UIGrid_SelectGameObject(sel);
+    OV.UI_selected = sel;
+    OV.OnCancelCallback = RC_cancel;
+}
+static void RC_importStop(void) {
+    saveimport_stop();
+    if (RC.imText) saveimport_free(RC.imText);
+    RC.imText = NULL;
+}
+static void RC_importReceived(char *txt) {
+    if (RC.imText) saveimport_free(RC.imText);
+    RC.imText = NULL;
+    cJSON *j = SaveSystem_IsChecksumValid(txt) ? cJSON_Parse(txt) : NULL;
+    if (!j) {
+        saveimport_free(txt);
+        RC.imState = IM_BAD;
+        UIButton_off(&RC.ImportButton);
+        RC_grid(&TB.BackButton);
+        return;
+    }
+    snprintf(RC.imInfo, sizeof(RC.imInfo), "%d coins, %d achievements", (int)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "Coins")), cJSON_GetArraySize(cJSON_GetObjectItem(j, "Achievements")));
+    cJSON_Delete(j);
+    RC.imText = txt, RC.imState = IM_READY;
+    UIButton_on(&RC.ImportButton, RC_onImport, NULL);
+    RC_grid(&RC.ImportButton);
+}
+static void RC_onImport(void *c) {
+    (void)c;
+    Sound_PlaySimple("ClickIn", 0);
+    if (RC.imState == IM_READY) {  // il salvataggio attuale resta in SaveData.preimport
+        const char *name = SaveSystem_GetSaveName(SAVE_DEFAULT);
+        char *cur = vs_read_text(name);
+        if (cur) vs_write_text("SaveData.preimport", cur), vs_free(cur);
+        if (!vs_write_text(name, RC.imText)) { RC.imState = IM_BAD; UIButton_off(&RC.ImportButton); RC_grid(&TB.BackButton); return; }
+        Overlay_DestroyGrid();
+        UIButton_off(&RC.ImportButton), UIButton_off(&TB.BackButton);
+        RC_importStop();
+        vs_reload();
+        return;
+    }
+    RC.imState = saveimport_start() ? IM_WAIT : IM_NONET;
+    UIButton_off(&RC.ImportButton), UIButton_off(&RC.LastRunButton), UIButton_off(&RC.DelSaveButton), UIButton_off(&RC.DelAllButton);
+    RC_grid(&TB.BackButton);
+}
+// Vita: cancellare dalla console. Due pressioni (la seconda dopo 500 ms): si esce dall'attesa cambiando riga.
+static void RC_deleteNow(int which) {
+    Overlay_DestroyGrid();
+    UIButton_off(&RC.DelSaveButton), UIButton_off(&RC.DelAllButton), UIButton_off(&TB.BackButton);
+    if (which == 1) {
+        static const char *const names[] = { "SaveData", "LastRunBackup", "SaveDataStash", "SaveData.preimport", "save.json" };
+        for (int i = 0; i < 5; i++) remove(vs_path(names[i]));
+        vs_reload();
+        return;
+    }
+    if (BGM.idx >= 0) UnloadMusicStream(BGM.music), BGM.idx = -1;  // i file aperti non si possono cancellare
+    if (SeekSfx.on) UnloadMusicStream(SeekSfx.m), SeekSfx.on = 0;
+    if (LoopSfx.on) UnloadMusicStream(LoopSfx.m), LoopSfx.on = 0;
+    vs_delete_all_and_exit();
+}
+static void RC_onDelete(void *c) {
+    int which = c == &RC.DelSaveButton ? 1 : 2;
+    Sound_PlaySimple("ClickIn", 0);
+    if (RC.delArmed == which && RC.t >= RC.delAt) { RC_deleteNow(which); return; }
+    if (RC.delArmed != which) RC.delArmed = which, RC.delAt = RC.t + 0x1f4;
+}
+static void RC_row(UIButton *b, const char *label) {
+    UIButton_draw(b, 1);
+    text_at(label, b->x + 230, b->y + 26, fit_size(label, 26, 430), 0.5f, 0.5f, WHITE);
+}
 static void RecoveryScene_create(void) {
     memset(&RC, 0, sizeof(RC));
     RC.active = 1;
     RC.hasLastRun = SaveSystem_HasBackup();  // DisplayRecoveryForLastRun
-    UIButton_set(&RC.LastRunButton, "GreenButton", 300, 150, 360, 64, 1, 0, 0);
+    int ry = 76;
+#define RC_NEXT() (ry += 64, ry - 64)
+    if (RC.hasLastRun) UIButton_set(&RC.LastRunButton, "GreenButton", 250, RC_NEXT(), 460, 52, 1, 0, 0);
+    else RC.LastRunButton = (UIButton){ 0 };
     RC.LastRunButton.visible = RC.hasLastRun;
     if (RC.hasLastRun) UIButton_on(&RC.LastRunButton, RC_onLastRun, NULL);
-    Overlay_DestroyGrid();
-    Overlay_MakeUIGrid(1, 1 + RC.hasLastRun, 0);
-    UIGrid_SetContents(0, 0, &TB.BackButton, 0);
-    if (RC.hasLastRun) UIGrid_SetContents(0, 1, &RC.LastRunButton, 0);
-    Overlay_ToggleCursorsVisibility(1);
-    UIButton *sel = RC.hasLastRun ? &RC.LastRunButton : &TB.BackButton;
-    UIGrid_SelectGameObject(sel);
-    OV.UI_selected = sel;
-    OV.OnCancelCallback = RC_cancel;
+    UIButton_set(&RC.ImportButton, "GreenButton", 250, RC_NEXT(), 460, 52, 1, 0, 0);
+    UIButton_on(&RC.ImportButton, RC_onImport, NULL);
+    UIButton_set(&RC.DelSaveButton, "BackButton", 250, RC_NEXT(), 460, 52, 1, 0, 0);
+    UIButton_on(&RC.DelSaveButton, RC_onDelete, &RC.DelSaveButton);
+    UIButton_set(&RC.DelAllButton, "BackButton", 250, RC_NEXT(), 460, 52, 1, 0, 0);
+    UIButton_on(&RC.DelAllButton, RC_onDelete, &RC.DelAllButton);
+#undef RC_NEXT
+    RC_grid(RC.hasLastRun ? &RC.LastRunButton : &RC.ImportButton);
     vui_set_prompts((VPrompt[]){ { G_CROSS, "vui_select" }, { G_CIRCLE, "vui_back" } }, 2);
     TB_title = tr("options_dataRecovery");
+    if (getenv("VS_IMPORT")) RC_onImport(NULL);  // sviluppo: apre subito l'importazione
 }
 static void RecoveryScene_update(float delta) {
     RC.t += delta;
     if (RC.confirm == 1 && RC.t >= RC.armAt) RC.confirm = 2, UIButton_on(&RC.LastRunButton, RC_onLastRun, NULL);
     UIButton_clicked(&RC.LastRunButton);
+    UIButton_clicked(&RC.ImportButton);
+    if (RC.imState == IM_OFF) {
+        UIButton_clicked(&RC.DelSaveButton), UIButton_clicked(&RC.DelAllButton);
+        if ((RC.delArmed == 1 && OV.UI_selected != &RC.DelSaveButton) || (RC.delArmed == 2 && OV.UI_selected != &RC.DelAllButton)) RC.delArmed = 0;
+        const char *dt = getenv("VS_RCDEL");  // sviluppo: save|all, cancella subito
+        if (dt && RC.t > 0x7d0) RC_deleteNow(!strcmp(dt, "save") ? 1 : 2);
+    }
+    if (RC.imState == IM_WAIT || RC.imState == IM_BAD || RC.imState == IM_READY) {
+        saveimport_poll();
+        char *txt = saveimport_take();
+        if (txt) RC_importReceived(txt);
+    }
+    if (RC.imState == IM_READY && getenv("VS_IMPORT") && !strcmp(getenv("VS_IMPORT"), "confirm")) RC_onImport(NULL);
 }
 static void RecoveryScene_draw(void) {
-    nine("frame5_c4.png", 12, (Rectangle){ 220, 110, 520, 230 }, WHITE);
-    if (!RC.hasLastRun) return;
-    UIButton *b = &RC.LastRunButton;
-    const char *s = tr(RC.confirm ? "charConfirm_confirm" : "options_lastRun");
-    UIButton_draw(b, 1);
-    text_at(s, b->x + 180, b->y + 32, fit_size(s, 28, 330), 0.5f, 0.5f, WHITE);
-    ui_wrap_text(tr("options_restoreDescription"), 250, 250, 22, 460, 150, rgb(0xd0c8b8, 1), 1);
+    if (RC.imState != IM_OFF) {
+        nine("frame5_c4.png", 12, (Rectangle){ 120, 90, 720, 300 }, WHITE);
+        if (RC.imState == IM_NONET) {
+            ui_wrap_text("Your Vita is not connected. Connect to Wi-Fi and try again.", 150, 180, 26, 660, 120, WHITE, 1);
+            return;
+        }
+        text_at("On your computer's browser, open:", 480, 130, 24, 0.5f, 0.5f, WHITE);
+        text_at(saveimport_address(), 480, 182, 36, 0.5f, 0.5f, rgb(0xffcd50, 1));
+        const char *msg = RC.imState == IM_BAD ? "That file is not a valid Vampire Survivors save. Your save was not touched: send another one."
+                        : RC.imState == IM_READY ? "Save received. Content this port does not have yet is skipped. Confirm below: your current save is kept as SaveData.preimport."
+                        : "Then choose SaveData.sav and press Send. Keep this screen open.";
+        ui_wrap_text(msg, 150, 232, 22, 660, 100, RC.imState == IM_BAD ? rgb(0xff8070, 1) : rgb(0xd0c8b8, 1), 1);
+        if (RC.imState == IM_READY) {
+            text_at(RC.imInfo, 480, 352, 24, 0.5f, 0.5f, rgb(0xffcd50, 1));
+            UIButton_draw(&RC.ImportButton, 1);
+            text_at("Import this save", RC.ImportButton.x + 230, RC.ImportButton.y + 28, 28, 0.5f, 0.5f, WHITE);
+        }
+        return;
+    }
+    if (RC.hasLastRun) RC_row(&RC.LastRunButton, tr(RC.confirm ? "charConfirm_confirm" : "options_lastRun"));
+    RC_row(&RC.ImportButton, "Import save from PC");
+    RC_row(&RC.DelSaveButton, RC.delArmed == 1 ? "Press again to delete" : "Delete save data");
+    RC_row(&RC.DelAllButton, RC.delArmed == 2 ? "Press again to delete" : "Delete all game data");
+    UIButton *sel = OV.UI_selected;
+    const char *about = sel == &RC.LastRunButton ? tr("options_restoreDescription")
+                      : sel == &RC.ImportButton ? "Bring your progress over from the PC version, using your computer's browser."
+                      : sel == &RC.DelSaveButton ? "Deletes your progress on this Vita, backups included. This cannot be undone."
+                      : sel == &RC.DelAllButton ? "Deletes your save and all the game files on the memory card (about 125 MB), then closes the game. You will need the setup tool to play again."
+                      : NULL;
+    if (about) {
+        nine("frame5_c4.png", 12, (Rectangle){ 180, 340, 600, 150 }, WHITE);
+        ui_wrap_text(about, 205, 360, 22, 550, 115, rgb(0xd0c8b8, 1), 1);
+    }
 }
 
 // ============================================================================
@@ -28522,6 +32961,7 @@ static void SceneManager_ExitOptions(void) {  // IntroScene ripresa, griglia sul
 }
 static void SceneManager_ExitRecovery(void) {  // (sic) si torna al menu principale, non alle Opzioni
     Overlay_DestroyGrid();
+    RC_importStop();
     RC.active = 0;
     MM.visible = 1, MM.awake = 1;
     TopBar_EnableOptions(SceneManager_OptionsFromMainMenu);
@@ -28674,7 +33114,9 @@ static char **Credits_lines(const char *which, int *n) {  // data/credits.json (
             else b[o++] = *p++;
         }
         b[o < sizeof(b) ? o : sizeof(b) - 1] = 0;
-        out[i] = strdup(b);
+        size_t len = strlen(b) + 1;
+        out[i] = malloc(len);  // gmem, non strdup: Credits_free libera con gmem_free
+        memcpy(out[i], b, len);
     }
     *n = m;
     return out;
@@ -28901,7 +33343,7 @@ static int CE_in(const char *k, const char *const *l) { for (; *l; l++) if (!str
 static void CE_createEnemyList(void) {
     static const char *const OUT[] = { "HEMO", "HEMO2", "REDUSA", "RELLYFISH", "RELLYFISH_SWARM", "BOSS_XLBLINDER", "FS_ANFORA_HP", "TRINACRIA", "FANGEL1", "FANGEL2",
                                        "FANGEL3", "TRAINEE_Y", "ARMOR1", "BULLET_W", "SHADEBLUE", "MS_GOSHADOKURO", "MS_OROCHIMARIO", NULL };
-    static const char *const SUB[] = { "MOLISANO", "MOON", "BULLET", "MASK", "BOSS", "D_", "test", "_FLAG", "MS_", "FS_", NULL };  // MS_/FS_: niente DLC
+    static const char *const SUB[] = { "MOLISANO", "MOON", "BULLET", "MASK", "BOSS", "D_", "test", "_FLAG", NULL };
     cJSON *en = data_get("enemies");
     CE.enemyList = calloc(cJSON_GetArraySize(en) + 1, sizeof(char *)), CE.nEnemies = 0;
     for (cJSON *e = en ? en->child : NULL; e; e = e->next) {
@@ -28914,8 +33356,7 @@ static void CE_createEnemyList(void) {
     CE_shuffle(CE.enemyList, CE.nEnemies);  // semplificazione: l'originale rimescola a ogni push; un rimescolamento finale da' la stessa distribuzione
 }
 static void CE_createCharacterList(void) {
-    static const char *const OUT[] = { "FINO", "CONCETTA", "POPPEA", "ARENGIJUS", "MIANG", "MENYA", "SYUUTO", "ONNA", "MCCOY", "MEGAMENYA", "MEGASYUUTO", "TONY",
-                                       "ELEANOR", "VICTOR", "KEIRA", "LUMINAIRE", "GENEVIEVE", "MEGAGENEVIEVE", "CTRPCAKE", "GHOUL", NULL };  // senza Moonspell e Foscari
+    static const char *const OUT[] = { "FINO", "CONCETTA", "POPPEA", "ARENGIJUS", NULL };  // quelli dei DLC non installati non sono nei dati
     cJSON *ch = data_get("characters");
     CE.characterList = calloc(cJSON_GetArraySize(ch) + 1, sizeof(char *)), CE.nCharacters = 0;
     for (cJSON *c = ch ? ch->child : NULL; c; c = c->next)
@@ -29383,7 +33824,7 @@ void game_start(const char *character) {
     char chbuf[64];  // spesso e' po_str("SelectedCharacter"): il po_sets qui sotto libererebbe la stringa
     snprintf(chbuf, sizeof(chbuf), "%s", character);
     character = chbuf;
-    memset(&WhiteHand, 0, sizeof(WhiteHand)), camera_zoom = 1;
+    memset(&WhiteHand, 0, sizeof(WhiteHand)), camera_zoom = 1, HasHardBounds = 0, memset(&CamPan, 0, sizeof(CamPan)), WE.made = 0, Enemy_beatMode = 0;
     GOI.active = 0;
     FB_disableMovingBG = 0;
     camera_followOffsetX = 0, FrameFreeze_ms = 0;
@@ -29486,6 +33927,7 @@ int game_update(float dt) {
     Sound_Update(dt * 1000);
     float delta = dt * 1000;  // ms, come il TimeStep di Phaser
     if (PS.active) { PauseScene_update(delta); return 0; }  // PauseScene sopra la MainScene in pausa
+    if (SM_restart) { SM_restart = 0; Sound_StopMusic(); game_start(po_str("SelectedCharacter")); return 0; }  // SceneManager.RestartMainScene (il primo sigillo)
     if (SM_reset) { SM_reset = 0; return 1; }  // SceneManager.Reset: niente risultati, si torna all'Intro
     if (CF.active) { CharFoundScene_update(delta); return 0; }  // UI_charFoundScene
     if (RF.active) { RelicFoundScene_update(delta); return 0; }  // UI_relicFoundScene

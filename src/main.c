@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "trophies.h"
 #include "vs.h"
 #include "rlgl.h"
 
@@ -198,6 +199,8 @@ int main(int argc, char **argv) {
     SaveSystem_Load();  // PreloadScene: salvataggio (o i default) applicato alle tabelle, poi la lingua
     Lang_init();
     vs_load_font();
+    trophies_init();
+    Trophies_sync();
 
     // Prova automatica sul desktop: VS_SCENE=game (partita diretta), VS_MENU=main|chars|stages (salta l'intro), VS_SHOT=secondi -> shot.png ed esce.
     const char *env_scene = getenv("VS_SCENE"), *env_shot = getenv("VS_SHOT");

@@ -1,4 +1,7 @@
+#include <dirent.h>
 #include <stdarg.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,6 +37,41 @@ void vs_init_paths(void) {
     const char *e = getenv("VS_DATA");
     snprintf(data_dir, sizeof(data_dir), "%s/", e && *e ? e : "gamedata");
 #endif
+}
+
+static void delete_tree(const char *path) {
+    DIR *d = opendir(path);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            char child[600];
+            snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+            struct stat st;
+#ifdef __vita__
+            int ok = stat(child, &st);
+#else
+            int ok = lstat(child, &st);  // a link is removed, never followed
+#endif
+            if (!ok && S_ISDIR(st.st_mode)) delete_tree(child);
+            else remove(child);
+        }
+        closedir(d);
+    }
+    rmdir(path);
+}
+
+void vs_delete_all_and_exit(void) {
+    char root[512];
+    const char *dev = getenv("VS_DELETE_ROOT");  // only to test the routine on a throwaway folder
+    snprintf(root, sizeof(root), "%s", dev && *dev ? dev : data_dir);
+    size_t n = strlen(root);
+    if (n && root[n - 1] == '/') root[n - 1] = 0;
+#ifndef __vita__
+    if (!dev) { TraceLog(LOG_WARNING, "VS: delete all is disabled on the desktop"); exit(0); }
+#endif
+    delete_tree(root);
+    exit(0);
 }
 
 const char *vs_path(const char *rel) {

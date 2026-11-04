@@ -18,6 +18,8 @@ own them, plus trophies and save import from the PC version.
 |---|---|
 | ![Main menu](screenshots/01-main-menu.png) | ![Stage selection](screenshots/02-stage-select.png) |
 | ![Gameplay](screenshots/03-gameplay.png) | ![Level up](screenshots/04-level-up.png) |
+| ![Legacy of the Moonspell](screenshots/05-moonspell.png) | ![Tides of the Foscari, the lake](screenshots/06-foscari-lake.png) |
+| ![Tides of the Foscari, the abyss](screenshots/07-abyss.png) | ![Data Recovery](screenshots/08-data-recovery.png) |
 
 *Captured from the desktop preview build, which runs the same game code at the
 Vita's 960x544. Frame rate on the real console is covered under Known Issues.*
@@ -73,18 +75,42 @@ README.
 
 4. **Install the VPK** with VitaShell.
 
-## Trophies
-
-The game has 150 trophies in two sets (the DLC ones are in the second). They
-need [NoTrpDrm](https://github.com/Rinnegatamante/NoTrpDrm); without the plugin the
-game runs normally, just without trophies.
-
 ## Bringing Your PC Save
 
-In the game, Options, Data Recovery, Import shows an address: open it in a
-browser on your computer and upload your save. Both the current Steam version
-and old-engine work; the page tells you where the file is. Your save is
-replaced, so back it up first if it matters.
+You can carry your progress over from the PC, with both the current Steam version
+and old-engine. Content this port does not have is skipped.
+
+1. **Find your save on the computer:**
+   - Current Steam version: `Steam/userdata/<id>/1794680/remote/SaveData`
+   - Old-engine, `SaveData.sav`:
+     - Windows: `%APPDATA%\Vampire_Survivors_<id>`
+     - macOS: `~/Library/Application Support/Vampire_Survivors_<id>`
+     - Linux: `~/.config/Vampire_Survivors_<id>`
+2. **On the Vita**, connected to the same Wi-Fi as the computer: Options, Data
+   Recovery, **Import save from PC**. The game shows an address; keep that screen
+   open.
+3. **On the computer**, open the address in a browser, choose the file and press
+   Send.
+4. **Back on the Vita**, check the summary and press **Import this save**. The game
+   restarts with your progress.
+
+Your previous Vita save stays in `ux0:data/VampireSurvivors/SaveData.preimport`.
+
+## Trophies
+
+There are 190 trophies plus the platinum, in two sets (the DLC ones are in the
+second, and need the DLCs). They need the [NoTrpDrm](https://github.com/Rinnegatamante/NoTrpDrm)
+plugin; without it the game runs normally, just without trophies.
+
+1. Copy `NoTrpDrm.suprx` to `ur0:tai/` with VitaShell.
+2. Back up `ur0:tai/config.txt`, then add this line under `*main`:
+
+       ur0:tai/NoTrpDrm.suprx
+
+3. Reboot the Vita and start the game.
+
+Achievements you already have earn their trophies when the game starts, imported
+ones included: import your PC save first and they arrive on the restart.
 
 ## Controls
 

@@ -42,7 +42,8 @@ Both are MIT licensed:
 ## In the setup tools
 
 - FFmpeg: the bundled binary is a GPL v3 build including x264, run as a separate
-  program. Source: https://ffmpeg.org/download.html
+  program, version 7.0.2.
+  Source: https://ffmpeg.org/releases/ffmpeg-7.0.2.tar.xz
 - imageio-ffmpeg: BSD 2-Clause, imageio contributors.
 - QuickJS: MIT, Fabrice Bellard and Charlie Gordon. Python bindings by PetterS.
 - PyInstaller: GPL with an exception that allows bundling applications.

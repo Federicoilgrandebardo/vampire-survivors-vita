@@ -9,6 +9,9 @@
 #include "trophies.h"
 #include "vs.h"
 #include "rlgl.h"
+#include "audio.h"
+#include "net.h"
+#include "phaser.h"
 
 static Scene scene;
 static char **main_argv;
@@ -86,13 +89,12 @@ int vs_finish_mode(void) {
     // Vita: di serie 3 (rt + swap). Senza, lo schermo a volte leggeva la vista di gioco (rt) o il frame (swap) prima che la
     // GPU li finisse: lampo nero in basso (le ultime tessere, ancora pulite a nero). Provato da Federico 2026-10-25.
     // Costo misurato con Pasqualina dopo la raylib senza MSAA: rt ~0,5 ms, swap ~1,5 ms a frame.
-#ifdef __vita__
-    const int def = 2;  // 2026-11-01: il lampo era lo scambio prima della fine della GPU (provato da Federico: swap 0 lampi,
-                        // off 2-31); rt costava ~9 ms e non serviva. Tre viste a turno in game_draw: 17,5 ms invece di 19,5
-#else
-    const int def = 0;
-#endif
-    if (m < 0) { const char *e = getenv("VS_FINISH"); m = !e ? def : !strcmp(e, "rt") ? 1 : !strcmp(e, "swap") ? 2 : !strcmp(e, "off") ? 0 : !strcmp(e, "ab") ? 4 : 3; }
+    // 2026-11-05: spenta anche sulla Vita. Sei armi evolute e 300 nemici: da ~39 a ~56 fps, un lampo nero in 3 minuti
+    // (prova di Federico). L'idea e' di DrakonPL. VS_FINISH=swap rimette l'attesa.
+    // Bug 4 del test finale: profilo nelle Opzioni (vs_quality_mode): Prestazioni = 0 (di serie), Qualita' = 3 (niente lampi).
+    const char *e = getenv("VS_FINISH");
+    if (!e) return vs_quality_mode() ? 3 : 0;
+    if (m < 0) m = !strcmp(e, "rt") ? 1 : !strcmp(e, "swap") ? 2 : !strcmp(e, "off") ? 0 : !strcmp(e, "ab") ? 4 : 3;
     if (m == 4) return ((int)(GetTime() / 10) & 1) ? 3 : 1;  // VS_FINISH=ab: rt e both a turno ogni 10 s (misura in una partita)
     return m;
 }
@@ -165,6 +167,33 @@ static void probe_frame(int scene_game, float dt) {
     }
 }
 
+int det_on;
+unsigned det_frame, det_calls;
+static unsigned det_s;
+int det_rand(void) {
+    if (!det_on) return rand();
+    det_calls++;
+    det_s ^= det_s << 13, det_s ^= det_s >> 17, det_s ^= det_s << 5;
+    return (int)(det_s >> 1);
+}
+unsigned physics_hash(void);
+void det_game_hash(unsigned *enemies, unsigned *player);
+void det_begin(unsigned seed) { det_on = 1, det_s = seed | 1, det_frame = det_calls = 0; }
+void det_end(void) { det_on = 0; }
+static void det_log(void) {
+    static FILE *f;
+    if (!f && getenv("VS_DET")) f = fopen(vs_path("det.txt"), "w");
+    unsigned e, p;
+    det_game_hash(&e, &p);
+    if (f) {
+        fprintf(f, "%u %u %08x %08x %08x\n", det_frame, det_calls, physics_hash(), e, p);
+        if (det_frame % 300 == 0) fflush(f);
+    }
+    if (net_on) net_frame_hash(det_frame, physics_hash() ^ e * 31 ^ p * 131 ^ det_calls);
+    det_frame++;
+}
+void game_net_submit(void);
+void game_net_end(void);
 int main(int argc, char **argv) {
     (void)argc;
     main_argv = argv;
@@ -182,7 +211,13 @@ int main(int argc, char **argv) {
         if (eq) *eq = 0, setenv(l, eq + 1, 1);
     }
     if (env) UnloadFileText(env);
-    if (!getenv("VS_MUTE")) InitAudioDevice();  // VS_MUTE: prove automatiche senza audio
+    if (getenv("VS_DET")) det_on = 1, det_s = (unsigned)atoi(getenv("VS_DET")) | 1;
+    if (getenv("VS_NET")) {  // sviluppo: VS_NET=host | <indirizzo>
+        unsigned seed = getenv("VS_DET") ? (unsigned)atoi(getenv("VS_DET")) : 11;
+        const char *n = getenv("VS_NET");
+        if (net_open(strcmp(n, "host") ? n : NULL, &seed)) det_begin(seed);
+    }
+    if (!getenv("VS_MUTE")) InitAudioDevice(), au_start();  // VS_MUTE: prove automatiche senza audio
     if (!data_get("characters")) {
         // Senza dati non c'e' gioco: si spiega come prepararli invece di chiudere in silenzio.
         while (!WindowShouldClose()) {
@@ -222,24 +257,41 @@ int main(int argc, char **argv) {
     int p_n = 0;
     while (!WindowShouldClose()) {
         double t0 = GetTime();
-        float dt = GetFrameTime();
+        float dt = det_on ? 1.0f / 60 : GetFrameTime();
         if (dt > 0.1f) dt = 0.1f;
-        int quit = 0;
+        int quit = 0, net_stepped = 0;
         if (scene == SCENE_MENU) {
             int r = menu_update(dt);
             if (r > 0) scene_set(SCENE_GAME);  // LaunchMainScene
             quit = r < 0;                      // Integration.closeGame
+        } else if (net_on) {  // lockstep: si simula solo quando ci sono gli input di entrambe le console
+            while (net_wants_input(det_frame)) game_net_submit();
+            net_stepped = net_tick(det_frame);
+            net_input_frame = det_frame, net_in_sim = net_stepped;
+            int ended = net_stepped && game_update(dt);
+            net_in_sim = 0;
+            if (ended || net_lost()) {
+                game_net_end();
+                menu_start();
+                scene_set(SCENE_MENU);
+            }
+            if (det_frame % 600 == 0 && net_stepped) net_report(det_frame);
         } else if (game_update(dt)) {
             menu_start();  // StartFromPostGame -> IntroScene
             scene_set(SCENE_MENU);
         }
         if (quit) break;
         pad_log();
+        if (det_on && scene == SCENE_GAME && (!net_on || net_stepped)) det_log();
         double t1 = GetTime();
         BeginDrawing();
         ClearBackground(BLACK);
         if (scene == SCENE_MENU) menu_draw();
-        else game_draw();
+        else {
+            game_context_set(net_on ? net_role : 0);  // il proprio giocatore: HUD e schede
+            game_draw();
+            game_context_set(0);
+        }
         double t2 = GetTime();
         if (vs_finish_mode() & 2) rlDrawRenderBatchActive(), glFinish();  // VS_FINISH=swap|both: tutto disegnato prima dello swap
         EndDrawing();

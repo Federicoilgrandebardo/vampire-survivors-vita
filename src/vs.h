@@ -2,6 +2,13 @@
 #pragma once
 
 #include "raylib.h"
+
+// VS_DET=<seme>: prova di determinismo per lo studio del multiplayer (dt fisso, PRNG proprio, hash per frame in <dati>/det.txt)
+extern int det_on;
+extern unsigned det_frame, det_calls;
+int det_rand(void);
+void det_begin(unsigned seed);
+void det_end(void);
 #include "third_party/cJSON.h"
 
 // Testo: con vs_font il glifo si trova da una tabella (raylib lo cerca in modo lineare, e il giapponese ne ha ~3000);
@@ -36,6 +43,9 @@ typedef struct VsVideo VsVideo;
 VsVideo *vs_video_open(const char *rel, int w, int h);
 int vs_video_update(VsVideo *v, float ms);
 Texture2D vs_video_texture(const VsVideo *v);
+void vs_video_loop(VsVideo *v);        // ricomincia da solo alla fine
+int vs_video_ready(const VsVideo *v);  // 1 quando c'e' almeno un fotogramma
+const char *vs_asset(const char *rel); // file nel VPK (arte fatta per il port): app0:assets/ sulla Vita, accanto all'eseguibile sul desktop
 void vs_video_close(VsVideo *v);
 
 // --- Atlanti (TexturePacker di Phaser: img/<nome>.json + png) ------------------
@@ -48,6 +58,8 @@ typedef struct {
 
 int atlas_load(const char *name);                              // 0 se fallisce
 const Frame *frame_get(const char *atlas, const char *frame);   // NULL se manca
+int atlas_add_image(const char *atlas, const char *frame, const char *path);  // un PNG intero come fotogramma (0 se manca)
+cJSON *lang_table(const char *file);  // lang/<file>.json gia' caricato (lingua -> translations -> ID)
 void frame_draw(const Frame *f, Vector2 center, int flip, float scale, Color tint);
 void frame_draw_ex(const Frame *f, Vector2 center, int flip, float sx, float sy, float angle, Color tint);
 
@@ -94,6 +106,7 @@ typedef struct {
 } Result;
 void game_start(const char *character);
 const char *game_prof(void);
+int vs_quality_mode(void);  // Opzioni: profilo Qualita' (attesa GPU, niente lampi) invece di Prestazioni (vs_game.c)
 int vs_finish_mode(void);  // VS_FINISH: 1 = rt, 2 = swap, 3 = both (main.c)
 void vs_gl_finish(void);  // VS_PROF: conteggi della scena di gioco
 int game_update(float dt);  // 0 finche' la partita continua

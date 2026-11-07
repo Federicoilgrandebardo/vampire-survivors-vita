@@ -26,6 +26,12 @@ Vita's 960x544. Frame rate on the real console is covered under Known Issues.*
 
 ## Changelog
 
+**v1.1** - local co-op for two Vitas on the same Wi-Fi, an intro at startup,
+much smoother heavy waves (around 56 fps where v1.0 dropped to 39), custom
+characters, a Jukebox, and Wolff's interface ideas: photosensitivity warning,
+pixel button glyphs, animated main menu, zoom and touch movement in the
+Options. Hidden somewhere is an experimental 3D view, see below.
+
 **v1.0** - both DLCs (Legacy of the Moonspell, Tides of the Foscari), trophies
 (two sets, needs NoTrpDrm), PC save import over Wi-Fi, a rebuilt Data Recovery
 screen with save deletion. Fixes: weapons picked up late, evolutions above all,
@@ -42,14 +48,14 @@ graphics, sounds, music and data are not in the VPK. You need your own copy, and
 you extract the data from it yourself with the setup tool below. DLCs work only
 if you own them: the tool picks up what your copy has. The only exceptions are
 the LiveArea images, made from the game's official artwork, the trophy pack,
-which carries the achievement texts and icons, and the screenshots in this
-README.
+which carries the achievement texts and icons, the startup intro, animation
+from the Ode to Castlevania announcement trailer (poncle / Konami) set to
+original music, and the screenshots in this README.
 
 ## Setup Instructions For End Users
 
 1. **Get the Phaser build.** In Steam, right-click Vampire Survivors,
-   Properties, Betas. Enter the access code `PhaserVersion2023`, pick
-   `old-engine` and let it download.
+   Properties, Betas, and pick `old-engine`. Let it download.
 
 2. **Run the setup tool** for your computer (Windows, macOS or Linux / Steam
    Deck; you can find it with each release). It finds your copy of the game on
@@ -113,6 +119,40 @@ plugin; without it the game runs normally, just without trophies.
 Achievements you already have earn their trophies when the game starts, imported
 ones included: import your PC save first and they arrive on the restart.
 
+## Co-op
+
+Two players, two Vitas, each with the game and its data installed (same
+version on both). Put both on the same Wi-Fi network, then from the main menu
+pick **Co-op**: one Vita hosts, the other joins. The joining player picks a
+character among the ones they have bought; the host picks the stage. Each
+player levels up on their own; if one falls, they come back at the other's
+next level-up, with half their health.
+
+## Custom Characters
+
+The port loads characters in the format of the Unity version's custom
+character beta (as made by Customello): put each one in its own folder under
+`ux0:data/VampireSurvivors/CustomCharacters/`, with its `character.json`,
+`localization.json`, `sprites/` and `skins/`. They show up in the character
+selection. Abilities the Phaser build never had (followers, ability cards,
+special controllers) are ignored. In co-op, a custom character the other Vita
+does not have falls back to Antonio there.
+
+## The Funny Glasses (experimental 3D view)
+
+A pair of Funny Glasses is hidden in the Mad Forest. Pick them up for 30
+seconds of 3D; after that, a **View** option in the Options switches the 3D
+view on for good. It lays the world on a tilted plane with the sprites
+standing up, in the spirit of the VS3D mod.
+
+**This is a beta and an easter egg, made for fun rather than to be played
+seriously.** The game was never designed for 3D: some props float or overlap,
+walls can look odd, ground effects stay flat, and it costs frame rate. Expect
+rough edges.
+
+Each stage also hides a vinyl record; the first one unlocks the **Jukebox** in
+the main menu.
+
 ## Controls
 
 | Vita | Game |
@@ -129,6 +169,8 @@ ones included: import your PC save first and they arrive on the restart.
   below 60 fps, down to roughly 25-30 with the busiest weapons: the enemy physics
   and the draw calls are at the limit of the Vita's CPU. Normal play runs at or
   close to 60 fps, on the DLC stages too.
+- The 3D view is experimental (see The Funny Glasses): visual glitches and a
+  lower frame rate are expected there.
 
 ## Not Included
 
@@ -153,8 +195,11 @@ The desktop build reads its data from `$VS_DATA` (default `gamedata/`).
 ## Credits
 
 - **poncle** for making Vampire Survivors. Please buy it, you need it anyway
-- **Wolff** ([WolffsRoom](https://github.com/WolffsRoom)) for the LiveArea art, the
-  crash dump behind the credits fix, and the work on trophies this port learned from
+- **Wolff** ([WolffsRoom](https://github.com/WolffsRoom)) for the LiveArea art, the animated
+  main menu, the button glyphs, a whole list of interface ideas, the crash dump behind the
+  credits fix, and the work on trophies this port learned from
+- **Marcin (DrakonPL)** for the performance work that showed where the frame time was going:
+  the GPU wait, audio off the main thread, the draw and physics ideas behind v1.1
 - **Richard Davey / Photon Storm** for [Phaser](https://github.com/phaserjs/phaser):
   `src/phaser.c` is a C translation of the parts of Phaser 3.55.2 the game uses
 - **Rex** for [phaser3-rex-plugins](https://github.com/rexrainbow/phaser3-rex-plugins)

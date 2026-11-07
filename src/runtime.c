@@ -74,6 +74,20 @@ void vs_delete_all_and_exit(void) {
     exit(0);
 }
 
+#define NET_WRAP_INPUT
+#include "net.h"
+const char *vs_asset(const char *rel) {
+    static char buf[4][600];
+    static int i;
+    char *b = buf[i++ & 3];
+#ifdef __vita__
+    snprintf(b, sizeof(buf[0]), "app0:assets/%s", rel);
+#else
+    const char *e = getenv("VS_ASSETS");
+    snprintf(b, sizeof(buf[0]), "%s/%s", e ? e : TextFormat("%sassets", GetApplicationDirectory()), rel);
+#endif
+    return b;
+}
 const char *vs_path(const char *rel) {
     static char buf[8][600];
     static int i;
@@ -141,6 +155,7 @@ static int atlas_index(const char *name) {
     return -1;
 }
 
+static void put_frame(int ai, const char *name, Frame f);
 static void add_frame(int ai, Texture2D *tex, cJSON *fr, const char *name) {
     cJSON *r = cJSON_GetObjectItem(fr, "frame"), *s = cJSON_GetObjectItem(fr, "spriteSourceSize"),
           *ss = cJSON_GetObjectItem(fr, "sourceSize");
@@ -163,6 +178,9 @@ static void add_frame(int ai, Texture2D *tex, cJSON *fr, const char *name) {
         f.sw = f.w;
         f.sh = f.h;
     }
+    put_frame(ai, name, f);
+}
+static void put_frame(int ai, const char *name, Frame f) {
     unsigned h = hash(ai + 1, name);
     for (unsigned k = 0; k < HASH_SIZE; k++) {
         Slot *sl = &slots[(h + k) & (HASH_SIZE - 1)];
@@ -221,6 +239,23 @@ int atlas_load(const char *name) {
         }
     }
     cJSON_Delete(j);
+    return 1;
+}
+
+// Un PNG intero come fotogramma di un atlante senza JSON (personaggi CUSTOM): l'atlante nasce al primo
+int atlas_add_image(const char *atlas, const char *frame, const char *path) {
+    int ai = atlas_index(atlas);
+    if (ai < 0) {
+        if (n_atlases == MAX_ATLASES) return 0;
+        if (!slots) slots = calloc(HASH_SIZE, sizeof(Slot));
+        ai = n_atlases++;
+        snprintf(atlases[ai].name, sizeof(atlases[ai].name), "%s", atlas);
+    }
+    if (!FileExists(path)) return 0;
+    Texture2D *t = malloc(sizeof(*t));  // una texture per fotogramma; un atlante impacchettato se i CUSTOM diventano tanti
+    *t = LoadTexture(path);
+    if (!t->id) { free(t); return 0; }
+    put_frame(ai, frame, (Frame){ t, 0, 0, (short)t->width, (short)t->height, 0, 0, (short)t->width, (short)t->height });
     return 1;
 }
 
@@ -303,6 +338,7 @@ static cJSON *lang_file(const char *file) {
     }
     return NULL;
 }
+cJSON *lang_table(const char *file) { return lang_file(file); }  // per aggiungere testi (personaggi CUSTOM)
 const char *tr_of(const char *file, const char *id, const char *field) {
     cJSON *j = lang_file(file);
     const char *codes[] = { lang_code, "en" };
@@ -809,10 +845,12 @@ struct VsVideo {
     int done;
 #ifdef __vita__
     SceAvPlayerHandle player;
-    int slot, started;
+    int slot, started, ready;
     float waited;
 #else
     FILE *pipe;
+    char path[600];
+    int ready, loop;
     unsigned char *buf;
     float t;
     int frame;
@@ -906,7 +944,7 @@ VsVideo *vs_video_open(const char *rel, int w, int h) {
     SceAvPlayerHandle pl = sceAvPlayerInit(&d);
     av_log("init %s slot %d -> %08x gxm %p", rel, s, pl, (void *)av_slots[s].gxm);
     if (!pl || ((unsigned)pl & 0xffff0000u) == 0x806a0000u) return NULL;  // l'handle e' un indirizzo (sopra 0x80000000): errore solo 0x806Axxxx
-    int as = sceAvPlayerAddSource(pl, vs_path(rel));
+    int as = sceAvPlayerAddSource(pl, strchr(rel, ':') ? rel : vs_path(rel));
     av_log("addsource %08x", as);
     if (as < 0) { sceAvPlayerClose(pl); return NULL; }
     VsVideo *v = calloc(1, sizeof(VsVideo));
@@ -927,11 +965,14 @@ int vs_video_update(VsVideo *v, float ms) {
         static int nf;
         if (nf++ % 60 == 0) av_log("frame %d data %p %ux%u ts %llu", nf, (void *)f.pData, f.details.video.width, f.details.video.height, (unsigned long long)f.timeStamp);
         SceGxmTexture *t = av_slots[v->slot].gxm;
+        v->ready = 1;
         sceGxmTextureInitLinear(t, f.pData, SCE_GXM_TEXTURE_FORMAT_YVU420P2_CSC1, f.details.video.width, f.details.video.height, 0);
         sceGxmTextureSetMinFilter(t, SCE_GXM_TEXTURE_FILTER_LINEAR), sceGxmTextureSetMagFilter(t, SCE_GXM_TEXTURE_FILTER_LINEAR);
     }
     return 1;
 }
+void vs_video_loop(VsVideo *v) { if (v) sceAvPlayerSetLooping(v->player, SCE_TRUE); }
+int vs_video_ready(const VsVideo *v) { return v && v->ready; }
 void vs_video_close(VsVideo *v) {
     if (!v) return;
     sceAvPlayerStop(v->player);
@@ -942,10 +983,12 @@ void vs_video_close(VsVideo *v) {
 #else
 VsVideo *vs_video_open(const char *rel, int w, int h) {  // semplificazione: anteprima sul Mac, serve ffmpeg nel PATH
     char cmd[700];
-    snprintf(cmd, sizeof(cmd), "ffmpeg -v quiet -i '%s' -f rawvideo -pix_fmt rgba -", vs_path(rel));
+    const char *path = rel[0] == '/' ? rel : vs_path(rel);
+    snprintf(cmd, sizeof(cmd), "ffmpeg -v quiet -i '%s' -f rawvideo -pix_fmt rgba -", path);
     FILE *p = popen(cmd, "r");
     if (!p) return NULL;
     VsVideo *v = calloc(1, sizeof(VsVideo));
+    snprintf(v->path, sizeof(v->path), "%s", path);
     v->pipe = p, v->buf = calloc((size_t)w * h, 4);
     Image im = { v->buf, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
     v->tex = LoadTextureFromImage(im);
@@ -958,12 +1001,20 @@ int vs_video_update(VsVideo *v, float ms) {  // i fotogrammi a 30 fps sul tempo 
     size_t n = (size_t)v->tex.width * v->tex.height * 4;
     int want = (int)(v->t * 30 / 1000), got = 0;
     while (v->frame < want) {
-        if (fread(v->buf, 1, n, v->pipe) != n) return !(v->done = 1);
+        if (fread(v->buf, 1, n, v->pipe) != n) {
+            if (!v->loop) return !(v->done = 1);
+            char cmd[700];
+            snprintf(cmd, sizeof(cmd), "ffmpeg -v quiet -i '%s' -f rawvideo -pix_fmt rgba -", v->path);
+            pclose(v->pipe);
+            if (!(v->pipe = popen(cmd, "r")) || fread(v->buf, 1, n, v->pipe) != n) return !(v->done = 1);
+        }
         v->frame++, got = 1;
     }
-    if (got) UpdateTexture(v->tex, v->buf);
+    if (got) UpdateTexture(v->tex, v->buf), v->ready = 1;
     return 1;
 }
+void vs_video_loop(VsVideo *v) { if (v) v->loop = 1; }
+int vs_video_ready(const VsVideo *v) { return v && v->ready; }
 void vs_video_close(VsVideo *v) {
     if (!v) return;
     pclose(v->pipe);

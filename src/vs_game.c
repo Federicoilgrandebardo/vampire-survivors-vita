@@ -13,6 +13,10 @@
 
 #include "phaser.h"
 #include "rlgl.h"
+#include "audio.h"
+#define NET_WRAP_INPUT
+#include "net.h"
+#include "port_lang.h"  // in testa: le reliquie del port mettono i loro testi in itemLang gia' al caricamento del salvataggio
 
 // Tutto cio' che la partita alloca passa da gmem e si libera a game_start (cache e risorse raylib escluse)
 #include "saveimport.h"
@@ -32,7 +36,7 @@ Result last_result;
 static int menu_launching;  // la partita parte dal menu: CharSelectionScene ha gia' fatto setupRNJ
 static Shader fill_shader;
 
-static float frand(void) { return (float)rand() / ((float)RAND_MAX + 1.0f); }  // Math.random in [0,1)
+static float frand(void) { return (float)det_rand() / ((float)RAND_MAX + 1.0f); }  // Math.random in [0,1)
 static float num(cJSON *o, const char *k, float def) {
     cJSON *n = cJSON_GetObjectItem(o, k);
     return cJSON_IsNumber(n) ? (float)n->valuedouble : def;
@@ -258,6 +262,7 @@ typedef struct BulletVT BulletVT;
 typedef struct WeaponVT WeaponVT;
 
 struct Weapon {  // 0xe49a
+    int player;  // di chi e' (partita a due)
     const WeaponVT *vt;
     const char *bulletType;
     float interval, repeatInterval, secondaryPower, power, area, speed, amount, duration, critChance, critMul,
@@ -589,6 +594,7 @@ typedef struct {  // sottoclassi di Pickup: metodi sovrascritti (NULL = quello d
 
 struct Pickup {  // 0x166d5 (+ sottoclassi: 0x50ae Gem, 0x8af Treasure)
     Sprite s;
+    int player;  // verso chi vola (partita a due)
     float DEFAULT_SPEED, radius, speed, time, value, feverMS;
     int goToPlayer, isStationary, disableGet, isCullable, isTeleportOnCull, isGem;
     int quiet;  // Silver Wind: volume 0.1 invece di 0.35; come nell'originale resta nel pool
@@ -703,7 +709,7 @@ static struct {  // 0x5103: Core
     Magnet *Magnet;
     Stage *Stage;
     SpriteList Enemies, EnemyGroup, PickupGroup, BulletGroup, playerGroup, MagnetGroup, PickupsWithArrows;
-    Weapon *Weapons[16], *RemovedWeapons[16], *HiddenWeapons[16];
+    Weapon **Weapons, **RemovedWeapons, **HiddenWeapons;  // quelli del giocatore corrente (PlayerSlot)
     int n_RemovedWeapons, n_HiddenWeapons;
     int n_weapons, SurvivedSeconds, updateTick, updateFreq, MaxGems, IsTimeStopped, canInterrupt, canPause, kills, enterPause;
     int EnterWeaponSelection, WeaponSelectionEvo;  // Candybox: WeaponSelectionType 'normal' / 'evo'
@@ -739,6 +745,34 @@ static struct {  // 0x5103: Core
     const char *RunPickups[512];  // PlayerOptions.RunPickups / RunPickups_Coins (riepilogo di fine partita)
     int n_RunPickups, RunPickups_Coins;
 } Core;
+
+// --- Partita a due: lo stato di ciascun giocatore. Core.Player e le armi puntano al giocatore corrente, cosi' la logica tradotta
+// dall'originale resta la stessa e gira una volta per giocatore. Con un giocatore solo non cambia mai.
+typedef struct {
+    Player *player;
+    Magnet *magnet;
+    Weapon *weapons[16], *removed[16], *hidden[16];
+    int n_weapons, n_removed, n_hidden;
+    Vector2 lastVelocity;
+} PlayerSlot;
+static PlayerSlot Slots[2];
+static int Players_n = 1, Scene_owner, Pickup_owner;
+int game_context;
+void game_context_set(int i) {
+    if (i == game_context) return;
+    PlayerSlot *o = &Slots[game_context], *n = &Slots[i];
+    o->player = Core.Player, o->magnet = Core.Magnet, o->n_weapons = Core.n_weapons, o->n_removed = Core.n_RemovedWeapons, o->n_hidden = Core.n_HiddenWeapons;
+    game_context = i;
+    Core.Player = n->player, Core.Magnet = n->magnet, Core.n_weapons = n->n_weapons, Core.n_RemovedWeapons = n->n_removed, Core.n_HiddenWeapons = n->n_hidden;
+    Core.Weapons = n->weapons, Core.RemovedWeapons = n->removed, Core.HiddenWeapons = n->hidden;
+}
+static void Players_reset(void) {
+    memset(Slots, 0, sizeof(Slots));
+    game_context = 0, Players_n = 1, Scene_owner = Pickup_owner = 0;
+    Core.Weapons = Slots[0].weapons, Core.RemovedWeapons = Slots[0].removed, Core.HiddenWeapons = Slots[0].hidden;
+}
+static int Players_isLocal(void) { return Players_n == 1 || game_context == net_role; }  // solo il proprio HUD
+static int Players_ofSprite(const Sprite *s) { return Players_n > 1 && s->owner == (void *)Slots[1].player ? 1 : 0; }
 
 // ============================================================================
 // 0x17260: SoundManager (effetti e musica)
@@ -809,7 +843,7 @@ static const struct { const char *key, *file; } SOUND_FILES[] = {
 };
 #define N_SOUND_FILES (int)(sizeof(SOUND_FILES) / sizeof(*SOUND_FILES))
 #define SOUND_ALIASES 8  // istanze contemporanee dello stesso effetto (WebAudio non ha limite: oltre si riusa la piu' vecchia)
-static struct { Sound base, alias[SOUND_ALIASES]; int loaded, next, instances; } SoundLib[N_SOUND_FILES > 0 ? N_SOUND_FILES : 1];
+static struct { Sound base, alias[SOUND_ALIASES]; int loaded, next, instances, loading; float wantVolume, wantPitch; double wantAt; } SoundLib[N_SOUND_FILES > 0 ? N_SOUND_FILES : 1];
 static struct { Music music; int idx, playing, loop; float volume, currentVolume, fadeFrom, fadeTo, fadeT, fadeDur; } BGM = { .idx = -1 };
 static float SoundsVolume = 1, MusicVolume = 1, SFXVolumeFactor = 1;  // PlayerOptions (default: audio attivo) e Core.SFXVolumeFactor
 
@@ -818,6 +852,27 @@ static int Sound_index(const char *key) {
     return -1;
 }
 static void Sound_instancesDown(void *ctx) { SoundLib[(intptr_t)ctx].instances--; }
+// Ogni flusso musicale si apre e si chiude da qui: il thread della musica non deve averlo in lista mentre cambia (audio.c)
+static void Music_open(Music *m, const char *path) { au_music_remove(m); *m = LoadMusicStream(path); }
+static void Music_close(Music *m) { au_music_remove(m); UnloadMusicStream(*m); }
+static void Sound_setBase(int i, Sound s) {
+    SoundLib[i].base = s, SoundLib[i].loaded = 1, SoundLib[i].loading = 0;
+    for (int a = 0; a < SOUND_ALIASES && s.frameCount; a++) SoundLib[i].alias[a] = LoadSoundAlias(s);
+}
+static void Sound_start(int i, float volume, float pitch) { au_sound_play(SoundLib[i].alias[SoundLib[i].next++ % SOUND_ALIASES], volume, pitch); }
+// Primo uso: i file piccoli si caricano in background e l'effetto parte appena e' pronto, se e' ancora in tempo (70 ms sulla Vita,
+// e un frame ne ha 16); quelli grandi, come le musiche dei forzieri, si caricano subito: arrivano con la scena in pausa e non devono andare persi.
+#define SOUND_BACKGROUND_MAX_BYTES (64 * 1024)
+#define SOUND_LATE_S 0.25
+static void Sound_pollLoads(void) {
+    int i;
+    Sound loaded;
+    while (au_load_poll(&i, &loaded)) {
+        Sound_setBase(i, loaded);
+        if (SoundLib[i].wantAt > 0 && loaded.frameCount && GetTime() - SoundLib[i].wantAt < SOUND_LATE_S) Sound_start(i, SoundLib[i].wantVolume, SoundLib[i].wantPitch);
+        SoundLib[i].wantAt = 0;
+    }
+}
 // SoundManager.PlaySound(key, config, delay, maxInstances): volume <= 0 = config senza volume
 static void Sound_PlaySound(const char *key, float volume, float rate, float detune, float delay, int maxInstances) {
     if (SoundsVolume == 0 || !IsAudioDeviceReady()) return;
@@ -828,20 +883,18 @@ static void Sound_PlaySound(const char *key, float volume, float rate, float det
         time_addEvent(delay, 0, 0, Sound_instancesDown, (void *)(intptr_t)i);
         SoundLib[i].instances++;
     }
+    float v = (volume > 0 ? volume * 0.5f : 0.1f) * SoundsVolume * SFXVolumeFactor;
+    float pitch = (rate > 0 ? rate : 1) * powf(2, detune / 1200);  // WebAudio: playbackRate * 2^(detune/1200)
     if (!SoundLib[i].loaded) {
-        SoundLib[i].loaded = 1;
         char rel[128];
         snprintf(rel, sizeof(rel), "sfx/%s", SOUND_FILES[i].file);
-        SoundLib[i].base = LoadSound(vs_path(rel));
-        for (int a = 0; a < SOUND_ALIASES && SoundLib[i].base.frameCount; a++) SoundLib[i].alias[a] = LoadSoundAlias(SoundLib[i].base);
+        const char *path = vs_path(rel);
+        if (!SoundLib[i].loading && GetFileLength(path) <= SOUND_BACKGROUND_MAX_BYTES && au_load_request(i, path)) SoundLib[i].loading = 1;
+        if (SoundLib[i].loading) { SoundLib[i].wantVolume = v, SoundLib[i].wantPitch = pitch, SoundLib[i].wantAt = GetTime(); return; }
+        Sound_setBase(i, LoadSound(path));
     }
     if (!SoundLib[i].base.frameCount) return;
-    float v = volume > 0 ? volume * 0.5f : 0.1f;
-    v *= SoundsVolume * SFXVolumeFactor;
-    Sound *s = &SoundLib[i].alias[SoundLib[i].next++ % SOUND_ALIASES];
-    SetSoundVolume(*s, v);
-    SetSoundPitch(*s, (rate > 0 ? rate : 1) * powf(2, detune / 1200));  // WebAudio: playbackRate * 2^(detune/1200)
-    PlaySound(*s);
+    Sound_start(i, v, pitch);
 }
 static void Sound_PlaySimple(const char *key, float volume) { Sound_PlaySound(key, volume, 1, 0, 0, 0); }
 // La PreloadScene carica tutto all'avvio; qui solo gli effetti frequenti, gli altri al primo uso (memoria della Vita)
@@ -852,12 +905,10 @@ static void Sound_Preload(void) {
     SoundsVolume = 0;  // carica senza suonare
     for (size_t k = 0; k < sizeof(keys) / sizeof(*keys); k++) {
         int i = Sound_index(keys[k]);
-        if (i < 0 || SoundLib[i].loaded) continue;
-        SoundLib[i].loaded = 1;
+        if (i < 0 || SoundLib[i].loaded || SoundLib[i].loading) continue;
         char rel[128];
         snprintf(rel, sizeof(rel), "sfx/%s", SOUND_FILES[i].file);
-        SoundLib[i].base = LoadSound(vs_path(rel));
-        for (int a = 0; a < SOUND_ALIASES && SoundLib[i].base.frameCount; a++) SoundLib[i].alias[a] = LoadSoundAlias(SoundLib[i].base);
+        Sound_setBase(i, LoadSound(vs_path(rel)));
     }
     SoundsVolume = v;
 }
@@ -867,15 +918,16 @@ static void Sound_PlaySeek(const char *key, float volume, float seek) {
     if (SoundsVolume == 0 || !IsAudioDeviceReady()) return;
     int i = Sound_index(key);
     if (i < 0) return;
-    if (SeekSfx.on) UnloadMusicStream(SeekSfx.m), SeekSfx.on = 0;
+    if (SeekSfx.on) Music_close(&SeekSfx.m), SeekSfx.on = 0;
     char rel[128];
     snprintf(rel, sizeof(rel), "sfx/%s", SOUND_FILES[i].file);
-    SeekSfx.m = LoadMusicStream(vs_path(rel));
+    Music_open(&SeekSfx.m, vs_path(rel));
     if (!SeekSfx.m.frameCount) return;
     SeekSfx.m.looping = 0;
-    SetMusicVolume(SeekSfx.m, (volume > 0 ? volume * 0.5f : 0.1f) * SoundsVolume * SFXVolumeFactor);
+    au_music_volume(&SeekSfx.m, (volume > 0 ? volume * 0.5f : 0.1f) * SoundsVolume * SFXVolumeFactor);
     PlayMusicStream(SeekSfx.m);
-    SeekMusicStream(SeekSfx.m, seek);
+    au_music_seek(&SeekSfx.m, seek);
+    au_music_add(&SeekSfx.m);
     SeekSfx.on = 1, SeekSfx.idx = i;
 }
 // PlaySound(key, { loop: true }): un flusso a parte (il vento di Gallo Tower), fermato da StopSound o dalla partita nuova
@@ -884,23 +936,25 @@ static void Sound_PlayLoop(const char *key, float volume) {
     if (SoundsVolume == 0 || !IsAudioDeviceReady()) return;
     int i = Sound_index(key);
     if (i < 0) return;
-    if (LoopSfx.on) UnloadMusicStream(LoopSfx.m), LoopSfx.on = 0;
+    if (LoopSfx.on) Music_close(&LoopSfx.m), LoopSfx.on = 0;
     char rel[128];
     snprintf(rel, sizeof(rel), "sfx/%s", SOUND_FILES[i].file);
-    LoopSfx.m = LoadMusicStream(vs_path(rel));
+    Music_open(&LoopSfx.m, vs_path(rel));
     if (!LoopSfx.m.frameCount) return;
     LoopSfx.m.looping = 1;
-    SetMusicVolume(LoopSfx.m, fminf(1, volume * 0.5f * SoundsVolume * SFXVolumeFactor));
+    au_music_volume(&LoopSfx.m, fminf(1, volume * 0.5f * SoundsVolume * SFXVolumeFactor));
     PlayMusicStream(LoopSfx.m);
+    au_music_add(&LoopSfx.m);
     LoopSfx.on = 1, LoopSfx.idx = i;
 }
-static void Sound_LoopVolume(float v) { if (LoopSfx.on) SetMusicVolume(LoopSfx.m, v); }  // sound.volume = v (Sketamari)
+static void Sound_LoopVolume(float v) { if (LoopSfx.on) au_music_volume(&LoopSfx.m, v); }  // sound.volume = v (Sketamari)
 static void Sound_StopSound(const char *key) {  // stopByKey
     int i = Sound_index(key);
-    if (i >= 0 && LoopSfx.on && LoopSfx.idx == i) UnloadMusicStream(LoopSfx.m), LoopSfx.on = 0;
+    if (i >= 0) SoundLib[i].wantAt = 0;  // un effetto ancora in caricamento non parte piu'
+    if (i >= 0 && LoopSfx.on && LoopSfx.idx == i) Music_close(&LoopSfx.m), LoopSfx.on = 0;
     if (i < 0 || !SoundLib[i].loaded) return;
-    for (int a = 0; a < SOUND_ALIASES; a++) StopSound(SoundLib[i].alias[a]);
-    if (SeekSfx.on && SeekSfx.idx == i) UnloadMusicStream(SeekSfx.m), SeekSfx.on = 0;
+    for (int a = 0; a < SOUND_ALIASES; a++) au_sound_stop(SoundLib[i].alias[a]);
+    if (SeekSfx.on && SeekSfx.idx == i) Music_close(&SeekSfx.m), SeekSfx.on = 0;
 }
 // PlayMusic(key, { volume, loop }): musica in streaming; rate/detune delle mod di stage: Foresta senza
 static void Sound_PlayMusic(const char *key, float volume, int loop) {
@@ -908,10 +962,10 @@ static void Sound_PlayMusic(const char *key, float volume, int loop) {
     int i = Sound_index(key);
     if (i < 0) return;
     if (BGM.idx != i) {
-        if (BGM.idx >= 0) UnloadMusicStream(BGM.music);
+        if (BGM.idx >= 0) Music_close(&BGM.music);
         char rel[128];
         snprintf(rel, sizeof(rel), "sfx/%s", SOUND_FILES[i].file);
-        BGM.music = LoadMusicStream(vs_path(rel));
+        Music_open(&BGM.music, vs_path(rel));
         BGM.idx = i;
     }
     if (!BGM.music.frameCount) return;
@@ -920,11 +974,12 @@ static void Sound_PlayMusic(const char *key, float volume, int loop) {
     BGM.currentVolume = volume;
     BGM.volume = volume * MusicVolume;
     BGM.fadeDur = 0;
-    SetMusicVolume(BGM.music, BGM.volume);
+    au_music_volume(&BGM.music, BGM.volume);
     PlayMusicStream(BGM.music);
+    au_music_add(&BGM.music);
     BGM.playing = 1;
 }
-static void Sound_StopMusic(void) { if (BGM.playing) { StopMusicStream(BGM.music); BGM.playing = 0; } }
+static void Sound_StopMusic(void) { if (BGM.playing) { au_music_stop(&BGM.music); BGM.playing = 0; } }
 static const char *po_str(const char *k);
 static void Sound_PlayMusic(const char *key, float volume, int loop);
 // Sound.SetupAndPlayBGM_Banger: la musica scelta (SelectedBGM) con le mod Hyper/Forsaken di music.json
@@ -943,25 +998,26 @@ static void Sound_FadeMusic(float volume, float ms) {
     float target = volume * MusicVolume;
     if (MusicVolume == 0) target = 0, ms = 0;
     if (ms > 0) { BGM.fadeFrom = BGM.volume, BGM.fadeTo = target, BGM.fadeT = 0, BGM.fadeDur = ms; }
-    else { BGM.volume = target; BGM.fadeDur = 0; SetMusicVolume(BGM.music, BGM.volume); }
+    else { BGM.volume = target; BGM.fadeDur = 0; au_music_volume(&BGM.music, BGM.volume); }
 }
 static void (*Sound_tickHook)(float delta);  // DirecterManager: timer e musiche delle fasi a tempo reale
 static void Sound_Update(float delta) {  // la musica va avanti anche con la scena in pausa (level-up, forziere)
+    Sound_pollLoads();
     if (Sound_tickHook) Sound_tickHook(delta);
     if (SeekSfx.on) {
-        UpdateMusicStream(SeekSfx.m);
-        if (!IsMusicStreamPlaying(SeekSfx.m)) UnloadMusicStream(SeekSfx.m), SeekSfx.on = 0;
+        au_music_update(&SeekSfx.m);
+        if (!IsMusicStreamPlaying(SeekSfx.m)) Music_close(&SeekSfx.m), SeekSfx.on = 0;
     }
-    if (LoopSfx.on) UpdateMusicStream(LoopSfx.m);
+    if (LoopSfx.on) au_music_update(&LoopSfx.m);
     if (!BGM.playing) return;
     if (BGM.fadeDur > 0) {
         BGM.fadeT += delta;
         float k = BGM.fadeT >= BGM.fadeDur ? 1 : BGM.fadeT / BGM.fadeDur;
         BGM.volume = BGM.fadeFrom + (BGM.fadeTo - BGM.fadeFrom) * k;
-        SetMusicVolume(BGM.music, BGM.volume);
+        au_music_volume(&BGM.music, BGM.volume);
         if (k >= 1) BGM.fadeDur = 0;
     }
-    UpdateMusicStream(BGM.music);
+    au_music_update(&BGM.music);
 }
 
 // ============================================================================
@@ -995,8 +1051,12 @@ static const char PlayerOptions_ctor[] =
 static cJSON *po(const char *k) { return cJSON_GetObjectItemCaseSensitive(PlayerOptions, k); }
 static double po_num(const char *k) { cJSON *n = po(k); return cJSON_IsNumber(n) ? n->valuedouble : cJSON_IsTrue(n); }
 static int po_is(const char *k) { return po_num(k) != 0; }  // un booleano o un numero (SelectedRandomEvents di AsyncLoad e' 0)
+int vs_quality_mode(void) { return PlayerOptions && po_is("QualityMode"); }
 static const char *po_str(const char *k) { return cJSON_GetStringValue(po(k)); }
-static void po_put(const char *k, cJSON *v) { cJSON_ReplaceItemInObjectCaseSensitive(PlayerOptions, k, v); }
+static void po_put(const char *k, cJSON *v) {  // le chiavi del port (TouchMove, zoom...) non sono nei default: Replace da solo le perdeva
+    if (po(k)) cJSON_ReplaceItemInObjectCaseSensitive(PlayerOptions, k, v);
+    else cJSON_AddItemToObject(PlayerOptions, k, v);
+}
 static void po_set(const char *k, double v) { cJSON *n = po(k); if (cJSON_IsNumber(n)) cJSON_SetNumberValue(n, v); else po_put(k, cJSON_CreateNumber(v)); }
 static void po_add(const char *k, double v) { po_set(k, po_num(k) + v); }
 LATER static void po_setb(const char *k, int b) { po_put(k, cJSON_CreateBool(b)); }
@@ -1050,9 +1110,120 @@ static int DLC_Has(const char *d) {  // 0x1679c: data/dlc.json scritto dal tool 
     cJSON_ArrayForEach(v, data_get("dlc")) if (!strcmp(v->valuestring, d)) return 1;
     return 0;
 }
+// Personaggi CUSTOM (beta della versione Unity, giugno 2026; formato di Customello): <dati>/CustomCharacters/<cartella>/
+// character.json (array per livelli, gli stessi campi dei personaggi 1.5), localization.json, sprites/*.png, skins/<spriteFolder>/*.png.
+// Diventano CUSTOM_<CARTELLA> nella tabella characters sopra la base di Antonio. Ignorati (non esistono nella 1.5):
+// characterController, carte abilita', seguaci, bloodColor, ignoreWalls e gli altri comportamenti nuovi.
+#include <dirent.h>
+#include <ctype.h>
+static void Custom_loadPngs(const char *folder, const char *sub, const char *prefix_in) {  // ogni PNG di <cartella>/<sub> come "<prefix><file>"
+    char dir[256], prefix[128];
+    snprintf(prefix, sizeof(prefix), "%s", prefix_in);  // TextFormat ha pochi buffer a giro: il prefisso del chiamante va copiato
+    snprintf(dir, sizeof(dir), "%s", vs_path(TextFormat("CustomCharacters/%s/%s", folder, sub)));
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    while (d && (de = readdir(d)))
+        if (strlen(de->d_name) > 4 && !strcasecmp(de->d_name + strlen(de->d_name) - 4, ".png"))
+            atlas_add_image("custom", TextFormat("%s%s", prefix, de->d_name), TextFormat("%s/%s", dir, de->d_name));
+    if (d) closedir(d);
+}
+static void CustomCharacters_load(void) {
+    static int done;
+    cJSON *chars = data_get("characters"), *base = tbl0("characters", "ANTONIO");
+    if (done || !chars || !base) return;
+    done = 1;
+    DIR *dir = opendir(vs_path("CustomCharacters"));
+    struct dirent *de;
+    while (dir && (de = readdir(dir))) {
+        if (de->d_name[0] == '.' || strlen(de->d_name) > 40) continue;
+        char folder[48], id[56] = "CUSTOM_";
+        snprintf(folder, sizeof(folder), "%s", de->d_name);
+        for (int i = 0, n = 7; folder[i] && n < 55; i++) id[n++] = isalnum((unsigned char)folder[i]) ? (char)toupper((unsigned char)folder[i]) : '_', id[n] = 0;
+        cJSON *arr = read_json(TextFormat("CustomCharacters/%s/character.json", folder)), *c0 = cJSON_GetArrayItem(arr, 0), *f;
+        if (!cJSON_IsArray(arr) || !cJSON_IsObject(c0) || cJSON_GetObjectItem(chars, id)) { cJSON_Delete(arr); continue; }
+        cJSON *e = cJSON_Duplicate(base, 1);  // i campi che il gioco si aspetta, poi quelli del file
+        cJSON_ArrayForEach(f, c0) obj_set(e, f->string, cJSON_Duplicate(f, 1));
+        Custom_loadPngs(folder, "sprites", TextFormat("%s/", folder));
+        obj_set(e, "textureName", cJSON_CreateString("custom"));
+        obj_set(e, "spriteName", cJSON_CreateString(TextFormat("%s/%s", folder, str(c0, "spriteName") ? str(c0, "spriteName") : "")));
+        cJSON *skins = cJSON_CreateArray(), *sk;
+        int si = 0;
+        cJSON_ArrayForEach(sk, cJSON_GetObjectItem(c0, "skins")) {  // spriteFolder: skins/<cartella>/ come "<personaggio>/<cartella>/<file>"
+            cJSON *s = cJSON_Duplicate(sk, 1);
+            const char *sf = str(sk, "spriteFolder");
+            if (sf) Custom_loadPngs(folder, TextFormat("skins/%s", sf), TextFormat("%s/%s/", folder, sf)),
+                    Custom_loadPngs(folder, TextFormat("skins/%s/sprites", sf), TextFormat("%s/%s/", folder, sf));  // Customello: skins/red/sprites/
+            obj_set(s, "id", cJSON_CreateNumber(si++));
+            obj_set(s, "textureName", cJSON_CreateString("custom"));
+            obj_set(s, "spriteName", cJSON_CreateString(sf ? TextFormat("%s/%s/%s", folder, sf, str(sk, "spriteName")) : TextFormat("%s/%s", folder, str(sk, "spriteName"))));
+            cJSON_AddItemToArray(skins, s);
+        }
+        if (!si) cJSON_AddItemToArray(skins, cJSON_Parse(TextFormat("{\"id\":0,\"name\":\"Default\",\"textureName\":\"custom\",\"spriteName\":\"%s\",\"walkingFrames\":%d,\"unlocked\":true}",
+                                                                     str(e, "spriteName"), (int)num(e, "walkingFrames", 1))));
+        obj_set(e, "skins", skins), obj_set(e, "currentSkinIndex", cJSON_CreateNumber(0));
+        const char *w = str(e, "startingWeapon");  // armi della versione nuova (BATTILIA...) che la 1.5 non ha: la Frusta
+        if (!w || !tbl0("weapons", w)) obj_set(e, "startingWeapon", cJSON_CreateString("WHIP"));
+        obj_set(e, "hidden", cJSON_CreateFalse());
+        cJSON *a = cJSON_CreateArray();  // [base, bonus per livello...]
+        cJSON_AddItemToArray(a, e);
+        for (int i = 1; i < cJSON_GetArraySize(arr); i++) cJSON_AddItemToArray(a, cJSON_Duplicate(cJSON_GetArrayItem(arr, i), 1));
+        cJSON_AddItemToObject(chars, id, a);
+        cJSON *loc = read_json(TextFormat("CustomCharacters/%s/localization.json", folder)), *lg, *cl = lang_table("characterLang");
+        cJSON_ArrayForEach(lg, loc) {  // "it" / "IT" / "pt-br": i codici del gioco (langKeys.json)
+            const char *code = NULL;
+            for (int i = 0; Lang_codeAt(i); i++) if (!strcasecmp(Lang_codeAt(i), lg->string)) code = Lang_codeAt(i);
+            cJSON *tr = code ? cJSON_GetObjectItem(cJSON_GetObjectItem(cl, code), "translations") : NULL;
+            if (tr && !cJSON_GetObjectItem(tr, id)) cJSON_AddItemToObject(tr, id, cJSON_Duplicate(lg, 1));
+        }
+        cJSON_Delete(loc), cJSON_Delete(arr);
+        TraceLog(LOG_INFO, "CUSTOM: %s (%s), arma %s, sprite %s %s", id, str(e, "charName"), str(e, "startingWeapon"), str(e, "spriteName"),
+                 frame_get("custom", str(e, "spriteName")) ? "ok" : "MANCANTE");
+    }
+    if (dir) closedir(dir);
+}
+// Reliquie del port (non sono nell'originale): gli occhiali buffi sbloccano per sempre la Vista 3D, un vinile per stage sblocca
+// i suoi brani (BGM e sideBBGM) nel Jukebox. Sono voci di items come le altre reliquie: raccolta, CollectedItems e scena "trovata".
+static float Glasses_fx;  // 1 -> 0 dopo aver preso gli occhiali: la realta' si piega (fisheye) mentre arriva la Vista 3D
+static float Glasses_left;  // secondi di Vista 3D regalati dagli occhiali (poi resta l'opzione del menu)
+static void PortRelic_add(const char *key_in, const char *frame_in, const char *stage) {
+    char key[64], frame[32];  // arrivano da TextFormat, che qui sotto si richiama piu' volte
+    snprintf(key, sizeof(key), "%s", key_in), snprintf(frame, sizeof(frame), "%s", frame_in);
+    cJSON *items = data_get("items"), *e = cJSON_Duplicate(cJSON_GetObjectItem(items, "RELIC_GRIMOIRE"), 1);
+    cJSON *e0 = cJSON_IsArray(e) ? cJSON_GetArrayItem(e, 0) : e, *il = lang_table("itemLang"), *sl = lang_table("stageLang");
+    const char *kn = stage ? "relic_vinyl_name" : "relic_glasses_name", *kd = stage ? "relic_vinyl_desc" : "relic_glasses_desc";
+    const char *sn_en = stage ? str(tbl0("stages", stage), "stageName") : NULL;
+    obj_set(e0, "texture", cJSON_CreateString("port")), obj_set(e0, "frameName", cJSON_CreateString(frame));
+    obj_set(e0, "name", cJSON_CreateString(TextFormat(port_tr_col(kn, 1), sn_en ? sn_en : stage ? stage : "")));
+    obj_set(e0, "description", cJSON_CreateString(TextFormat(port_tr_col(kd, 1), sn_en ? sn_en : stage ? stage : "")));
+    obj_set(e0, "achievementTips", cJSON_CreateString("")), obj_set(e0, "tips", cJSON_CreateString(""));
+    cJSON_AddItemToObject(items, key, e);
+    for (int col = 1; col <= 12; col++) {  // itemLang: nome e descrizione in ogni lingua, col nome dello stage di quella lingua
+        cJSON *tr = cJSON_GetObjectItem(cJSON_GetObjectItem(il, PORT_LANGS[col - 1]), "translations");
+        if (!tr || cJSON_GetObjectItem(tr, key)) continue;
+        const char *sn = stage ? cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetObjectItem(cJSON_GetObjectItem(cJSON_GetObjectItem(sl, PORT_LANGS[col - 1]), "translations"), stage), "stageName")) : NULL;
+        if (!sn) sn = sn_en ? sn_en : stage ? stage : "";
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "name", TextFormat(port_tr_col(kn, col), sn));
+        cJSON_AddStringToObject(o, "description", TextFormat(port_tr_col(kd, col), sn));
+        cJSON_AddItemToObject(tr, key, o);
+    }
+}
+static void PortRelics_init(void) {
+    static int done;
+    if (done || !cJSON_GetObjectItem(data_get("items"), "RELIC_GRIMOIRE")) return;
+    done = 1;
+    atlas_add_image("port", "glasses3d.png", vs_asset("relics/glasses3d.png"));
+    for (int i = 0; i < 8; i++) atlas_add_image("port", TextFormat("vinyl%d.png", i), vs_asset(TextFormat("relics/vinyl%d.png", i)));
+    PortRelic_add("RELIC_3DGLASSES", "glasses3d.png", NULL);
+    cJSON *s;
+    int i = 0;
+    cJSON_ArrayForEach(s, data_get("stages")) PortRelic_add(TextFormat("RELIC_VINYL_%s", s->string), TextFormat("vinyl%d.png", i++ % 8), s->string);
+}
 static void PlayerOptions_apply(void) {
     cJSON *t, *v;
     char b[16];
+    CustomCharacters_load();  // prima dei personaggi comprati: un CUSTOM comprato resta comprato
+    PortRelics_init();  // prima di CollectedItems: un vinile gia' trovato risulta visto
     cJSON_ArrayForEach(t, data_get("powerups")) obj_set(cJSON_GetArrayItem(t, 0), "level", cJSON_CreateNumber(0));
     cJSON_ArrayForEach(v, po("BoughtPowerups")) if ((t = tbl0("powerups", key_of(v, b)))) obj_set(t, "level", cJSON_CreateNumber(num(t, "level", 0) + 1));
     cJSON_ArrayForEach(v, po("DisabledPowerups")) if ((t = tbl0("powerups", key_of(v, b)))) obj_set(t, "active", cJSON_CreateFalse());
@@ -1134,6 +1305,7 @@ static void SaveSystem_ApplyLoadedSave(const char *txt) {
 enum { SAVE_DEFAULT, SAVE_BACKUP, SAVE_STASH };
 static const char *SaveSystem_GetSaveName(int t) { return t == SAVE_BACKUP ? "LastRunBackup" : t == SAVE_STASH ? "SaveDataStash" : "SaveData"; }
 static void SaveSystem_write(int type) {
+    if (net_on && net_role == 1) return;  // chi si e' unito gioca col salvataggio dell'ospite: il proprio resta intatto
     SaveSystem_UpdateChecksum();
     char *s = cJSON_PrintUnformatted(PlayerOptions);
     if (!vs_write_text(SaveSystem_GetSaveName(type), s)) TraceLog(LOG_WARNING, "VS: salvataggio non riuscito");
@@ -1410,6 +1582,7 @@ static void PlayerUI_OpenSeasonFan(unsigned color, const char *icon) {
     PlayerUI.seasonTween = tweens_add((TweenConfig){ .props = { { &PlayerUI.seasonValue, NULL, 0.5f * PI } }, .nprops = 1, .duration = WickedSeason_duration() });
 }
 static void PlayerUI_Update(void) {
+    if (!Players_isLocal()) return;
     PlayerUI.hpBar.scaleX = fmaxf(0, Core.Player->hp / Core.Player->maxHp * PlayerUI.hpBarWidth);
     PlayerUI.hpBar.scaleY = PlayerUI.hpBarHeight;
     float w = game_width - 8;
@@ -1548,9 +1721,10 @@ static void MainUI_Add(const char *type) {
     else MainUI.PowerUpIcons[MainUI.n_PowerUpIcons++] = w;
     MainUI_RearrangeIcons();
 }
-static void MainUI_AddWeaponIcon(const char *type) { MainUI_Add(type); }
+static void MainUI_AddWeaponIcon(const char *type) { if (Players_isLocal()) MainUI_Add(type); }
 static void MainUI_ShowWeaponBlocks(int n) { for (int i = 0; i < n && i < 5; i++) MainUI.BlockedWeaponSlots[i].visible = 1; }
 static void MainUI_Remove(const char *type) {  // l'icona sparisce dai potenziamenti o dalle armi, poi RearrangeIcons
+    if (!Players_isLocal()) return;
     for (int k = 0; k < 2; k++) {
         WeaponIconUI **a = k == 0 ? MainUI.PowerUpIcons : MainUI.WeaponIcons;
         int *n = k == 0 ? &MainUI.n_PowerUpIcons : &MainUI.n_WeaponIcons;
@@ -1736,6 +1910,25 @@ static void TilingTileset_spawnRelicAt(TilingTileset *t, cJSON *o) {  // una rel
     const char *guards = tiled_props(o, "guards");
     if (p && guards) p->enemyType = guards, p->spawnQuantity = tiled_prop(o, "spawnQuantity", 0), p->spawnAngle = tiled_prop(o, "spawnAngle", 0x168) * (PI / 180);
 }
+// Reliquie del port nello stage: il vinile nel punto "Item" della mappa piu' lontano dalla partenza (calpestabile per costruzione),
+// gli occhiali nella Biblioteca nel secondo piu' lontano; senza punti Item, a 900 px dalla partenza
+static void TilingTileset_spawnPortRelics(TilingTileset *t, const char *stage) {
+    Vector2 best[2] = { { t->StartPosition.x + 900, t->StartPosition.y }, { t->StartPosition.x - 900, t->StartPosition.y } };
+    float d0 = -1, d1 = -1;
+    cJSON *o;
+    cJSON_ArrayForEach(o, tilemap_getObjectLayerObjects(t->MainMap, "Scripts")) {
+        if (!str(o, "name") || strcmp(str(o, "name"), "Item")) continue;
+        Vector2 q = { num(o, "x", 0), num(o, "y", 0) };
+        float d = hypotf(q.x - t->StartPosition.x, q.y - t->StartPosition.y);
+        if (d > d0) best[1] = best[0], d1 = d0, best[0] = q, d0 = d;
+        else if (d > d1) best[1] = q, d1 = d;
+    }
+    cJSON *vi = cJSON_GetObjectItem(data_get("items"), TextFormat("RELIC_VINYL_%s", stage));  // la chiave della tabella: Pickup tiene il puntatore
+    if (vi && !po_has("CollectedItems", vi->string)) Core_MakeRelic(best[0].x, best[0].y, vi->string);
+    TraceLog(LOG_INFO, "PORT: %s a %.0f,%.0f (partenza %.0f,%.0f), occhiali %s", vi ? vi->string : "-", best[0].x, best[0].y, t->StartPosition.x, t->StartPosition.y,
+             !strcmp(stage, "LIBRARY") ? TextFormat("a %.0f,%.0f", best[1].x, best[1].y) : "-");
+    if (!strcmp(stage, "FOREST") && !po_has("CollectedItems", "RELIC_3DGLASSES")) Core_MakeRelic(best[1].x, best[1].y, "RELIC_3DGLASSES");  // primo livello (Federico)
+}
 // GetSpecialLocations / GetNoShadowAreaLocations: oggetti di Scripts con quel nome (la memoria e' della partita)
 static int TilingTileset_GetSpecialLocations(TilingTileset *t, const char *name, Vector2 **out) {
     cJSON *o, *objs = tilemap_getObjectLayerObjects(t->MainMap, "Scripts");
@@ -1828,6 +2021,7 @@ static TilingTileset *TilingTileset_new(const char *stageType, float sizeX, floa
         // tilep (pianificami) e ARCANACHEST: in nessuna mappa del gioco base;
         // StoreScript (CFF bara, MRC mercante, Wind, Deco, Piano, center): restano in Scripts, li leggono le classi degli stage
     }
+    TilingTileset_spawnPortRelics(t, stageType);  // occhiali e vinile: dopo PlayerStart
     for (int i = 0; i < t->mapsAmount; i++) {
         Tilemap *m = t->MainMap;
         LayerContainer *c = &t->layerContainers[i];
@@ -2071,15 +2265,27 @@ static void Player_OnDeath(Player *p) {
 static void Player_Die(Player *p) {
     p->isDead = 1;
     p->s.body.enable = 0;
+    if (Players_n > 1 && !Slots[Slots[1].player == p ? 0 : 1].player->isDead) {  // l'altro continua: si rinasce al prossimo level-up
+        Player_PlayDeadAnimation(p);
+        time_addEvent(0xfa, 0, 0, Player_pfxStop, p);  // come in singolo: il sangue si ferma dopo 250 ms
+        return;
+    }
     Player_OnDeath(p);
+}
+static void Player_Revive(Player *p, float k);
+static void Players_reviveAtLevelUp(void) {  // il compagno caduto torna con meta' vita
+    for (int i = 0; i < Players_n; i++) {
+        Player *p = Slots[i].player;
+        if (p->isDead) game_context_set(i), Player_Revive(p, 0.5f);
+    }
 }
 
 // scene.events: 'Player_ReceivedDamage' / 'Player_LostShield' (ascoltati dalle armi di ritorsione)
 enum { EV_PLAYER_RECEIVEDDAMAGE, EV_PLAYER_LOSTSHIELD };
-static struct { Callback fn; void *ctx; } PlayerEvents[2][16];
+static struct { Callback fn; void *ctx; int player; } PlayerEvents[2][16];
 static int n_PlayerEvents[2];
 static void PlayerEvents_add(int ev, Callback fn, void *ctx) {
-    if (n_PlayerEvents[ev] < 16) PlayerEvents[ev][n_PlayerEvents[ev]].fn = fn, PlayerEvents[ev][n_PlayerEvents[ev]++].ctx = ctx;
+    if (n_PlayerEvents[ev] < 16) PlayerEvents[ev][n_PlayerEvents[ev]].fn = fn, PlayerEvents[ev][n_PlayerEvents[ev]].player = game_context, PlayerEvents[ev][n_PlayerEvents[ev]++].ctx = ctx;
 }
 static float PlayerEvents_arg;  // emit(evento, valore): il danno per 'Player_LostShield'
 static void PlayerEvents_remove(void *ctx) {  // removeListener di tutte le registrazioni di quell'oggetto
@@ -2088,7 +2294,7 @@ static void PlayerEvents_remove(void *ctx) {  // removeListener di tutte le regi
             if (PlayerEvents[ev][i].ctx == ctx) memmove(&PlayerEvents[ev][i], &PlayerEvents[ev][i + 1], (--n_PlayerEvents[ev] - i) * sizeof(PlayerEvents[ev][0]));
 }
 static void PlayerEvents_emit(int ev) {
-    for (int i = 0; i < n_PlayerEvents[ev]; i++) PlayerEvents[ev][i].fn(PlayerEvents[ev][i].ctx);
+    for (int i = 0; i < n_PlayerEvents[ev]; i++) if (PlayerEvents[ev][i].player == game_context) PlayerEvents[ev][i].fn(PlayerEvents[ev][i].ctx);  // le armi di chi ha preso il colpo
 }
 static int Player_GetDamaged(Player *p, float amount) {
     if (Player_is(p, "MEGAMENYA")) Player_setIsInvul(p, 1);  // 0x2eb8: IsInvul prima di super
@@ -2142,7 +2348,11 @@ static void Player_RecoverHp(Player *p, float v, int show, int regenScale) {
 static void Player_Regenerate(void *ctx) { Player *p = ctx; if (p->regen > 0) Player_RecoverHp(p, p->regen, 0, 0); }
 static void Player_SetInvulForMilliSeconds(Player *p, float ms) { Player_setIsInvul(p, 1); p->invulTime += ms; }
 
-static void Player_AddXP(Player *p, float v) { p->xp += v * ExperienceMultiplier * Arcanas.xpMultiplier; }
+static void Player_AddXP(Player *p, float v) {
+    float gain = v * ExperienceMultiplier * Arcanas.xpMultiplier;
+    p->xp += gain;
+    if (Players_n > 1) Slots[game_context ? 0 : 1].player->xp += gain;  // l'esperienza e' di tutti e due
+}
 
 // Le statistiche numeriche che Player possiede (this.hasOwnProperty) e che le tabelle possono toccare
 static float *Player_field(Player *p, const char *k) {
@@ -3113,6 +3323,7 @@ static void Relic_GetTaken(Pickup *p) {
     if (p->disableGet) return;
     p->Cursor.visible = 0;
     Core.CurrentFoundRelic = p->itemType;
+    if (!strcmp(p->itemType, "RELIC_3DGLASSES")) Glasses_fx = 1, Glasses_left = 30;  // la realta' si piega per 30 s; poi Vista 3D dal menu
     if (Core.n_RelicQueue < 16) Core.RelicQueue[Core.n_RelicQueue++] = p->itemType;
     Pickup_SetSeenItem(p->itemType);
     Pickup_GetTaken(p);
@@ -4038,8 +4249,12 @@ static void base_EnemyOnRecycle(Enemy *e) {
     e->isDespawning = 0;
 }
 
+// I primi nemici della partita da un blocco solo: un'ondata non alloca e azzera centinaia di KB in un frame (nessuno libera un nemico singolo)
+#define ENEMY_BLOCK 400
+static Enemy *EnemyBlock;
+static int EnemyBlock_used;
 static Enemy *Enemy_new(EnemyPool *pool, const char *type) {  // constructor
-    Enemy *e = calloc(1, sizeof(Enemy));
+    Enemy *e = EnemyBlock_used < ENEMY_BLOCK && EnemyBlock ? &EnemyBlock[EnemyBlock_used++] : calloc(1, sizeof(Enemy));
     sprite_init(&e->s, NULL, 0, 0);
     e->s.owner = e;
     e->vt = enemy_vt(type);
@@ -4072,69 +4287,101 @@ static Enemy *Enemy_new(EnemyPool *pool, const char *type) {  // constructor
     return e;
 }
 
-static void Enemy_Init(Enemy *e, float x, float y) {
-    cJSON *d = cJSON_GetArrayItem(cJSON_GetObjectItem(data_get("enemies"), e->enemyType), 0);
-    float sp = has(d, "maxSpeed") ? frand() * (num(d, "maxSpeed", 0) - num(d, "speed", 0)) + num(d, "speed", 0) : num(d, "speed", 0);
-    e->dataMaxHp = e->maxHp = num(d, "maxHp", 0);
-    e->power = num(d, "power", 0);
-    e->knockback = num(d, "knockback", 0);
-    e->maxKnockback = num(d, "maxKnockback", 0);
-    e->deathKB = num(d, "deathKB", 0);
-    e->res_Rosary = num(d, "res_Rosary", 0);
-    e->feverValue = orv(d, "feverValue", 1);
-    e->res_Freeze = num(d, "res_Freeze", 0);
-    e->res_Corridor = num(d, "res_Corridor", 0);
-    e->res_Debuffs = num(d, "res_Debuffs", 0);
-    e->xp = num(d, "xp", 0);
-    e->speed = e->defaultSpeed = sp;
-    e->moreX = num(d, "moreX", 0);
-    e->moreY = num(d, "moreY", 0);
-    e->s.alpha = orv(d, "alpha", 1);
-    e->scaleMul = orv(d, "scale", 1);
-    cJSON *co = cJSON_GetObjectItem(d, "colliderOverride");
-    if (co) {
-        e->hasColliderOverride = 1;
-        e->colliderRadius = num(co, "radius", 0);
-        e->colliderOffsetX = num(co, "offsetX", 0);
-        e->colliderOffsetY = num(co, "offsetY", 0);
-    }
-    e->idleFrameCount = (int)num(d, "idleFrameCount", 0);
-    e->passThroughWalls = cJSON_IsTrue(cJSON_GetObjectItem(d, "passThroughWalls"));
-    e->saveTint = has(d, "tint") ? (unsigned)num(d, "tint", 0xffffff) : 0xffffff;
-    cJSON *skills = cJSON_GetObjectItem(d, "skills"), *sk;
-    cJSON_ArrayForEach(sk, skills) {  // enum EnemySkill (0x7584): numeri nei dati
-        int s = (int)cJSON_GetNumberValue(sk);
-        if (s == 0) e->HPxLevel = 1;
-        if (s == 1) e->FixedDirection = 1;
-        if (s == 3) { e->Medusa = 1; e->medusaElapsed = 2 * frand(); }
-        if (s == 2) {
-            e->SelfDestruct = 1;
-            sprite_init(&e->alertSprite, frame_get("vfx", "sPFX_ring_64.png"), 0, 0);
-            e->alertSprite.visible = 0, e->alertSprite.blendAdd = 1;
-            sprite_setOrigin(&e->alertSprite, 0.5f, 0.75f), sprite_setTint(&e->alertSprite, 0xff0000);
-        }
-        // le altre abilita': nemici non ancora usati
-    }
-    cJSON *names = cJSON_GetObjectItem(d, "frameNames");
-    const char *name = cJSON_GetStringValue(cJSON_GetArrayItem(names, (int)floorf(frand() * cJSON_GetArraySize(names))));  // RND.pick
-    const char *tex = str(d, "textureName");
-    sprite_setFrame(&e->s, frame_get(tex, name));
+// I dati di un tipo di nemico, letti una volta sola: l'ondata del minuto 23 crea 286 nemici in un frame, e rileggere ogni volta
+// enemies.json (25 voci + i nomi dei fotogrammi) costava decine di millisecondi sulla Vita. Idea di DrakonPL.
+// Dura una partita: gli atlanti possono cambiare fra uno stage e l'altro.
+typedef struct { const Frame *frame; Animation die, idle; } EnemyLook;  // una per ogni frameNames: RND.pick
+typedef struct EnemyData {
+    const char *type;
+    struct EnemyData *next;
+    int hasMaxSpeed, hasColliderOverride, idleFrameCount, passThroughWalls, HPxLevel, FixedDirection, Medusa, SelfDestruct, nLooks;
+    float speed, maxSpeed, maxHp, power, knockback, maxKnockback, deathKB, res_Rosary, feverValue, res_Freeze, res_Corridor, res_Debuffs, xp, moreX, moreY, alpha, scale;
+    float colliderRadius, colliderOffsetX, colliderOffsetY;
+    unsigned saveTint;
+    EnemyLook *looks;
+} EnemyData;
+#define ENEMY_DATA_BUCKETS 256
+static EnemyData *EnemyData_table[ENEMY_DATA_BUCKETS];
+static void EnemyData_look(EnemyLook *l, const char *tex, const char *name, int end, int idleFrames) {
+    l->frame = frame_get(tex, name);
     char prefix[96];
-    snprintf(prefix, sizeof(prefix), "%s", name);
+    snprintf(prefix, sizeof(prefix), "%s", name ? name : "");
     char *q = strstr(prefix, "0.png");
     if (q) *q = 0;
-    e->die.n = anims_generateFrameNames(tex, prefix, 0, (int)num(d, "end", 0), 0, e->die.frames, ANIM_MAX_FRAMES);
-    e->die.frameRate = 0x18;
-    e->die.msPerFrame = 1000.0f / e->die.frameRate;
-    e->die.repeat = 0;
-    if (e->idleFrameCount) {
+    l->die.n = anims_generateFrameNames(tex, prefix, 0, end, 0, l->die.frames, ANIM_MAX_FRAMES);
+    l->die.frameRate = 0x18;
+    l->die.msPerFrame = 1000.0f / l->die.frameRate;
+    l->die.repeat = 0;
+    if (idleFrames) {
         char ip[100];
         snprintf(ip, sizeof(ip), "%si", prefix);
-        e->idle.n = anims_generateFrameNames(tex, ip, 1, e->idleFrameCount, 2, e->idle.frames, ANIM_MAX_FRAMES);
-        e->idle.frameRate = 8;
-        e->idle.msPerFrame = 1000.0f / 8;
-        e->idle.repeat = -1;
+        l->idle.n = anims_generateFrameNames(tex, ip, 1, idleFrames, 2, l->idle.frames, ANIM_MAX_FRAMES);
+        l->idle.frameRate = 8;
+        l->idle.msPerFrame = 1000.0f / 8;
+        l->idle.repeat = -1;
     }
+}
+static const EnemyData *EnemyData_of(const char *type) {
+    unsigned h = 5381;
+    for (const char *c = type; *c; c++) h = h * 33 + (unsigned char)*c;
+    EnemyData **slot = &EnemyData_table[h % ENEMY_DATA_BUCKETS];
+    for (EnemyData *t = *slot; t; t = t->next) if (!strcmp(t->type, type)) return t;
+    EnemyData *t = calloc(1, sizeof(EnemyData));
+    t->type = type, t->next = *slot, *slot = t;
+    cJSON *d = cJSON_GetArrayItem(cJSON_GetObjectItem(data_get("enemies"), type), 0);
+    t->hasMaxSpeed = has(d, "maxSpeed");
+    t->speed = num(d, "speed", 0), t->maxSpeed = num(d, "maxSpeed", 0), t->maxHp = num(d, "maxHp", 0), t->power = num(d, "power", 0);
+    t->knockback = num(d, "knockback", 0), t->maxKnockback = num(d, "maxKnockback", 0), t->deathKB = num(d, "deathKB", 0);
+    t->res_Rosary = num(d, "res_Rosary", 0), t->feverValue = orv(d, "feverValue", 1), t->res_Freeze = num(d, "res_Freeze", 0);
+    t->res_Corridor = num(d, "res_Corridor", 0), t->res_Debuffs = num(d, "res_Debuffs", 0), t->xp = num(d, "xp", 0);
+    t->moreX = num(d, "moreX", 0), t->moreY = num(d, "moreY", 0), t->alpha = orv(d, "alpha", 1), t->scale = orv(d, "scale", 1);
+    cJSON *co = cJSON_GetObjectItem(d, "colliderOverride");
+    if (co) t->hasColliderOverride = 1, t->colliderRadius = num(co, "radius", 0), t->colliderOffsetX = num(co, "offsetX", 0), t->colliderOffsetY = num(co, "offsetY", 0);
+    t->idleFrameCount = (int)num(d, "idleFrameCount", 0);
+    t->passThroughWalls = cJSON_IsTrue(cJSON_GetObjectItem(d, "passThroughWalls"));
+    t->saveTint = has(d, "tint") ? (unsigned)num(d, "tint", 0xffffff) : 0xffffff;
+    cJSON *sk;
+    cJSON_ArrayForEach(sk, cJSON_GetObjectItem(d, "skills")) {  // enum EnemySkill (0x7584): numeri nei dati; le altre abilita': nemici non ancora usati
+        int s = (int)cJSON_GetNumberValue(sk);
+        if (s == 0) t->HPxLevel = 1;
+        if (s == 1) t->FixedDirection = 1;
+        if (s == 2) t->SelfDestruct = 1;
+        if (s == 3) t->Medusa = 1;
+    }
+    cJSON *names = cJSON_GetObjectItem(d, "frameNames");
+    t->nLooks = cJSON_GetArraySize(names);
+    t->looks = calloc(t->nLooks ? t->nLooks : 1, sizeof(EnemyLook));
+    for (int k = 0; k < t->nLooks; k++) EnemyData_look(&t->looks[k], str(d, "textureName"), cJSON_GetStringValue(cJSON_GetArrayItem(names, k)), (int)num(d, "end", 0), t->idleFrameCount);
+    return t;
+}
+static void Enemy_Init(Enemy *e, float x, float y) {
+    const EnemyData *t = EnemyData_of(e->enemyType);
+    float sp = t->hasMaxSpeed ? frand() * (t->maxSpeed - t->speed) + t->speed : t->speed;
+    e->dataMaxHp = e->maxHp = t->maxHp;
+    e->power = t->power, e->knockback = t->knockback, e->maxKnockback = t->maxKnockback, e->deathKB = t->deathKB;
+    e->res_Rosary = t->res_Rosary, e->feverValue = t->feverValue, e->res_Freeze = t->res_Freeze, e->res_Corridor = t->res_Corridor, e->res_Debuffs = t->res_Debuffs;
+    e->xp = t->xp;
+    e->speed = e->defaultSpeed = sp;
+    e->moreX = t->moreX, e->moreY = t->moreY;
+    e->s.alpha = t->alpha;
+    e->scaleMul = t->scale;
+    if (t->hasColliderOverride) e->hasColliderOverride = 1, e->colliderRadius = t->colliderRadius, e->colliderOffsetX = t->colliderOffsetX, e->colliderOffsetY = t->colliderOffsetY;
+    e->idleFrameCount = t->idleFrameCount;
+    e->passThroughWalls = t->passThroughWalls;
+    e->saveTint = t->saveTint;
+    if (t->HPxLevel) e->HPxLevel = 1;
+    if (t->FixedDirection) e->FixedDirection = 1;
+    if (t->Medusa) e->Medusa = 1, e->medusaElapsed = 2 * frand();
+    if (t->SelfDestruct) {
+        e->SelfDestruct = 1;
+        sprite_init(&e->alertSprite, frame_get("vfx", "sPFX_ring_64.png"), 0, 0);
+        e->alertSprite.visible = 0, e->alertSprite.blendAdd = 1;
+        sprite_setOrigin(&e->alertSprite, 0.5f, 0.75f), sprite_setTint(&e->alertSprite, 0xff0000);
+    }
+    const EnemyLook *l = &t->looks[t->nLooks ? (int)floorf(frand() * t->nLooks) : (frand(), 0)];  // RND.pick
+    sprite_setFrame(&e->s, l->frame);
+    e->die = l->die;
+    if (e->idleFrameCount) e->idle = l->idle;
     e->s.onAnimationComplete = Enemy_OnDeathAnimationComplete;
     e->defaultName = e->s.frame;
     e->s.x = x;
@@ -6864,7 +7111,11 @@ static const BulletVT B_MisspellTrue2 = { "vfx", "WhiteDot.png", B_MisspellAshes
 // --- Weapon (0xe49a) ----------------------------------------------------------
 static void Weapon_Fire(Weapon *w) { w->vt->Fire(w); }
 static void Weapon_ResetFiringTimer(Weapon *w) { if (!w->resetDisabled) w->vt->ResetFiringTimer(w); }  // resetDisabled: ResetFiringTimer = function () {}
-static void Weapon_FireCb(void *ctx) { Weapon_Fire(ctx); }
+static void Weapon_FireCb(void *ctx) {  // i timer di sparo girano anche se Update e' saltato: in coop il caduto non spara
+    Weapon *w = ctx;
+    if (Players_n > 1 && Slots[w->player].player && Slots[w->player].player->isDead) return;
+    Weapon_Fire(w);
+}
 
 static void base_ResetFiringTimer(Weapon *w) {
     time_removeEvent(w->firingTimer);  // firingTimer.destroy()
@@ -7039,7 +7290,9 @@ static void W_HolyWater_Update(Weapon *w, float delta) {
 }
 
 // --- W_Laurel (0x11fa3) -------------------------------------------------------
-static Weapon *laurel;  // ascolta l'evento Player_LostShield
+static Weapon *laurel_of[2];
+#define laurel laurel_of[game_context]
+// laurel: ascolta l'evento Player_LostShield
 static void W_Laurel_CheckColor(Weapon *w) {
     w->image.visible = 1;
     switch ((int)Core.Player->shields) {
@@ -13993,7 +14246,8 @@ static void Sammy_30(void *ctx) {
 }
 static void Sammy_OnCoinPickup(Player *p, float value) {
     float v = value * GoldMultiplier * Player_PGreed(p) * Player_PGrowth(p);
-    p->xp += v * ExperienceMultiplier;  // AddXP_IgnoretGameKiller: senza il moltiplicatore che Game Killer azzera
+    p->xp += v * ExperienceMultiplier;
+    if (Players_n > 1) Slots[game_context ? 0 : 1].player->xp += v * ExperienceMultiplier;  // AddXP_IgnoretGameKiller: senza il moltiplicatore che Game Killer azzera
     Sound_PlaySound("Gem", 0.1f, 1, 0, 1, 1);
     PlayerUI_Update();
 }
@@ -14186,6 +14440,7 @@ static Weapon *Weapon_new(const char *bulletType) {
     const WeaponVT *vt = weapon_vt(bulletType);
     if (!vt) return NULL;
     Weapon *w = calloc(1, sizeof(Weapon));
+    w->player = game_context;
     w->vt = vt;
     w->bulletType = bulletType;
     w->interval = 0x3e8;
@@ -14326,7 +14581,8 @@ static struct {
     int n_weighted;
     float accumulatedWeight, chanceForExistingPowerUp;
     int levelUpOptions, maxTrueWeapons, maxPowerUpWeapons;
-} LUF;
+} LUF_of[2];
+#define LUF LUF_of[game_context]
 
 static int strin(const char **a, int n, const char *s) { for (int i = 0; i < n; i++) if (!strcmp(a[i], s)) return i; return -1; }
 static void LevelUpFactory_DoExclude(const char *t) { if (LUF.n_excl < 256) LUF.ExcludedWeapons[LUF.n_excl++] = t; }
@@ -17031,7 +17287,7 @@ static void Library_BigSpoop(void) {
     Lib.sDarkness.scaleX = (game_width + 0x14) / 160.0f, Lib.sDarkness.scaleY = (game_height + 0x14) / 100.0f;
     children_add(&Lib.sDarkness);
     Sound_StopMusic();
-    if (LoopSfx.on) StopMusicStream(LoopSfx.m), LoopSfx.on = 0;  // sound.stopAll
+    if (LoopSfx.on) au_music_stop(&LoopSfx.m), LoopSfx.on = 0;  // sound.stopAll
     Lib.saveDMG = po_is("DamageNumbersEnabled"), Lib.hasSaved = 1;
     snprintf(Lib.saveBGM, sizeof(Lib.saveBGM), "%s", po_str("SelectedBGM") ? po_str("SelectedBGM") : "");
     snprintf(Lib.saveBGMMod, sizeof(Lib.saveBGMMod), "%s", po_str("SelectedBGMMod") ? po_str("SelectedBGMMod") : "");
@@ -19340,14 +19596,15 @@ enum { DMT_PHASE0, DMT_MID, DMT_LAST };
 static int DM_play(const char *key, int loop, float fromVol) {
     int k = -1;
     for (int i = 0; i < 3; i++) if (!DM.ch[i].on) { k = i; break; }
-    if (k < 0) k = (DM.cur + 1) % 3, StopMusicStream(DM.ch[k].m), UnloadMusicStream(DM.ch[k].m);
+    if (k < 0) k = (DM.cur + 1) % 3, au_music_stop(&DM.ch[k].m), Music_close(&DM.ch[k].m);
     int si = Sound_index(key);
     if (si < 0 || !IsAudioDeviceReady()) return -1;
-    DM.ch[k].m = LoadMusicStream(vs_path(TextFormat("sfx/%s", SOUND_FILES[si].file)));
+    Music_open(&DM.ch[k].m, vs_path(TextFormat("sfx/%s", SOUND_FILES[si].file)));
     DM.ch[k].m.looping = loop;
     DM.ch[k].on = 1, DM.ch[k].stopAtEnd = 0, DM.ch[k].vol = fromVol, DM.ch[k].dur = 0;
-    SetMusicVolume(DM.ch[k].m, fromVol);
+    au_music_volume(&DM.ch[k].m, fromVol);
     PlayMusicStream(DM.ch[k].m);
+    au_music_add(&DM.ch[k].m);
     return DM.cur = k;
 }
 static void DM_fade(int k, float to, float dur, int stop) {
@@ -19395,18 +19652,18 @@ static void DM_Tick(float delta) {  // tempo reale: timer e dissolvenze (Circ.ea
             DM.ch[k].t += delta;
             float p = fminf(1, DM.ch[k].t / DM.ch[k].dur), e = 1 - sqrtf(1 - p * p);
             DM.ch[k].vol = DM.ch[k].from + (DM.ch[k].to - DM.ch[k].from) * e;
-            SetMusicVolume(DM.ch[k].m, DM.ch[k].vol);
+            au_music_volume(&DM.ch[k].m, DM.ch[k].vol);
             if (p >= 1) {
                 DM.ch[k].dur = 0;
-                if (DM.ch[k].stopAtEnd) { StopMusicStream(DM.ch[k].m), UnloadMusicStream(DM.ch[k].m), DM.ch[k].on = 0; continue; }
+                if (DM.ch[k].stopAtEnd) { au_music_stop(&DM.ch[k].m), Music_close(&DM.ch[k].m), DM.ch[k].on = 0; continue; }
             }
         }
-        UpdateMusicStream(DM.ch[k].m);
-        if (!DM.ch[k].m.looping && !IsMusicStreamPlaying(DM.ch[k].m)) UnloadMusicStream(DM.ch[k].m), DM.ch[k].on = 0;
+        au_music_update(&DM.ch[k].m);
+        if (!DM.ch[k].m.looping && !IsMusicStreamPlaying(DM.ch[k].m)) Music_close(&DM.ch[k].m), DM.ch[k].on = 0;
     }
 }
 static void DM_Cleanup(void) {
-    for (int k = 0; k < 3; k++) if (DM.ch[k].on) StopMusicStream(DM.ch[k].m), UnloadMusicStream(DM.ch[k].m), DM.ch[k].on = 0;
+    for (int k = 0; k < 3; k++) if (DM.ch[k].on) au_music_stop(&DM.ch[k].m), Music_close(&DM.ch[k].m), DM.ch[k].on = 0;
     DM_RemoveTimers();
     DM.active = 0;
 }
@@ -19942,6 +20199,7 @@ static void BGMan_MakeBackground(const char *texture, Stage *st) {
 // cielo, i Mietitori sfilano verso l'alto e nel cielo viola scende l'Ender. Battuto: il cielo torna, la Mano Bianca chiude la partita.
 static struct {
     int on, waitIntro, nSaved, cloudsOn, overlaysOn;
+    float introMs;
     float t, minuteValue, tintHelp, cloudsT, cloudsAlpha, overlayA, overlayAddA;
     EnemyPool *pMad, *pDrown, *pStalk, *pTrick, *pEnder;
     Enemy *maddener, *ender;
@@ -21258,7 +21516,9 @@ static void Chapel_SecretCreate(void) {
 static void Chapel_SecretUpdate(float delta) {
     if (!ChS.on) return;
     ChS.t += delta;
-    if (ChS.waitIntro && !IsMusicStreamPlaying(BGM.music)) {  // currentBGMObj.on('complete')
+    if (ChS.waitIntro) ChS.introMs += delta;
+    if (ChS.waitIntro && (net_on ? ChS.introMs >= 1000 * GetMusicTimeLength(BGM.music) : !IsMusicStreamPlaying(BGM.music))) {  // in rete: sul tempo di gioco, l'audio non e' uguale sulle due console
+  // currentBGMObj.on('complete')
         ChS.waitIntro = 0;
         po_sets("SelectedBGM", "TheEndMain"), Sound_SetupAndPlayBGM_Banger(1);
     }
@@ -22796,12 +23056,15 @@ static void Core_onPlayerOverlapsEnemy(void *ctx, Sprite *ps, Sprite *es) {
     (void)ctx;
     Enemy *e = es->owner;
     if (e->isDead || e->IsTimeStopped) return;
+    game_context_set(Players_ofSprite(ps));
     Player_GetDamaged(ps->owner, e->power);
     Enemy_OnPlayerOverlap(e);
 }
 static void Core_onPlayerOverlapsPickup(void *ctx, Sprite *ps, Sprite *ks) {
-    (void)ctx; (void)ps;
+    (void)ctx;
     Pickup *p = ks->owner;
+    game_context_set(Players_ofSprite(ps));
+    Pickup_owner = game_context;  // forzieri, arcane e negozio si aprono per chi li ha presi
     Pickup_DoGetTaken(p);  // GetPickup e' vuoto; GetTaken della sottoclasse
 }
 static void Core_onImmaterialPlayerOverlapsPickup(void *ctx, Sprite *ps, Sprite *ks) {  // solo l'oro si raccoglie; il resto sparisce alla vista
@@ -22812,7 +23075,9 @@ static void Core_onImmaterialPlayerOverlapsPickup(void *ctx, Sprite *ps, Sprite 
     if (!strcmp(p->itemType, "COIN") || !strcmp(p->itemType, "COINBAG1") || !strcmp(p->itemType, "COINBAGMAX")) Pickup_DoGetTaken(p);  // goldItems
 }
 static void Core_onMagnetOverlapsPickup(void *ctx, Sprite *ms, Sprite *ks) {
-    (void)ctx; (void)ms;
+    (void)ctx;
+    game_context_set(Players_n > 1 && ms->owner == (void *)Slots[1].magnet ? 1 : 0);
+    ((Pickup *)ks->owner)->player = game_context;
     Pickup_Vacuum(ks->owner);  // particelle PfxEmitter_Pickups: non ancora tradotte
 }
 static void Core_OnTickerEvent(void *ctx) {
@@ -23044,8 +23309,73 @@ static void Core_ApplyBoughtPowerup(cJSON *u) {
 static int G_humbugOn, G_petOn, G_hasP;
 static KeyCombo G_humbug, G_pet;
 static void SpellsManager_ActivateSpells(void);
+// Cio' che ogni giocatore fa per conto suo all'inizio della partita
+static void Player_setupFactory(void) {
+    Player_MakeLevelOne(Core.Player);
+    LevelUpFactory_Init();
+    LUF.maxTrueWeapons = (int)po_num("SelectedMaxWeapons");
+    cJSON *sw;
+    cJSON_ArrayForEach(sw, po("SealedWeapons")) {  // LevelUpFactory.BanishSealedWeapons
+        int found = 0;
+        for (int i = 0; i < LUF.n_banished; i++) found |= cJSON_IsString(sw) && !strcmp(LUF.BanishedWeapons[i], sw->valuestring);
+        if (cJSON_IsString(sw) && !found && LUF.n_banished < 64) LevelUpFactory_DoExclude(sw->valuestring), LUF.BanishedWeapons[LUF.n_banished++] = sw->valuestring;
+    }
+}
+static cJSON *Net_second;  // {"char":..., "levels":{potenziamento: rango}}: l'equipaggiamento di chi si e' unito
+static void Player_applyPowerups(void) {
+    cJSON *pw, *secondLevels = game_context == 1 && Net_second ? cJSON_GetObjectItem(Net_second, "levels") : NULL;
+    cJSON_ArrayForEach(pw, data_get("powerups")) {  // ApplyBoughtPowerup per ogni rango comprato dei potenziamenti attivi
+        cJSON *p0 = cJSON_GetArrayItem(pw, 0);
+        int ranks = secondLevels ? (int)cJSON_GetNumberValue(cJSON_GetObjectItem(secondLevels, pw->string)) : (int)num(p0, "level", 0);
+        for (int k = 0; k < ranks; k++) if (cJSON_IsTrue(cJSON_GetObjectItem(p0, "active"))) Core_ApplyBoughtPowerup(cJSON_GetArrayItem(pw, k));
+    }
+    if (Core.Player->exLevels > 0) Core.Player->xp = 5;  // Cristina, Pino, Febbra
+}
+static void Player_addStartingWeapons(void) {
+    if (Core.Player->startingWeapon) Core_AddWeapon(Core.Player->startingWeapon, 1);
+    cJSON *xw;
+    cJSON_ArrayForEach(xw, Core.Player->exWeapons) if (cJSON_IsString(xw)) Core_AddWeapon(xw->valuestring, 1);
+    cJSON_ArrayForEach(xw, Core.Player->hiddenWeapons) if (cJSON_IsString(xw)) Core_AddHiddenWeapon(xw->valuestring);
+}
+static void Player_addDevWeapons(void) {
+    // Sviluppo: VS_ADD="AXE,KNIFE:8" aggiunge armi all'avvio (come debug_AddAllWeapons); ":8" le porta a quel livello
+    const char *add = getenv("VS_ADD");
+    static char names[16][32];
+    for (int n = 0; add && *add && n < 16; n++) {
+        const char *e = strchr(add, ',');
+        snprintf(names[n], sizeof(names[n]), "%.*s", e ? (int)(e - add) : (int)strlen(add), add);
+        char *lv = strchr(names[n], ':');
+        int to = lv ? atoi(lv + 1) : 1;
+        if (lv) *lv = 0;
+        cJSON *k = cJSON_GetObjectItem(data_get("weapons"), names[n]);
+        for (int l = 0; k && l < to; l++) Core_LevelWeaponUp(k->string, 1);
+        add = e ? e + 1 : "";
+    }
+}
+// Il secondo giocatore entra in partita quando il primo e' gia' pronto. Il personaggio e' il suo (VS_CHAR2 finche' non c'e' la schermata di connessione).
+static void Players_addSecond(const char *character) {
+    Sprite *first = &Core.Player->s;
+    float x = first->x, y = first->y;
+    Players_n = 2;
+    game_context_set(1);
+    const char *secondChar = Net_second ? cJSON_GetStringValue(cJSON_GetObjectItem(Net_second, "char")) : NULL;
+    const char *c2 = getenv("VS_CHAR2") ? getenv("VS_CHAR2") : secondChar ? secondChar : character;
+    TraceLog(LOG_INFO, "NET: secondo giocatore %s", c2);
+    Core.Player = Player_new(c2);
+    Core.Magnet = Magnet_new();
+    Slots[1].player = Core.Player, Slots[1].magnet = Core.Magnet;
+    Core.Player->s.x = x + 0x28, Core.Player->s.y = y;
+    list_add(&Core.playerGroup, &Core.Player->s);
+    list_add(&Core.MagnetGroup, &Core.Magnet->s);
+    Player_setupFactory();
+    Player_applyPowerups();
+    Player_addStartingWeapons();
+    Player_addDevWeapons();
+    game_context_set(0);
+}
 static void Core_InitGame(const char *character) {
     memset(&Core, 0, sizeof(Core));
+    Players_reset();
     n_PlayerEvents[0] = n_PlayerEvents[1] = 0;  // la scena nuova riparte senza listener
     Arcanas_Init();  // Core.InitGame: new Arcanas + Init, prima del giocatore
     Core.EnemyGroup.bit = 1;
@@ -23077,15 +23407,7 @@ static void Core_InitGame(const char *character) {
     MainUI_UpdateCoins();
     MainUI_UpdateKills();
     MainUI_UpdatePlayerLevel();
-    Player_MakeLevelOne(Core.Player);
-    LevelUpFactory_Init();
-    LUF.maxTrueWeapons = (int)po_num("SelectedMaxWeapons");
-    cJSON *sw;
-    cJSON_ArrayForEach(sw, po("SealedWeapons")) {  // LevelUpFactory.BanishSealedWeapons
-        int found = 0;
-        for (int i = 0; i < LUF.n_banished; i++) found |= cJSON_IsString(sw) && !strcmp(LUF.BanishedWeapons[i], sw->valuestring);
-        if (cJSON_IsString(sw) && !found && LUF.n_banished < 64) LevelUpFactory_DoExclude(sw->valuestring), LUF.BanishedWeapons[LUF.n_banished++] = sw->valuestring;
-    }
+    Player_setupFactory();
     MainUI_ShowWeaponBlocks(6 - (int)po_num("SelectedMaxWeapons"));
     ContainmentRect_init(&Core.containmentRect_Exact, 1, 1);
     ContainmentRect_init(&Core.containmentRect_Screen, 1.2f, 1.3f);
@@ -23094,12 +23416,7 @@ static void Core_InitGame(const char *character) {
         .angle = ERND(0, 0xb4), .speed = ERND(0x19, 0x32), .quantity = 0xa, .lifespan = ERND(0x64, 0x190), .alpha = ERANGE(1, 0),
         .scale = ERANGE(2 * PixelScale, PixelScale), .gravityY = -0x3e8, .on = 0 });
     if (po_is("SelectedGoldenEggs")) EggManager_ApplyBonuses();
-    cJSON *pw;
-    cJSON_ArrayForEach(pw, data_get("powerups")) {  // ApplyBoughtPowerup per ogni rango comprato dei potenziamenti attivi
-        cJSON *p0 = cJSON_GetArrayItem(pw, 0);
-        for (int k = 0; k < (int)num(p0, "level", 0); k++) if (cJSON_IsTrue(cJSON_GetObjectItem(p0, "active"))) Core_ApplyBoughtPowerup(cJSON_GetArrayItem(pw, k));
-    }
-    if (Core.Player->exLevels > 0) Core.Player->xp = 5;  // Cristina, Pino, Febbra
+    Player_applyPowerups();
     Core.Stage = Stage_new(po_str("SelectedStage"));
     Stage_Init(Core.Stage);
     Core.MaxDestructibles = Core.Stage->maxDestructibles;
@@ -23110,10 +23427,7 @@ static void Core_InitGame(const char *character) {
     if (po_has("CollectedItems", "RELIC_BANGER")) Sound_SetupAndPlayBGM_Banger(1);  // la musica scelta nella selezione dello stage
     else if (bgm) Sound_PlayMusic(bgm, 0.3f, 1);
     Sound_Preload();
-    if (Core.Player->startingWeapon) Core_AddWeapon(Core.Player->startingWeapon, 1);
-    cJSON *xw;
-    cJSON_ArrayForEach(xw, Core.Player->exWeapons) if (cJSON_IsString(xw)) Core_AddWeapon(xw->valuestring, 1);
-    cJSON_ArrayForEach(xw, Core.Player->hiddenWeapons) if (cJSON_IsString(xw)) Core_AddHiddenWeapon(xw->valuestring);
+    Player_addStartingWeapons();
     if (RandomazzoEnabled()) Core.GiveMainArcana = 1;  // MainScene.create: HasRandomazzoEnabled
     if (getenv("VS_ARCANADRAFT")) Core.GiveDraftArcana = 1;  // sviluppo: debug_ArcanaDraft
     for (const char *a = getenv("VS_ARCANA"); a && *a;) {  // sviluppo: VS_ARCANA="5,16" attiva le arcane (indici di arcana.json, T05_CRASH ...)
@@ -23121,19 +23435,7 @@ static void Core_InitGame(const char *character) {
         a = strchr(a, ',');
         if (a) a++;
     }
-    // Sviluppo: VS_ADD="AXE,KNIFE:8" aggiunge armi all'avvio (come debug_AddAllWeapons); ":8" le porta a quel livello
-    const char *add = getenv("VS_ADD");
-    static char names[16][32];
-    for (int n = 0; add && *add && n < 16; n++) {
-        const char *e = strchr(add, ',');
-        snprintf(names[n], sizeof(names[n]), "%.*s", e ? (int)(e - add) : (int)strlen(add), add);
-        char *lv = strchr(names[n], ':');
-        int to = lv ? atoi(lv + 1) : 1;
-        if (lv) *lv = 0;
-        cJSON *k = cJSON_GetObjectItem(data_get("weapons"), names[n]);
-        for (int l = 0; k && l < to; l++) Core_LevelWeaponUp(k->string, 1);
-        add = e ? e + 1 : "";
-    }
+    Player_addDevWeapons();
     if (getenv("VS_EVENT")) {  // sviluppo: VS_EVENT=TIPO[,moreX[,moreY[,moreZ]]] scatena l'evento subito (MEDUSA_WALL,12,MEDUSA1_FAST)
         static char ev[128];
         snprintf(ev, sizeof(ev), "%s", getenv("VS_EVENT"));
@@ -23211,6 +23513,7 @@ static void Core_Update(float delta) {
     int tick = 0;
     if (Core.updateTick++, Core.updateTick % Core.updateFreq == 0) { Core.updateTick = 0; tick = 1; }
     if (tick) {
+        game_context_set(Pickup_owner);
         if (Core.canInterrupt && Core.canPause && Core.enterPause) {
             Core.enterPause = 0;
             SceneManager_EnterPause();
@@ -23232,7 +23535,13 @@ static void Core_Update(float delta) {
         } else if (Core.canInterrupt && Core.GiveDraftArcana) {
             Core.GiveDraftArcana = 0;
             if (Arcana_unlockedCount() > Arcanas.n) ARC_open(1);
-        } else if (Core.canInterrupt && Core.Player->xp >= Core.currentXPfactor) {
+        } else if (Core.canInterrupt && Players_n > 1 && Slots[1].player->level < Slots[0].player->level) {  // l'esperienza e' comune: ognuno sceglie il suo, uno dopo l'altro
+            game_context_set(1);
+            Player_LevelUp(Core.Player);
+            Core_SwapToLevelUpScene();
+            PlayerUI_Update();
+        } else if (Core.canInterrupt && (game_context_set(0), Core.Player->xp >= Core.currentXPfactor)) {
+            if (Players_n > 1) Players_reviveAtLevelUp(), game_context_set(0);
             Player_LevelUp(Core.Player);
             Core_SwapToLevelUpScene();
             LootManager_RecalculateLoot();
@@ -23256,8 +23565,15 @@ static void Core_Update(float delta) {
             Core.n_CharQueue = 0;
             CharFoundScene_open();
         }
+        Scene_owner = game_context;
+        game_context_set(0);
         if (Core.Stage->dayNight) BGMan_DayNightHue();
-        for (int i = 0; i < Core.PickupGroup.n; i++) Pickup_Update(Core.PickupGroup.items[i]->owner);
+        for (int i = 0; i < Core.PickupGroup.n; i++) {
+            Pickup *pk = Core.PickupGroup.items[i]->owner;
+            game_context_set(Players_n > 1 ? pk->player : 0);
+            Pickup_Update(pk);
+        }
+        game_context_set(0);
         for (int i = 0; i < Core.explosionPool.nspawned; i++) EnemyExplosion_Update(Core.explosionPool.spawned[i]);
     } else if (Core.canPause && Core.enterPause) {
         Core.enterPause = 0;
@@ -23265,19 +23581,36 @@ static void Core_Update(float delta) {
     }
     for (int i = 0; i < Core.BulletGroup.n; i++) {  // BulletGroup.children.entries[i].Update(delta)
         Bullet *b = Core.BulletGroup.items[i]->owner;
+        if (Players_n > 1 && b->weapon) game_context_set(b->weapon->player);
         if (b->vt->Update) b->vt->Update(b, delta);
     }
-    for (int i = 0; i < Core.n_weapons; i++) Core.Weapons[i]->vt->Update(Core.Weapons[i], delta);
-    for (int i = Core.n_HiddenWeapons - 1; i >= 0; i--) Core.HiddenWeapons[i]->vt->Update(Core.HiddenWeapons[i], delta);
-    Player_Update(Core.Player, delta);
-    Magnet_Update(Core.Magnet);
+    for (int pi = 0; pi < Players_n; pi++) {
+        game_context_set(pi);
+        if (Players_n > 1 && Core.Player->isDead) continue;
+        for (int i = 0; i < Core.n_weapons; i++) Core.Weapons[i]->vt->Update(Core.Weapons[i], delta);
+        for (int i = Core.n_HiddenWeapons - 1; i >= 0; i--) Core.HiddenWeapons[i]->vt->Update(Core.HiddenWeapons[i], delta);
+        Player_Update(Core.Player, delta);
+        Magnet_Update(Core.Magnet);
+    }
+    game_context_set(0);
     BGMan_Update();
     GoldFever_Update(delta);
     WhiteHand_Update();  // dopo Arcanas.Update
     Arcanas_Update(delta);
     GizmoManager_Update();
     Enemies_delta = delta;
-    for (int i = 0; i < Core.Enemies.n; i++) Enemy_Update(Core.Enemies.items[i]->owner);
+    for (int i = 0; i < Core.Enemies.n; i++) {
+        Enemy *e = Core.Enemies.items[i]->owner;
+        if (Players_n > 1) {  // ogni nemico insegue il giocatore piu' vicino
+            Sprite *a = &Slots[0].player->s, *b = &Slots[1].player->s;
+            float da = (e->s.x - a->x) * (e->s.x - a->x) + (e->s.y - a->y) * (e->s.y - a->y), db = (e->s.x - b->x) * (e->s.x - b->x) + (e->s.y - b->y) * (e->s.y - b->y);
+            int pick = Slots[1].player->isDead ? 0 : Slots[0].player->isDead ? 1 : db < da;
+            game_context_set(pick);
+            if (e->target == a || e->target == b) e->target = &Core.Player->s;
+        }
+        Enemy_Update(e);
+    }
+    game_context_set(0);
     if (Lights.on) Lights.lights[0].x = Core.Player->s.x, Lights.lights[0].y = Core.Player->s.y;  // Stage.hasLights: lo spotlight segue il giocatore
 }
 
@@ -23353,7 +23686,7 @@ static void Player_SetInvulForMilliSecondsNonCumulative(Player *p, float ms) {
 
 
 
-static void text_wrap(const char *s, Vector2 p, float size, float wrap, Color c) {
+static float text_wrap(const char *s, Vector2 p, float size, float wrap, Color c) {  // y dell'ultima riga; c.a 0 = misura e basta
     char line[256] = "";
     float y = p.y;
     const char *w = s;
@@ -23363,16 +23696,17 @@ static void text_wrap(const char *s, Vector2 p, float size, float wrap, Color c)
         char cand[256];
         snprintf(cand, sizeof(cand), "%s%s%.*s", line, *line ? " " : "", (int)(e - w), w);
         if (MeasureTextEx(vs_font, cand, size, 1).x > wrap && *line) {
-            DrawTextEx(vs_font, line, (Vector2){ p.x, y }, size, 1, c);
+            if (c.a) DrawTextEx(vs_font, line, (Vector2){ p.x, y }, size, 1, c);
             y += size * 1.15f;
             snprintf(line, sizeof(line), "%.*s", (int)(e - w), w);
         } else {
             snprintf(line, sizeof(line), "%s", cand);
         }
-        if (*e == '\n') { DrawTextEx(vs_font, line, (Vector2){ p.x, y }, size, 1, c); y += size * 1.15f; line[0] = 0; }
+        if (*e == '\n') { if (c.a) DrawTextEx(vs_font, line, (Vector2){ p.x, y }, size, 1, c); y += size * 1.15f; line[0] = 0; }
         w = *e ? e + 1 : e;
     }
-    if (*line) DrawTextEx(vs_font, line, (Vector2){ p.x, y }, size, 1, c);
+    if (*line && c.a) DrawTextEx(vs_font, line, (Vector2){ p.x, y }, size, 1, c);
+    return y;
 }
 
 static void TS_frame(const char *atlas, const char *name, float x, float y, float ox, float oy, float sc, float ang, Color c, int add);
@@ -25225,59 +25559,57 @@ enum { G_CROSS, G_CIRCLE, G_TRIANGLE, G_SQUARE, G_L, G_R, G_START };
 typedef struct { int glyph; const char *label; } VPrompt;
 static VPrompt VUI_prompts[6];
 static int VUI_np;
-static void vui_glyph(int g, float cx, float cy, float r) {  // i simboli dei tasti della Vita
-    if (g >= G_L) {
-        const char *t = g == G_L ? "L" : g == G_R ? "R" : "START";
-        float w = MeasureTextEx(vs_font, t, 18, 0).x + 10;
-        DrawRectangleRoundedLinesEx((Rectangle){ cx - 0.5f * w, cy - 10, w, 20 }, 0.5f, 6, 2, (Color){ 0x8d, 0x8d, 0x9e, 255 });
-        text_at(t, cx, cy, 18, 0.5f, 0.5f, (Color){ 0xcf, 0xcf, 0xe0, 255 });
-        return;
+// I simboli dei tasti sono di Wolff (WolffsRoom), disegnati per stare nello stile del gioco: pixel netti, scala 2
+static Texture2D vui_glyph_tex(int g) {
+    static Texture2D T[G_START + 1];
+    static const char *const F[G_START + 1] = { [G_CROSS] = "cross_0", [G_CIRCLE] = "circle_0", [G_SQUARE] = "square_0", [G_TRIANGLE] = "triangle_0",
+                                                [G_L] = "L", [G_R] = "R", [G_START] = "start" };
+    if (!T[g].id) {
+        T[g] = LoadTexture(vs_asset(TextFormat(g >= G_L && g != G_START ? "glyphs/button_psv_%s.png" : "glyphs/button_ps4_%s.png", F[g])));
+        SetTextureFilter(T[g], TEXTURE_FILTER_POINT);
     }
-    DrawCircleV((Vector2){ cx, cy }, r, (Color){ 0x1a, 0x1a, 0x2a, 255 });
-    DrawCircleLinesV((Vector2){ cx, cy }, r, (Color){ 0x55, 0x55, 0x55, 255 });
-    float k = 0.45f * r;
-    if (g == G_CROSS) {
-        Color c = { 0x7f, 0xb1, 0xff, 255 };
-        DrawLineEx((Vector2){ cx - k, cy - k }, (Vector2){ cx + k, cy + k }, 2.6f, c), DrawLineEx((Vector2){ cx + k, cy - k }, (Vector2){ cx - k, cy + k }, 2.6f, c);
-    } else if (g == G_CIRCLE) DrawRing((Vector2){ cx, cy }, k - 1.3f, k + 1.3f, 0, 360, 24, (Color){ 0xff, 0x6b, 0x6b, 255 });
-    else if (g == G_TRIANGLE) {
-        Color c = { 0x5e, 0xe0, 0x8a, 255 };
-        Vector2 a = { cx, cy - k - 1 }, b = { cx + k + 1, cy + k }, d = { cx - k - 1, cy + k };
-        DrawLineEx(a, b, 2.4f, c), DrawLineEx(b, d, 2.4f, c), DrawLineEx(d, a, 2.4f, c);
-    } else DrawRectangleLinesEx((Rectangle){ cx - k, cy - k, 2 * k, 2 * k }, 2.4f, (Color){ 0xff, 0x8a, 0xd8, 255 });
+    return T[g];
 }
-static const char *vui_tr(const char *k) {  // le scritte della barra dei tasti (non sono nell'originale): italiano o inglese, poi Lang
-    static const char *const T[][3] = {
-        { "vui_select", "Seleziona", "Select" }, { "vui_confirm", "Conferma", "Confirm" }, { "vui_back", "Indietro", "Back" },
-        { "vui_page", "Pagina", "Page" }, { "vui_tab", "Scheda", "Tab" }, { "vui_seal", "Sigilla", "Seal" }, { "vui_stats", "Statistiche", "Stats" },
-        { "vui_start", "Inizia", "Start" }, { "vui_options", "Opzioni", "Options" }, { "vui_quick", "Avvio rapido", "Quick start" },
-        { "vui_buy", "Compra", "Buy" }, { "vui_refund", "Rimborso", "Refund" }, { "vui_hide", "Nascondi completati", "Hide completed" },
-        { "vui_skip10", "Salta 10", "Skip 10" }, { "vui_game_options", "Opzioni partita", "Run options" },
-    };
-    int it = !strcmp(Lang_getLangCode(), "it");
-    for (size_t i = 0; i < sizeof(T) / sizeof(*T); i++) if (!strcmp(T[i][0], k)) return T[i][it ? 1 : 2];
-    return tr(k);
+static float vui_glyph_w(int g) { return 2.0f * vui_glyph_tex(g).width; }
+static double vui_hit_at[G_START + 1];  // ultimo colpo (pad o tocco): l'effetto dura VUI_HIT_S anche se il gioco risponde subito
+#define VUI_HIT_S 0.18
+static float vui_glyph_hit(int g) {  // 1 appena premuto -> 0 dopo VUI_HIT_S
+    static const int B[G_START + 1] = { [G_CROSS] = GAMEPAD_BUTTON_RIGHT_FACE_DOWN, [G_CIRCLE] = GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, [G_SQUARE] = GAMEPAD_BUTTON_RIGHT_FACE_LEFT,
+                                        [G_TRIANGLE] = GAMEPAD_BUTTON_RIGHT_FACE_UP, [G_L] = GAMEPAD_BUTTON_LEFT_TRIGGER_1, [G_R] = GAMEPAD_BUTTON_RIGHT_TRIGGER_1, [G_START] = GAMEPAD_BUTTON_MIDDLE_RIGHT };
+    if (IsGamepadAvailable(0) && IsGamepadButtonDown(0, B[g])) vui_hit_at[g] = GetTime();
+    float k = 1 - (float)((GetTime() - vui_hit_at[g]) / VUI_HIT_S);
+    return vui_hit_at[g] > 0 && k > 0 ? k : 0;
+}
+static void vui_glyph(int g, float cx, float cy, float r) {
+    (void)r;
+    Texture2D t = vui_glyph_tex(g);
+    float k = vui_glyph_hit(g), s = 2.0f * (1 - 0.12f * k), w = s * t.width, h = s * t.height;
+    unsigned char c = (unsigned char)(255 - (255 - 0x8c) * k);
+    Rectangle src = { 0, 0, t.width, t.height }, dst = { roundf(cx - 0.5f * w), roundf(cy - 0.5f * h), w, h };
+    DrawTexturePro(t, src, (Rectangle){ dst.x + 2, dst.y + 2, w, h }, (Vector2){ 0, 0 }, 0, Fade(BLACK, 0.7f));
+    DrawTexturePro(t, src, dst, (Vector2){ 0, 0 }, 0, (Color){ c, c, c, 255 });
+}
+static const char *vui_tr(const char *k) {  // le scritte della barra dei tasti (non sono nell'originale): port_lang.h, poi Lang
+    const char *s = port_tr(k);
+    return s != k ? s : tr(k);
 }
 static Rectangle VUI_hit[6];
 static void vui_set_prompts(const VPrompt *p, int n) { VUI_np = n < 6 ? n : 6; memcpy(VUI_prompts, p, VUI_np * sizeof(*p)); }
 static void vui_prompt_select(void) { vui_set_prompts((VPrompt[]){ { G_CROSS, "vui_select" } }, 1); }
 static void vui_prompts_clear(void) { VUI_np = 0; }
-static void vui_prompt_bar(void) {  // barra dei tasti in basso (44 px), allineata a destra
+static void vui_prompt_bar(void) {  // i tasti in basso, al centro, con un'ombra al posto della barra
     if (!VUI_np) return;
-    DrawRectangle(0, MENU_H - 44, MENU_W, 44, (Color){ 12, 6, 10, 218 });
-    DrawRectangle(0, MENU_H - 44, MENU_W, 2, rgb(0x8a6a2a, 1));
-    float x = MENU_W - 28, cy = MENU_H - 22;
-    for (int i = VUI_np - 1; i >= 0; i--) {
+    float total = 0, cy = MENU_H - 22;
+    for (int i = 0; i < VUI_np; i++) total += vui_glyph_w(VUI_prompts[i].glyph) + 8 + MeasureTextEx(vs_font, vui_tr(VUI_prompts[i].label), 22, 0).x + (i ? 30 : 0);
+    float x = 0.5f * (MENU_W - total);
+    for (int i = 0; i < VUI_np; i++) {
         const char *l = vui_tr(VUI_prompts[i].label);
-        float x1 = x;
-        float lw = MeasureTextEx(vs_font, l, 22, 0).x;
-        text_at(l, x - lw, cy, 22, 0, 0.5f, (Color){ 0xe9, 0xe2, 0xd4, 255 });
-        x -= lw + 10;
-        int g = VUI_prompts[i].glyph;
-        float gw = g >= G_L ? MeasureTextEx(vs_font, g == G_START ? "START" : "L", 18, 0).x + 10 : 26;
-        vui_glyph(g, x - 0.5f * gw, cy, 12);
-        VUI_hit[i] = (Rectangle){ x - gw - 6, MENU_H - 44, x1 - x + gw + 12, 44 };
-        x -= gw + 26;
+        float gw = vui_glyph_w(VUI_prompts[i].glyph), lw = MeasureTextEx(vs_font, l, 22, 0).x;
+        vui_glyph(VUI_prompts[i].glyph, x + 0.5f * gw, cy, 0);
+        text_at(l, x + gw + 10, cy + 2, 22, 0, 0.5f, Fade(BLACK, 0.8f));
+        text_at(l, x + gw + 8, cy, 22, 0, 0.5f, (Color){ 0xe9, 0xe2, 0xd4, 255 });
+        VUI_hit[i] = (Rectangle){ x - 6, MENU_H - 44, gw + 8 + lw + 12, 44 };
+        x += gw + 8 + lw + 30;
     }
 }
 static void nine_wh(const char *frame, int cw, int ch, Rectangle r, Color tint);
@@ -25366,8 +25698,13 @@ static UIButton *UIGrid_Go(int dx, int dy) {  // GoLeft/GoRight/GoUp/GoDown
     *c += dx ? dx : dy;
     if (*c < 0) *c = UIGrid.wrap ? n - 1 : 0;
     if (*c > n - 1) *c = UIGrid.wrap ? 0 : n - 1;
-    UIButton *g = UIGrid_GetCurrent();
-    if (g) return g;
+    for (int i = 0; i < n; i++) {  // Vita: le celle vuote si scavalcano (menu principale senza Bestiario/Segreti: Credits e CO-OP)
+        UIButton *g = UIGrid_GetCurrent();
+        if (g) return g;
+        int e = *c + (dx ? dx : dy);
+        if (e < 0 || e > n - 1) { if (!UIGrid.wrap) break; e = e < 0 ? n - 1 : 0; }
+        *c = e;
+    }
     *c = old;
     return UIGrid.currentGameObject;
 }
@@ -25403,6 +25740,7 @@ static void Overlay_CheckButtonPad(int i, float delta, int down, int dx, int dy,
     OV.timeDown[i] += delta;
 }
 static void vui_press(int g) {  // un simbolo della barra toccato = quel tasto
+    vui_hit_at[g] = GetTime();
     if (g == G_CROSS) Overlay_OnSubmitPressed();
     else if (g == G_CIRCLE) Overlay_OnCancelPressed();
     else if (g == G_TRIANGLE && OV.OnTriangle) OV.OnTriangle();
@@ -25444,6 +25782,9 @@ static void Overlay_update(float delta) {
     // updateController
     if (IsGamepadAvailable(0) && UIGrid.on) {
         float sx = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X), sy = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_Y);
+        // in coop l'asse arriva dalla rete gia' fuso col D-pad (Player_localMove): contato due volte saltava un'opzione
+        if (IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_LEFT) || IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT) ||
+            IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_UP) || IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_DOWN)) sx = sy = 0;
         Overlay_CheckButtonPad(0, delta, IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_LEFT), -1, 0, NULL);
         Overlay_CheckButtonPad(1, delta, IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT), 1, 0, NULL);
         Overlay_CheckButtonPad(2, delta, IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_UP), 0, -1, NULL);
@@ -25460,8 +25801,8 @@ static void Overlay_draw(void) {  // HighlightButton
     if (!OV.UI_selected) return;
     if (!OV.cursorsVisible || OV.blockInput) return;
     UIButton *b = OV.UI_selected;
-    vui_focus((Rectangle){ UI_left(b), UI_top(b), bW(b), bH(b) }, OV.t);
-    ui_arrows(UI_left(b) + 0.5f * bW(b), UI_top(b) + 0.5f * bH(b), 0.5f * bW(b) + 8, OV.t);
+    if (bW(b) > 500) vui_focus((Rectangle){ UI_left(b), UI_top(b), bW(b), bH(b) }, OV.t);  // righe larghe (Opzioni): le frecce uscirebbero dallo schermo
+    else ui_arrows(UI_left(b) + 0.5f * bW(b), UI_top(b) + 0.5f * bH(b), 0.5f * bW(b) + 8, OV.t);
 }
 
 // Testo con a capo (wordWrap.width) ridotto da scaleToMaxFast(text, false, maxW, maxH); restituisce l'altezza
@@ -27717,19 +28058,21 @@ static void RelicFoundScene_update(float delta) {
 static void RelicPanel_draw(const char *type, float px, float py, float pw, float ph) {
     cJSON *it = cJSON_GetObjectItem(data_get("items"), type);
     int special = cJSON_IsTrue(cJSON_GetObjectItem(it, "isSpecialOption"));
-    nine("frame1_c2.png", 12, (Rectangle){ px, py, pw, ph }, special ? YELLOW : WHITE);
-    const Frame *ib = frame_get("UI", "frameB.png");
-    if (ib) DrawTexturePro(*ib->tex, (Rectangle){ ib->x, ib->y, ib->w, ib->h }, (Rectangle){ px + 4, py + 4, ib->w * 2, ib->h * 2 }, (Vector2){ 0, 0 }, 0, WHITE);
-    const Frame *ic = frame_get(str(it, "texture"), str(it, "frameName"));
-    if (ic) DrawTexturePro(*ic->tex, (Rectangle){ ic->x, ic->y, ic->w, ic->h }, (Rectangle){ px + 0x1c - ic->sw + 2 * ic->ox, py + 0x1c - ic->sh + 2 * ic->oy, ic->w * 2, ic->h * 2 }, (Vector2){ 0, 0 }, 0, WHITE);
     const char *name = tr_of("itemLang", type, "name"), *d = tr_of("itemLang", type, "description");
-    DrawTextEx(vs_font, *name ? name : str(it, "name"), (Vector2){ px + 0x50, py + 6 }, 16, 1, WHITE);
     char desc[512];
     snprintf(desc, sizeof(desc), "%s", *d ? d : str(it, "description") ? str(it, "description") : "");
     if (special) {
         const char *tp = tr_of("itemLang", type, "tips");
         snprintf(desc + strlen(desc), sizeof(desc) - strlen(desc), " %s", *tp ? tp : str(it, "tips") ? str(it, "tips") : "");
     }
+    // Vita: 0.2 x sfondo bastava a 720 di altezza; le descrizioni lunghe (Grimorio, IT) uscivano sotto il riquadro
+    ph = fmaxf(ph, text_wrap(desc, (Vector2){ px + 0xa, py + 0x3c }, 16, 0.9f * pw, BLANK) + 16 * 1.15f + 6 - py);
+    nine("frame1_c2.png", 12, (Rectangle){ px, py, pw, ph }, special ? YELLOW : WHITE);
+    const Frame *ib = frame_get("UI", "frameB.png");
+    if (ib) DrawTexturePro(*ib->tex, (Rectangle){ ib->x, ib->y, ib->w, ib->h }, (Rectangle){ px + 4, py + 4, ib->w * 2, ib->h * 2 }, (Vector2){ 0, 0 }, 0, WHITE);
+    const Frame *ic = frame_get(str(it, "texture"), str(it, "frameName"));
+    if (ic) DrawTexturePro(*ic->tex, (Rectangle){ ic->x, ic->y, ic->w, ic->h }, (Rectangle){ px + 0x1c - ic->sw + 2 * ic->ox, py + 0x1c - ic->sh + 2 * ic->oy, ic->w * 2, ic->h * 2 }, (Vector2){ 0, 0 }, 0, WHITE);
+    DrawTextEx(vs_font, *name ? name : str(it, "name"), (Vector2){ px + 0x50, py + 6 }, 16, 1, WHITE);
     text_wrap(desc, (Vector2){ px + 0xa, py + 0x3c }, 16, 0.9f * pw, WHITE);
 }
 
@@ -28248,7 +28591,8 @@ static void RelicFoundScene_draw(void) {
 // ============================================================================
 // 0x1a27: scena di gioco (create + update)
 // ============================================================================
-static Vector2 _lastVelocity;
+#define PLAYERS_LEASH_X 500  // la vista e' larga 730
+#define PLAYERS_LEASH_Y 320
 
 static void DespawnIfOutside(ContainmentRect *r) {  // 0x12c8a.DespawnIfOutside
     SpriteList *l = &Core.Enemies;
@@ -28272,20 +28616,10 @@ static void CheckAllAndDespawnIfOutside(ContainmentRect *r) {  // proiettili
 
 static Sprite pauseButton;  // 'pause.png' in alto a destra (tocco)
 static int MainScene_enterPause;
-static void scene_update(float delta) {
-    Player *p = Core.Player;
-    // escKey 'down': niente pausa con un forziere in coda o un level-up pronto; Start del pad (bottone 9) con 100 ms di blocco
-    static double padPauseAt;
-    if (IsKeyPressed(KEY_ESCAPE) && !(Core.n_TreasureQueue > 0 || p->xp >= Core.currentXPfactor)) MainScene_enterPause = 1;
-    if (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT) && GetTime() >= padPauseAt) padPauseAt = GetTime() + 0.1, MainScene_enterPause = 1;
-    if (ptr_pressed()) {  // pauseButton 'pointerdown' -> Core.enterPause
-        float sc = (float)SCREEN_H / game_height, gx = (PT.pos.x - (SCREEN_W - game_width * sc) / 2) / sc, gy = PT.pos.y / sc;  // Vita: anche col tocco
-        float w = pauseButton.width * pauseButton.scaleX, h = pauseButton.height * pauseButton.scaleY;
-        if (gx >= pauseButton.x - w && gx < pauseButton.x && gy >= pauseButton.y && gy < pauseButton.y + h) Core.enterPause = 1;
-    }
-    float maxSpeed = PlayerPxSpeed * p->moveSpeed * p->slowMultiplier;
-    p->lastFacedDirection = _lastVelocity;
-    p->s.body.velocity = (Vector2){ 0, 0 };
+static float View_zoom(void);
+static struct { int on; float x, y; } TapMove;  // Opzioni: tocca un punto e il personaggio ci va (proposta di Wolff)
+// Gli input di questa console: tasti, pad, tocco, agganci di sviluppo. Velocita' in px/s, 0 = fermo
+static Vector2 Player_localMove(Player *p, float maxSpeed) {
     Vector2 cv = { 0, 0 };
     int moved = 0;
     // updateCursors
@@ -28293,6 +28627,11 @@ static void scene_update(float delta) {
     else if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) { cv.x = 1; moved = 1; }
     if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W)) { cv.y = -1; moved = 1; }
     else if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S)) { cv.y = 1; moved = 1; }
+    if (getenv("VS_DETWALK")) {  // VS_DET: input a script, una direzione ogni 2 s; il valore sfasa le due console
+        static const signed char D[8][2] = { {1,0},{1,1},{0,1},{-1,1},{-1,0},{-1,-1},{0,-1},{1,-1} };
+        int k = (det_frame / 120 + atoi(getenv("VS_DETWALK")) - 1) % 8;
+        cv.x = D[k][0], cv.y = D[k][1];
+    }
     const char *walk = getenv("VS_WALK");  // sviluppo: VS_WALK="1,0[,secondi]" cammina da solo in quella direzione (e si ferma)
     static double walk_t0 = -1;
     float wx, wy, wsec = 0;
@@ -28322,16 +28661,63 @@ static void scene_update(float delta) {
             if (fabsf(sy) > 0.3f) { cv.y = sy * maxSpeed; moved = 1; }
         }
     }
+    static int devTap;  // sviluppo: VS_TAP=dx,dy un tocco a partita iniziata (distanza dal giocatore in pixel di mondo)
+    if (getenv("VS_TAP") && !devTap) { float dx = 0, dy = 0; sscanf(getenv("VS_TAP"), "%f,%f", &dx, &dy); devTap = 1, TapMove.on = 1, TapMove.x = p->s.x + dx, TapMove.y = p->s.y + dy; }
+    if (moved) TapMove.on = 0;  // i tasti vincono sul tocco
+    else if (TapMove.on) {
+        float dx = TapMove.x - p->s.x, dy = TapMove.y - p->s.y, d = sqrtf(dx * dx + dy * dy);
+        if (d < 4 || !(po_is("TouchMove") || getenv("VS_TAP"))) TapMove.on = 0;
+        else cv.x = dx / d * maxSpeed, cv.y = dy / d * maxSpeed, moved = 1;
+    }
+    return cv;
+}
+static void scene_update(float delta) {
+    game_context_set(0);
+    Player *p = Core.Player;
+    // escKey 'down': niente pausa con un forziere in coda o un level-up pronto; Start del pad (bottone 9) con 100 ms di blocco
+    static double padPauseAt;
+    if (IsKeyPressed(KEY_ESCAPE) && !(Core.n_TreasureQueue > 0 || p->xp >= Core.currentXPfactor)) MainScene_enterPause = 1;
+    if (net_on) {  // Start di uno dei due: la pausa la guida lui
+        for (int i = 0; i < Players_n; i++) if (net_player_pressed(i, GAMEPAD_BUTTON_MIDDLE_RIGHT)) MainScene_enterPause = 1, Pickup_owner = i;
+    } else if (IsGamepadAvailable(0) && IsGamepadButtonPressed(0, GAMEPAD_BUTTON_MIDDLE_RIGHT) && GetTime() >= padPauseAt) padPauseAt = GetTime() + 0.1, MainScene_enterPause = 1;
+    if (ptr_pressed()) {  // pauseButton 'pointerdown' -> Core.enterPause
+        float sc = (float)SCREEN_H / game_height, gx = (PT.pos.x - (SCREEN_W - game_width * sc) / 2) / sc, gy = PT.pos.y / sc;  // Vita: anche col tocco
+        float w = pauseButton.width * pauseButton.scaleX, h = pauseButton.height * pauseButton.scaleY;
+        if (gx >= pauseButton.x - w && gx < pauseButton.x && gy >= pauseButton.y && gy < pauseButton.y + h) Core.enterPause = 1;
+        else if (po_is("TouchMove")) TapMove.on = 1, TapMove.x = p->s.x + (gx - 0.5f * game_width) / View_zoom(), TapMove.y = p->s.y + (gy - 0.5f * game_height) / View_zoom();    }
+    float maxSpeed = PlayerPxSpeed * p->moveSpeed * p->slowMultiplier;
+    for (int pi = 0; pi < Players_n; pi++) {
+    game_context_set(pi);
+    p = Core.Player;
+    maxSpeed = PlayerPxSpeed * p->moveSpeed * p->slowMultiplier;
+    p->lastFacedDirection = Slots[pi].lastVelocity;
+    p->s.body.velocity = (Vector2){ 0, 0 };
+    Vector2 cv;
+    if (net_on) {  // lockstep: l'input arriva dalla rete, anche il proprio
+        NetMove m = net_move(pi, det_frame);
+        cv = (Vector2){ m.x / 127.0f * maxSpeed, m.y / 127.0f * maxSpeed };
+        if (p->isDead) cv = (Vector2){ 0, 0 };
+        if (Players_n > 1) {  // non ci si allontana oltre la vista: stage ed eventi girano attorno al primo giocatore
+            Sprite *o = &Slots[!pi].player->s;
+            float dx = p->s.x - o->x, dy = p->s.y - o->y;
+            if ((fabsf(dx) > PLAYERS_LEASH_X && dx * cv.x > 0)) cv.x = 0;
+            if ((fabsf(dy) > PLAYERS_LEASH_Y && dy * cv.y > 0)) cv.y = 0;
+        }
+    } else cv = Player_localMove(p, maxSpeed);
+    int moved = cv.x != 0 || cv.y != 0;
     if (moved) {
         sprite_setVelocity(&p->s, cv.x, cv.y);
-        _lastVelocity = p->s.body.velocity;
+        Slots[pi].lastVelocity = p->s.body.velocity;
         p->frameWalk = sqrtf(cv.x * cv.x + cv.y * cv.y);
         p->walked += p->frameWalk;
     } else {
-        p->lastFacedDirection = _lastVelocity;
+        p->lastFacedDirection = Slots[pi].lastVelocity;
         p->s.body.velocity = (Vector2){ 0, 0 };
         p->frameWalk = p->walked = 0;
     }
+    }
+    game_context_set(0);
+    p = Core.Player;
     ContainmentRect_AdjustPosition(&Core.containmentRect_Enemies);
     for (int i = 0; i < 0x14; i++) DespawnIfOutside(&Core.containmentRect_Enemies);
     CheckAllAndDespawnIfOutside(&Core.containmentRect_Bullets);
@@ -28447,7 +28833,9 @@ static void TopBar_draw(void) {
 // ============================================================================
 static struct {
     int visible, awake, hasBestiaryGuide, hasSecretsGuide, hasQuickStart, doShadowGag;
-    UIButton ResolutionButton, CreditsButton, CollectionButton, AchievementButton, BestiaryButton, SecretsButton, PowerupButton, StartButton, QuickStartButton;
+    UIButton JukeboxButton;  // del port: dal primo vinile trovato
+    int hasJukebox;
+    UIButton CoopButton, ResolutionButton, CreditsButton, CollectionButton, AchievementButton, BestiaryButton, SecretsButton, PowerupButton, StartButton, QuickStartButton;
 } MM;
 static void SceneManager_StartFromMainMenu(void), SceneManager_QuickStartFromMainMenu(void), SceneManager_PowerUpFromMainMenu(void),
     SceneManager_CollectionFromMainMenu(void), SceneManager_AchievementsFromMainMenu(void), SceneManager_Credits_FromMainMenu(void),
@@ -28461,6 +28849,11 @@ static void MM_onAchievement(void *c) { (void)c; MM_click(SceneManager_Achieveme
 static void MM_onCredits(void *c) { (void)c; MM_click(SceneManager_Credits_FromMainMenu); }
 static void MM_onBestiary(void *c) { (void)c; MM_click(SceneManager_BestiaryFromMainMenu); }
 static void MM_onSecrets(void *c) { (void)c; MM_click(SceneManager_SecretsFromMainMenu); MM.SecretsButton.tint = 0xffffff; }
+static void Lobby_open(void);
+static void MM_onCoop(void *c) { (void)c; Sound_PlaySimple("ClickIn", 0); Lobby_open(); }
+static void SceneManager_Jukebox_FromMainMenu(void);
+static int Jukebox_vinyls(void);
+static void MM_onJukebox(void *c) { (void)c; MM_click(SceneManager_Jukebox_FromMainMenu); }
 static void MainMenu_create(void) {  // Vita: colonna di bottoni a destra, in coordinate dello schermo
     memset(&MM, 0, sizeof(MM));
     // preload: JustGotJubilee -> doShadowGag (con le reliquie, F3.3)
@@ -28475,7 +28868,15 @@ static void MainMenu_create(void) {  // Vita: colonna di bottoni a destra, in co
     MM.hasSecretsGuide = po_has("CollectedItems", "RELIC_SECRETS");
     UIButton_set(&MM.SecretsButton, "OptionsButton", x + w - hw, 292, hw, 52, 1, 0, 0);
     MM.SecretsButton.visible = 0;
-    UIButton_set(&MM.CreditsButton, "OptionsMiniButton", x, 358, w, 40, 1, 0, 0);
+    UIButton_set(&MM.CreditsButton, "OptionsMiniButton", x, 358, hw, 40, 1, 0, 0);
+    UIButton_set(&MM.CoopButton, "OptionsMiniButton", x + w - hw, 358, hw, 40, 1, 0, 0);
+    MM.hasJukebox = Jukebox_vinyls() > 0;  // col Jukebox: CO-OP | Jukebox, poi Riconoscimenti largo sotto; senza, come prima
+    UIButton_set(&MM.JukeboxButton, "OptionsMiniButton", x + w - hw, 358, hw, 40, 1, 0, 0);
+    MM.JukeboxButton.visible = MM.hasJukebox;
+    if (MM.hasJukebox) {
+        UIButton_set(&MM.CoopButton, "OptionsMiniButton", x, 358, hw, 40, 1, 0, 0);
+        UIButton_set(&MM.CreditsButton, "OptionsMiniButton", x, 406, w, 40, 1, 0, 0);
+    }
     MM.hasQuickStart = cJSON_GetArraySize(po("UnlockedStages")) >= 5;
     UIButton_set(&MM.QuickStartButton, "OptionsMiniButton", 0, 0, 0, 0, 1, 0, 0);  // Vita: niente bottone, e' START
     MM.QuickStartButton.visible = 0;
@@ -28490,6 +28891,8 @@ static void MainMenu_EnableButtons(void) {
     UIButton_on(&MM.CollectionButton, MM_onCollection, NULL);
     UIButton_on(&MM.AchievementButton, MM_onAchievement, NULL);
     UIButton_on(&MM.CreditsButton, MM_onCredits, NULL);
+    UIButton_on(&MM.CoopButton, MM_onCoop, NULL);
+    if (MM.hasJukebox) UIButton_on(&MM.JukeboxButton, MM_onJukebox, NULL);
     if (MM.hasBestiaryGuide) UIButton_on(&MM.BestiaryButton, MM_onBestiary, NULL);
     if (MM.hasSecretsGuide) UIButton_on(&MM.SecretsButton, MM_onSecrets, NULL);
 }
@@ -28501,6 +28904,27 @@ static UIButton *MM_buttons(int i) {
 static void MainMenu_update(void) {
     if (!MM.visible || !MM.awake) return;
     for (int i = 0; i < 8; i++) if (UIButton_clicked(MM_buttons(i))) break;
+    UIButton_clicked(&MM.CoopButton);
+    if (MM.hasJukebox) UIButton_clicked(&MM.JukeboxButton);
+}
+static const char *MM_upper(const char *s) {  // UTF-8 in maiuscolo come gli altri bottoni: ASCII, Latin-1, Latin Ext-A (pl, tr), cirillico; CJK invariato
+    static char out[128];
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p && o + 3 < sizeof(out);) {
+        unsigned c = *p;
+        if (c < 0x80) { out[o++] = (char)(c >= 'a' && c <= 'z' ? c - 32 : c); p++; continue; }
+        if (c < 0xc0 || c >= 0xe0 || (p[1] & 0xc0) != 0x80) { out[o++] = (char)*p++; continue; }  // 3-4 byte (CJK) e il resto: com'e'
+        c = ((c & 0x1f) << 6) | (p[1] & 0x3f);
+        if (c == 0x131) { out[o++] = 'I', p += 2; continue; }  // turco: ı senza puntino -> I
+        if (c >= 0xe0 && c <= 0xfe && c != 0xf7) c -= 0x20;                                          // à..þ
+        else if ((c >= 0x100 && c <= 0x137) || (c >= 0x14a && c <= 0x177)) c &= ~1u;                  // Latin Ext-A: maiuscola pari
+        else if (((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17e)) && !(c & 1)) c -= 1;       // qui maiuscola dispari (ł ń ż)
+        else if (c >= 0x430 && c <= 0x44f) c -= 0x20;                                                 // а..я
+        else if (c >= 0x450 && c <= 0x45f) c -= 0x50;                                                 // ё ђ ...
+        out[o++] = (char)(0xc0 | (c >> 6)), out[o++] = (char)(0x80 | (c & 0x3f)), p += 2;
+    }
+    out[o] = 0;
+    return out;
 }
 static void MM_label(UIButton *b, const char *s, float px) {
     if (!b->visible) return;
@@ -28508,7 +28932,7 @@ static void MM_label(UIButton *b, const char *s, float px) {
 }
 static void MainMenu_draw(void) {
     if (!MM.visible) return;
-    DrawRectangleRounded((Rectangle){ 552, 60, 380, 352 }, 0.06f, 6, (Color){ 12, 6, 10, 130 });  // Vita: velo dietro la colonna
+    DrawRectangleRounded((Rectangle){ 552, 60, 380, MM.hasJukebox ? 400 : 352 }, 0.06f, 6, (Color){ 12, 6, 10, 130 });  // Vita: velo dietro la colonna
     UIButton *B[] = { &MM.StartButton, &MM.PowerupButton, &MM.CollectionButton, &MM.AchievementButton, &MM.BestiaryButton, &MM.SecretsButton, &MM.CreditsButton };
     for (size_t i = 0; i < sizeof(B) / sizeof(*B); i++) UIButton_draw(B[i], 1);
     MM_label(&MM.StartButton, tr("menu_start"), 40);
@@ -28517,7 +28941,9 @@ static void MainMenu_draw(void) {
     MM_label(&MM.AchievementButton, tr("menu_unlocks"), 24);
     MM_label(&MM.BestiaryButton, tr("menu_bestiary"), 24);
     MM_label(&MM.SecretsButton, tr("menu_secrets"), 24);
-    MM_label(&MM.CreditsButton, tr("menu_credit"), 22);
+    MM_label(&MM.CreditsButton, MM_upper(tr("menu_credit")), 22);
+    UIButton_draw(&MM.CoopButton, 1), MM_label(&MM.CoopButton, "CO-OP", 22);
+    if (MM.hasJukebox) UIButton_draw(&MM.JukeboxButton, 1), MM_label(&MM.JukeboxButton, MM_upper(port_tr("menu_jukebox")), 22);
 }
 
 // ============================================================================
@@ -28535,13 +28961,15 @@ static void MM_onOptionsKey(void) { if (TB.OptionsButton.onDown) TB.OptionsButto
 static void IntroScene_MakeUIGrid(UIButton *sel) {  // Vita: due colonne, i bottoni larghi occupano entrambe
     if (!sel) sel = &MM.StartButton;
     Overlay_DestroyGrid();
-    Overlay_MakeUIGrid(2, 6, 0);
+    Overlay_MakeUIGrid(2, MM.hasJukebox ? 7 : 6, 0);
     for (int c = 0; c < 2; c++) {
         UIGrid_SetContents(c, 0, &TB.OptionsButton, 0);
         UIGrid_SetContents(c, 1, &MM.StartButton, 0);
         UIGrid_SetContents(c, 2, &MM.PowerupButton, 0);
-        UIGrid_SetContents(c, 5, &MM.CreditsButton, 0);
+        if (MM.hasJukebox) UIGrid_SetContents(c, 6, &MM.CreditsButton, 0);
     }
+    UIGrid_SetContents(0, 5, MM.hasJukebox ? &MM.CoopButton : &MM.CreditsButton, 0);
+    UIGrid_SetContents(1, 5, MM.hasJukebox ? &MM.JukeboxButton : &MM.CoopButton, 0);
     UIGrid_SetContents(0, 3, &MM.CollectionButton, 0);
     UIGrid_SetContents(1, 3, &MM.AchievementButton, 0);
     if (MM.hasBestiaryGuide) UIGrid_SetContents(0, 4, &MM.BestiaryButton, 0);
@@ -28576,8 +29004,12 @@ static void IntroScene_OnFirstInput(void) {
     Sound_PlaySimple("ClickIn", 0);
     IN.firstInputAt = IN.t;  // dopo 30 ms: MakeUIGrid()
 }
+// La home animata e' di Wolff (WolffsRoom): gira sul decoder del video come i video del finale, che usano la partita e mai il menu
+static VsVideo *HomeVideo;
+static void HomeVideo_close(void) { vs_video_close(HomeVideo), HomeVideo = NULL; }
 static void IntroScene_update(float delta) {
     IN.t += delta;
+    vs_video_update(HomeVideo, delta);
     if (!IN.introEnded && IN.t >= 0x3e8) {  // pixelation 50 -> 1 in 1000 ms, poi OnIntroEnded
         IN.introEnded = 1, IN.blinkAt = IN.t, IN.touchVisible = 1;
     }
@@ -28595,6 +29027,7 @@ static void IntroScene_update(float delta) {
 }
 static Texture2D IN_bg, IN_title;
 static void IntroScene_drawScene(void) {
+    if (!HomeVideo) { HomeVideo = vs_video_open(vs_asset("home.mp4"), MENU_W, MENU_H); vs_video_loop(HomeVideo); }
     if (!IN_bg.id) IN_bg = LoadTexture(vs_path("img/introBG.png")), IN_title = LoadTexture(vs_path("img/title.png"));
     float W = MENU_W, H = MENU_H, t = IN.t;
     if (IN_bg.id) {
@@ -28602,7 +29035,10 @@ static void IntroScene_drawScene(void) {
         DrawTexturePro(IN_bg, (Rectangle){ 0, 0, IN_bg.width, IN_bg.height }, (Rectangle){ 0.5f * W, 0.5f * H, IN_bg.width * sc, IN_bg.height * sc },
                        (Vector2){ 0.5f * IN_bg.width * sc, 0.5f * IN_bg.height * sc }, 0, WHITE);
     }
-    if (!strcmp(po_str("MainMenuBG") ? po_str("MainMenuBG") : "", "CLASSIC")) {
+    if (vs_video_ready(HomeVideo)) {
+        Texture2D v = vs_video_texture(HomeVideo);
+        DrawTexturePro(v, (Rectangle){ 0, 0, v.width, v.height }, (Rectangle){ 0, 0, W, H }, (Vector2){ 0, 0 }, 0, WHITE);
+    } else if (!strcmp(po_str("MainMenuBG") ? po_str("MainMenuBG") : "", "CLASSIC")) {
         TS_frame("illustrations", "villain.png", -0x40, 0x40, 0, 0, 3, 0, Fade(WHITE, 0.5f * lerp01(t, 0x2ee, 0x2ee)), 0);
         const Frame *im = frame_get("illustrations", "imelda.png");
         if (im) {  // setOrigin(1, 0.5).setScale(2).setFlipX(true): il ribaltamento non sposta l'origine
@@ -30469,7 +30905,7 @@ static void CA_createList(void) {
     }
     CA.Rows = CA.n;
     for (int i = 0; i < CA.Rows; i++) CA.panels[i].x = 26, CA.panels[i].y = 70 + 0x2c * i;  // Vita: coordinate dello schermo
-    CA.scY = 0, CA.scMinY = 0, CA.scMaxY = fmaxf(0, CA.Rows * 0x2c + 8 - 420);
+    CA.scY = 0, CA.scMinY = 0, CA.scMaxY = fmaxf(0, CA.Rows * 0x2c + 8 + 14 - 420);
     CA.Highlighted = CA.panels[0].power;
     CollectionAchievementsScene_MakeUIGrid();
     CA_OnPanelClicked(CA.Highlighted);
@@ -30502,9 +30938,10 @@ static void CollectionAchievementsScene_create(void) {
 static float CA_wx(float x) { return x; }  // Vita: coordinate dello schermo
 static float CA_wy(float y) { return y - CA.scY; }
 static void CA_correctScrollableContainerPosition(void) {  // Vita: la riga scelta sempre dentro la lista
-    float top = CA.hlY - 0xe;
-    if (top - CA.scY < 66) CA.scY = top - 70;
-    if (top + 0x2c - CA.scY > 486) CA.scY = top + 0x2c - 482;
+    const float margin = 14;  // la cornice della riga sporge di 12 px
+    float row = CA_wy(CA.hlY) + CA.scY;
+    if (row - margin - CA.scY < 66) CA.scY = row - margin - 66;
+    if (row + 0x24 + margin - CA.scY > 486) CA.scY = row + 0x24 + margin - 486;
     CA.scY = fminf(fmaxf(CA.scY, 0), CA.scMaxY);
 }
 static void CA_layout(void) {
@@ -30568,7 +31005,9 @@ static void CollectionAchievementsScene_draw(void) {
         if (y > -0x40 && y < MENU_H) CollectionAchievementPanel_draw(&CA.panels[i]);
     }
     menu_unclip();
+    menu_clip(24, 66, 552, 420);
     if (CA.hlVisible) vui_focus((Rectangle){ CA_wx(CA.hlX), CA_wy(CA.hlY), 0x1b8, 0x24 }, OV.t);
+    menu_unclip();
     if (CA.scMaxY > 0) {
         float h = 420 * 420 / (420 + CA.scMaxY);
         DrawRectangleRounded((Rectangle){ 570, 66 + (420 - h) * CA.scY / CA.scMaxY, 5, h }, 1, 4, rgb(VUI_GOLD, CA.barAlpha * 0.7f + 0.3f));
@@ -31342,13 +31781,18 @@ static int Evo_build(const EvoItem *e, EvoEl *el) {  // createWeaponContainer / 
     } else n = Evo_unknown(el, n, x), x += 0x23;
     return n;
 }
+// Vita: il pannello (742 x 453, pensato per 720 di altezza) usciva in fondo, copriva le statistiche (x 8..208) e
+// finiva sopra i bottoni (da y 432): scalato uniforme nello spazio libero x 216..952, y 6..426
+#define EVO_K 0.927f
+#define EVO_CX 584.0f
+#define EVO_Y 6.0f
 static void EvolutionPanel_draw(void) {
     float sx = PSAnim_v(&PS.evoSX, PS.t);
     if (sx <= 0.001f) return;
     float w = SAFE_WIDTH + 0xe6, h = PS.evoH;
     rlPushMatrix();
-    rlTranslatef(SAFE_CX + 0x28, PS.evoY, 0);
-    rlScalef(sx, PixelScale, 1);
+    rlTranslatef(EVO_CX, EVO_Y, 0);
+    rlScalef(sx * EVO_K, EVO_K, 1);
     nine("frame1_c4.png", 12, (Rectangle){ -0.5f * w, 0, w, h }, rgb(0xffffcc, 0.75f));  // PanelBackgroundBlue
     const char *hd = tr("grimoire_header");
     TS_text(hd, 0, 0x21, fit_size(hd, 16, 0xfa), 2 * PixelScale, 0, WHITE);
@@ -31544,7 +31988,7 @@ static void PS_onShowGuides(void *c) {  // le frecce verso i pickup (ShowPickups
 static void PauseScene_create(void) {
     memset(&PS, 0, sizeof(PS));
     PS.active = 1;
-    PS.hasRelicMap = po_has("CollectedItems", "RELIC_MAP"), PS.hasEvolutionGuide = po_has("CollectedItems", "RELIC_GRIMOIRE"), PS.hasRandomazzo = RandomazzoEnabled();
+    PS.hasRelicMap = Collected("RELIC_MAP"), PS.hasEvolutionGuide = Collected("RELIC_GRIMOIRE"), PS.hasRandomazzo = RandomazzoEnabled();
     float bx = PS.butX = 0.5f * MENU_W, by = PS.butY = MENU_H - 44 - 0x24;  // Vita: sopra la barra dei tasti (l'originale MENU_H - 64)
     UIButton_set(&PS.OptionsButton, "OptionsButton", bx - 0x78, by, 0x60, 0x20, 2 * PixelScale, 0.5f, 0.5f);
     UIButton_set(&PS.ResumeButton, "OptionsButton", bx + 0x78, by, 0x60, 0x20, 2 * PixelScale, 0.5f, 0.5f);
@@ -31600,7 +32044,7 @@ static void PauseScene_update(float delta) {
         return;
     }
     if (PS.evoExists && PS.pagesAmount > 0) {  // le frecce delle pagine, dentro il pannello (centro in SAFE_CX + 40)
-        float ex = SAFE_CX + 0x28, ey = PS.evoY + 0x1a4, sx = PSAnim_v(&PS.evoSX, PS.t);
+        float ex = EVO_CX, ey = EVO_Y + 0x1a4 * EVO_K, sx = PSAnim_v(&PS.evoSX, PS.t) * EVO_K;
         PS.UI_left.x = ex - 0x32 * sx, PS.UI_left.y = ey, PS.UI_right.x = ex + 0x32 * sx, PS.UI_right.y = ey;
         if (!PS.UI_left.interactive) UIButton_on(&PS.UI_left, Evo_prev, NULL), UIButton_on(&PS.UI_right, Evo_next, NULL);
         if (OV.UI_selected != UIGrid.previousGameObject) {
@@ -31717,9 +32161,10 @@ static void SceneManager_EnterPause(void) { PauseScene_create(); }  // pausa del
 // Vita: le due pagine in una sola lista a sinistra; a destra le lingue (menu) o Riprendi ed Esci (pausa).
 // Saltati (solo PC o mobile): schermo intero, joystick visibile, Twitch, Ctrl+F2 x7 (azzera il salvataggio).
 // ============================================================================
-enum { OPT_SLIDER, OPT_TOGGLE, OPT_TEXT, OPT_BG, OPT_LANG };
+enum { OPT_SLIDER, OPT_TOGGLE, OPT_TEXT, OPT_BG, OPT_LANG, OPT_ZOOM, OPT_PROFILE };
+static const float OPT_ZOOMS[] = { 0.85f, 1, 1.15f, 1.3f, 1.5f };
 typedef struct { int kind; const char *label, *key; float value; UIButton box; } OptRow;
-#define OPT_MAX 10
+#define OPT_MAX 12
 #define OPT_ROW_H 46
 #define OPT_SX0 330.0f  // il cursore: bounds da 330 a 490
 #define OPT_SW 160.0f
@@ -31747,7 +32192,7 @@ static void Opt_apply(OptRow *r) {  // le change* delle pagine
         if (!strcmp(r->key, "SoundsVolume")) SoundsVolume = r->value;
         else {  // changeBGM: Sound.UpdateMusicVolume(CurrentBGM, value)
             MusicVolume = r->value;
-            if (BGM.playing) BGM.volume = BGM.currentVolume * MusicVolume, BGM.fadeDur = 0, SetMusicVolume(BGM.music, BGM.volume);
+            if (BGM.playing) BGM.volume = BGM.currentVolume * MusicVolume, BGM.fadeDur = 0, au_music_volume(&BGM.music, BGM.volume);
         }
     } else if (r->kind == OPT_BG) {  // changeDISABLEBG: disableMovingBackground rimette sempre disableMovingBG a true (sic)
         FB_disableMovingBG = r->value != 0;
@@ -31775,14 +32220,26 @@ static void Opt_langStep(int d) {
     while (Lang_codeAt(n)) n++;
     if (n) Opt_setLang(Lang_codeAt((Opt_langIndex() + d + n) % n));
 }
+static void Opt_zoomStep(OptRow *r, int d) {
+    int n = sizeof(OPT_ZOOMS) / sizeof(*OPT_ZOOMS), i = 0;
+    while (i < n - 1 && OPT_ZOOMS[i] < r->value - 0.01f) i++;
+    r->value = OPT_ZOOMS[(i + d + n) % n];
+    po_set(r->key, r->value);
+    Sound_PlaySimple("ClickIn", 0);
+    Opt_save();
+}
+static void Opt_onZoomNext(void *c) { Opt_zoomStep(c, 1); }
 static void Opt_onToggle(void *c) { OptRow *r = c; r->value = !r->value; Opt_apply(r); }  // OptionToggle.onToggle
 static void Opt_onLangNext(void *c) { (void)c; Opt_langStep(1); }
 static void Opt_onLangPick(void *c) { Opt_setLang(Lang_codeAt((int)(intptr_t)c)); }
 static OptRow *Opt_rowOf(UIButton *b) { for (int i = 0; i < OP.n; i++) if (&OP.rows[i].box == b) return &OP.rows[i]; return NULL; }
+static void Opt_zoomStep(OptRow *r, int d);
 static void Opt_step(UIButton *b, int d) {  // onLeft / onRight: manualLeft / manualRight dei cursori (Vita: anche la lingua)
     OptRow *r = Opt_rowOf(b);
     if (!r) return;
     if (r->kind == OPT_LANG) { Opt_langStep(d); return; }
+    if (r->kind == OPT_ZOOM) { Opt_zoomStep(r, d); return; }
+    if (r->kind == OPT_PROFILE) { Opt_onToggle(r); return; }  // due valori: sinistra e destra cambiano
     if (r->kind != OPT_SLIDER) return;
     r->value = d < 0 ? fmaxf(r->value - 0.1f, 0) : fminf(r->value + 0.1f, 1);
     Opt_apply(r);
@@ -31804,13 +32261,19 @@ static void Opt_add(int kind, const char *label, const char *key, float value) {
     OptRow *r = &OP.rows[OP.n];
     r->kind = kind, r->label = label, r->key = key, r->value = value;
     UIButton_set(&r->box, "", 24, 72 + OP.n * OPT_ROW_H, 552, OPT_ROW_H - 4, 1, 0, 0);
-    if (kind == OPT_TOGGLE || kind == OPT_TEXT || kind == OPT_BG) UIButton_on(&r->box, Opt_onToggle, r);
+    if (kind == OPT_TOGGLE || kind == OPT_TEXT || kind == OPT_BG || kind == OPT_PROFILE) UIButton_on(&r->box, Opt_onToggle, r);
+    else if (kind == OPT_ZOOM) UIButton_on(&r->box, Opt_onZoomNext, r);
     else if (kind == OPT_LANG) UIButton_on(&r->box, Opt_onLangNext, NULL);  // Vita: niente tendina, croce = lingua seguente
     else r->box.interactive = 1;  // il cursore si trascina, la croce non fa nulla
     OP.n++;
 }
+static void Opt_layout(void) {  // le righe si stringono per stare nel riquadro
+    float h = fminf(OPT_ROW_H, 414.0f / OP.n);
+    for (int i = 0; i < OP.n; i++) OP.rows[i].box.y = 72 + i * h, OP.rows[i].box.h = h - 4;
+}
 static void Options_MakeUIGrid(void) {  // MakeUIGrid (menu: Indietro in cima) / MakeUIGrid_Options (pausa: Esci e Riprendi in fondo)
     Overlay_DestroyGrid();
+    Opt_layout();
     int top = !OP.pause, rb = OP.RestoreBackupButton.visible, h = OP.n + top + OP.pause + rb;
     Overlay_MakeUIGrid(2, h, OP.pause);
     for (int c = 0; c < 2; c++) {
@@ -31837,6 +32300,10 @@ static void Options_create(int pause) {
     Opt_add(OPT_SLIDER, "options_sounds", "SoundsVolume", (float)po_num("SoundsVolume"));
     Opt_add(OPT_SLIDER, "options_music", "MusicVolume", (float)po_num("MusicVolume"));
     Opt_add(OPT_TOGGLE, "options_flashing_VFX", "FlashingVFXEnabled", po_is("FlashingVFXEnabled"));
+    Opt_add(OPT_ZOOM, "vui_zoom", "ViewZoom", View_zoom());
+    Opt_add(OPT_TOGGLE, "vui_touchmove", "TouchMove", po_is("TouchMove"));
+    Opt_add(OPT_PROFILE, "vui_profile", "QualityMode", po_is("QualityMode"));  // Performance (fps alti) / Grafica (attesa GPU, niente lampi)
+    if (Collected("RELIC_3DGLASSES")) Opt_add(OPT_PROFILE, "vui_view", "View3D", po_is("View3D"));  // Vista 2D | 3D (beta): dopo gli occhiali buffi
     if (pause) {  // 0x38f1 + 0xdad8
         Opt_add(OPT_TOGGLE, "options_damageNumbers", "DamageNumbersEnabled", po_is("DamageNumbersEnabled"));
         const FancyBG *fb = Core.Stage->fancyBG;
@@ -31896,18 +32363,28 @@ static void Options_draw(void) {
         OptRow *r = &OP.rows[i];
         float y = r->box.y, cy = y + 0.5f * bH(&r->box);
         if (i) DrawRectangle(36, (int)y - 3, 528, 1, rgb(0x8a6a2a, 0.5f));
-        const char *l = tr(r->label);
+        const char *l = vui_tr(r->label);
         text_at(l, 36, cy, fit_size(l, 24, r->kind == OPT_SLIDER ? 280 : 300), 0, 0.5f, WHITE);
         if (r->kind == OPT_SLIDER) {
             DrawRectangle((int)OPT_SX0, (int)cy - 3, (int)OPT_SW, 6, rgb(0x1a1020, 1));
             DrawRectangle((int)OPT_SX0, (int)cy - 3, (int)(OPT_SW * r->value), 6, rgb(VUI_GOLD, 1));
             TS_frame("UI", "menu_square_flat_24.png", OPT_SX0 + OPT_SW * r->value, cy, 0.5f, 0.5f, 1.25f, 0, WHITE, 0);
             text_at(TextFormat("%d%%", (int)roundf(100 * r->value)), 562, cy, 22, 1, 0.5f, WHITE);
+        } else if (r->kind == OPT_ZOOM) {
+            float cx = 0.5f * (OPT_SX0 + 562);
+            text_at("<", OPT_SX0, cy, 26, 0, 0.5f, rgb(VUI_GOLD, 1)), text_at(">", 562, cy, 26, 1, 0.5f, rgb(VUI_GOLD, 1));
+            text_at(TextFormat("%d%%", (int)roundf(100 * r->value)), cx, cy, 24, 0.5f, 0.5f, WHITE);
         } else if (r->kind == OPT_LANG) {
             const char *n = Lang_native(Lang_getLangCode());
             float cx = 0.5f * (OPT_SX0 + 562);
             text_at("<", OPT_SX0, cy, 26, 0, 0.5f, rgb(VUI_GOLD, 1)), text_at(">", 562, cy, 26, 1, 0.5f, rgb(VUI_GOLD, 1));
             text_at(n, cx, cy, fit_size(n, 24, 190), 0.5f, 0.5f, WHITE);
+        } else if (r->kind == OPT_PROFILE) {
+            int view = !strcmp(r->key, "View3D");  // lo stesso selettore a due valori per Vista 2D | 3D
+            const char *v = vui_tr(view ? (r->value ? "vui_view_3d" : "vui_view_2d") : r->value ? "vui_profile_gfx" : "vui_profile_perf");
+            float cx = 0.5f * (OPT_SX0 + 562);
+            text_at("<", OPT_SX0, cy, 26, 0, 0.5f, rgb(VUI_GOLD, 1)), text_at(">", 562, cy, 26, 1, 0.5f, rgb(VUI_GOLD, 1));
+            text_at(v, cx, cy, fit_size(v, 24, 190), 0.5f, 0.5f, WHITE);
         } else if (r->kind == OPT_TEXT) {  // createTextToggle: Classico / Elaborazione Blast
             const char *v = tr(r->value ? "options_SFX_classic" : "options_SFX_blast");
             text_at(v, 562, cy, fit_size(v, 22, 200), 1, 0.5f, rgb(VUI_GOLD, 1));
@@ -32006,7 +32483,7 @@ static void RC_importReceived(char *txt) {
         RC_grid(&TB.BackButton);
         return;
     }
-    snprintf(RC.imInfo, sizeof(RC.imInfo), "%d coins, %d achievements", (int)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "Coins")), cJSON_GetArraySize(cJSON_GetObjectItem(j, "Achievements")));
+    snprintf(RC.imInfo, sizeof(RC.imInfo), port_tr("rc_info"), (int)cJSON_GetNumberValue(cJSON_GetObjectItem(j, "Coins")), cJSON_GetArraySize(cJSON_GetObjectItem(j, "Achievements")));
     cJSON_Delete(j);
     RC.imText = txt, RC.imState = IM_READY;
     UIButton_on(&RC.ImportButton, RC_onImport, NULL);
@@ -32040,9 +32517,9 @@ static void RC_deleteNow(int which) {
         vs_reload();
         return;
     }
-    if (BGM.idx >= 0) UnloadMusicStream(BGM.music), BGM.idx = -1;  // i file aperti non si possono cancellare
-    if (SeekSfx.on) UnloadMusicStream(SeekSfx.m), SeekSfx.on = 0;
-    if (LoopSfx.on) UnloadMusicStream(LoopSfx.m), LoopSfx.on = 0;
+    if (BGM.idx >= 0) Music_close(&BGM.music), BGM.idx = -1;  // i file aperti non si possono cancellare
+    if (SeekSfx.on) Music_close(&SeekSfx.m), SeekSfx.on = 0;
+    if (LoopSfx.on) Music_close(&LoopSfx.m), LoopSfx.on = 0;
     vs_delete_all_and_exit();
 }
 static void RC_onDelete(void *c) {
@@ -32085,6 +32562,7 @@ static void RecoveryScene_update(float delta) {
     if (RC.imState == IM_OFF) {
         UIButton_clicked(&RC.DelSaveButton), UIButton_clicked(&RC.DelAllButton);
         if ((RC.delArmed == 1 && OV.UI_selected != &RC.DelSaveButton) || (RC.delArmed == 2 && OV.UI_selected != &RC.DelAllButton)) RC.delArmed = 0;
+        if (getenv("VS_RCSEL")) OV.UI_selected = getenv("VS_RCSEL")[0] == 'a' ? &RC.DelAllButton : &RC.DelSaveButton;  // sviluppo: save|all, solo selezionato
         const char *dt = getenv("VS_RCDEL");  // sviluppo: save|all, cancella subito
         if (dt && RC.t > 0x7d0) RC_deleteNow(!strcmp(dt, "save") ? 1 : 2);
     }
@@ -32099,31 +32577,31 @@ static void RecoveryScene_draw(void) {
     if (RC.imState != IM_OFF) {
         nine("frame5_c4.png", 12, (Rectangle){ 120, 90, 720, 300 }, WHITE);
         if (RC.imState == IM_NONET) {
-            ui_wrap_text("Your Vita is not connected. Connect to Wi-Fi and try again.", 150, 180, 26, 660, 120, WHITE, 1);
+            ui_wrap_text(port_tr("rc_nowifi"), 150, 180, 26, 660, 120, WHITE, 1);
             return;
         }
-        text_at("On your computer's browser, open:", 480, 130, 24, 0.5f, 0.5f, WHITE);
+        text_at(port_tr("rc_open"), 480, 130, 24, 0.5f, 0.5f, WHITE);
         text_at(saveimport_address(), 480, 182, 36, 0.5f, 0.5f, rgb(0xffcd50, 1));
-        const char *msg = RC.imState == IM_BAD ? "That file is not a valid Vampire Survivors save. Your save was not touched: send another one."
-                        : RC.imState == IM_READY ? "Save received. Content this port does not have yet is skipped. Confirm below: your current save is kept as SaveData.preimport."
-                        : "Then choose SaveData.sav and press Send. Keep this screen open.";
+        const char *msg = RC.imState == IM_BAD ? port_tr("rc_bad")
+                        : RC.imState == IM_READY ? port_tr("rc_ready")
+                        : port_tr("rc_send");
         ui_wrap_text(msg, 150, 232, 22, 660, 100, RC.imState == IM_BAD ? rgb(0xff8070, 1) : rgb(0xd0c8b8, 1), 1);
         if (RC.imState == IM_READY) {
             text_at(RC.imInfo, 480, 352, 24, 0.5f, 0.5f, rgb(0xffcd50, 1));
             UIButton_draw(&RC.ImportButton, 1);
-            text_at("Import this save", RC.ImportButton.x + 230, RC.ImportButton.y + 28, 28, 0.5f, 0.5f, WHITE);
+            text_at(port_tr("rc_importthis"), RC.ImportButton.x + 230, RC.ImportButton.y + 28, 28, 0.5f, 0.5f, WHITE);
         }
         return;
     }
     if (RC.hasLastRun) RC_row(&RC.LastRunButton, tr(RC.confirm ? "charConfirm_confirm" : "options_lastRun"));
-    RC_row(&RC.ImportButton, "Import save from PC");
-    RC_row(&RC.DelSaveButton, RC.delArmed == 1 ? "Press again to delete" : "Delete save data");
-    RC_row(&RC.DelAllButton, RC.delArmed == 2 ? "Press again to delete" : "Delete all game data");
+    RC_row(&RC.ImportButton, port_tr("rc_import"));
+    RC_row(&RC.DelSaveButton, RC.delArmed == 1 ? port_tr("rc_again") : port_tr("rc_delsave"));
+    RC_row(&RC.DelAllButton, RC.delArmed == 2 ? port_tr("rc_again") : port_tr("rc_delall"));
     UIButton *sel = OV.UI_selected;
     const char *about = sel == &RC.LastRunButton ? tr("options_restoreDescription")
-                      : sel == &RC.ImportButton ? "Bring your progress over from the PC version, using your computer's browser."
-                      : sel == &RC.DelSaveButton ? "Deletes your progress on this Vita, backups included. This cannot be undone."
-                      : sel == &RC.DelAllButton ? "Deletes your save and all the game files on the memory card (about 125 MB), then closes the game. You will need the setup tool to play again."
+                      : sel == &RC.ImportButton ? port_tr("rc_about_import")
+                      : sel == &RC.DelSaveButton ? port_tr("rc_about_delsave")
+                      : sel == &RC.DelAllButton ? port_tr("rc_about_delall")
                       : NULL;
     if (about) {
         nine("frame5_c4.png", 12, (Rectangle){ 180, 340, 600, 150 }, WHITE);
@@ -33094,7 +33572,26 @@ static void SceneManager_StartFromStageSelection(void) { SS.active = 0; SceneMan
 static int pending_ending;  // 1 = EnterGameEndScene (fuochi, poi crediti), 2 = EnterCreditEndingScene (solo crediti)
 static char **Credits_lines(const char *which, int *n) {  // data/credits.json (tools/extract_data.js): le chiavi fra \1 e \2 nella lingua corrente
     static cJSON *cj;
-    if (!cj) { char *t = LoadFileText(vs_path("data/credits.json")); cj = t ? cJSON_Parse(t) : NULL; if (t) UnloadFileText(t); }
+    if (!cj) {
+        char *t = LoadFileText(vs_path("data/credits.json")); cj = t ? cJSON_Parse(t) : NULL; if (t) UnloadFileText(t);
+        static const char *const PORT[] = {  // dopo il marchio, in tutte e due le liste; gli stessi nomi dei Credits del README
+            "", "", "PS VITA PORT", "• RaZorGaToR", "", "SPECIAL THANKS",
+            "• Wolff (WolffsRoom): LiveArea art,", "  animated menu, button glyphs,", "  interface ideas, trophies",
+            "• Marcin (DrakonPL): performance work", "  behind v1.1",
+            "• Richard Davey / Photon Storm: Phaser",
+            "• Rex: phaser3-rex-plugins", "• ironwallaby: delaunay-fast",
+            "• Rinnegatamante: vitaGL, raylib Vita port,", "  ShaRKBR33D",
+            "• Ramon Santamaria (raysan5): raylib",
+            "• Northfear: SDL2 Vita port",
+            "• Dave Gamble and contributors: cJSON",
+            "• The VitaSDK team",
+            "• TheFloW: VitaShell",
+            "• Fabrice Bellard and Charlie Gordon: QuickJS",
+            "• PetterS: QuickJS Python bindings",
+            "• FFmpeg, imageio-ffmpeg, PyInstaller" };
+        for (cJSON *a = cj ? cj->child : NULL; a; a = a->next)
+            for (int i = (int)(sizeof(PORT) / sizeof(*PORT)) - 1; i >= 0 && cJSON_GetArraySize(a) > 3; i--) cJSON_InsertItemInArray(a, 3, cJSON_CreateString(PORT[i]));
+    }
     cJSON *a = cJSON_GetObjectItem(cj, which);
     int m = cJSON_GetArraySize(a);
     char **out = calloc(m + 1, sizeof(char *));
@@ -33611,6 +34108,84 @@ static void SceneManager_BackFromCredits(void) {
     IntroScene_MakeUIGrid(&MM.CreditsButton);
 }
 
+// --- Jukebox (del port): i brani di music.json; quelli di uno stage si sbloccano col suo vinile (RELIC_VINYL_<stage>), quelli
+// di un personaggio comprandolo, gli altri ci sono subito. Su/giu' sceglie, croce suona, cerchio torna al menu.
+#define JB_MAX 96
+static struct { int active, n, sel, top, playing; const char *key[JB_MAX]; int open[JB_MAX]; } JB;
+static int Jukebox_vinyls(void) {  // vinili trovati: il bottone del menu compare dal primo
+    int n = 0;
+    cJSON *v;
+    cJSON_ArrayForEach(v, po("CollectedItems")) n += cJSON_IsString(v) && !strncmp(v->valuestring, "RELIC_VINYL_", 12);
+    return n + (getenv("VS_RELICS") && strstr(getenv("VS_RELICS"), "RELIC_VINYL_"));  // sviluppo: VS_RELICS come le altre reliquie
+}
+static void SceneManager_BackFromJukebox(void);
+static void JB_play(void) {
+    if (!JB.n || !JB.open[JB.sel]) { Sound_PlaySimple("ClickOut", 0); return; }
+    Sound_StopMusic();
+    Sound_PlayMusic(JB.key[JB.sel], 0.5f, 1);
+    JB.playing = JB.sel;
+}
+static void JB_cancel(void) { SceneManager_BackFromJukebox(); }
+static void JukeboxScene_create(void) {
+    memset(&JB, 0, sizeof(JB));
+    JB.active = 1, JB.playing = -1;
+    cJSON *m;
+    cJSON_ArrayForEach(m, data_get("music")) {
+        if (JB.n >= JB_MAX || !str(m, "title")) continue;
+        const char *st = str(m, "unlockedByStage"), *ch = str(m, "unlockedByCharacter");
+        JB.key[JB.n] = m->string;
+        JB.open[JB.n++] = st ? Collected(TextFormat("RELIC_VINYL_%s", st)) : ch ? po_has("BoughtCharacters", ch) : 1;
+    }
+    TB_title = port_tr("menu_jukebox");
+    Overlay_DestroyGrid();
+    Overlay_MakeUIGrid(1, 1, 0);  // vuota: le direzioni le legge la scena, la croce suona (OnSubmitCallback)
+    Overlay_ToggleCursorsVisibility(0);
+    OV.OnSubmitCallback = JB_play, OV.OnCancelCallback = JB_cancel;
+    vui_set_prompts((VPrompt[]){ { G_CROSS, "vui_select" }, { G_CIRCLE, "vui_back" } }, 2);
+}
+#define JB_ROWS 9
+static void JukeboxScene_update(float delta) {
+    (void)delta;
+    int dx = 0, dy = 0;
+    in_dir_pressed(&dx, &dy);
+    if (JB.n && (dy || dx)) JB.sel = (JB.sel + dy + JB_ROWS * dx + JB.n) % JB.n, Sound_PlaySimple("ClickIn", 0);  // sinistra/destra: una pagina
+    if (JB.sel < JB.top) JB.top = JB.sel;
+    if (JB.sel >= JB.top + JB_ROWS) JB.top = JB.sel - JB_ROWS + 1;
+}
+static void JukeboxScene_draw(void) {
+    Rectangle box = { 20, 62, MENU_W - 40, MENU_H - 62 - 52 };
+    nine("frame5_c4.png", 12, box, WHITE);
+    for (int r = 0; r < JB_ROWS && JB.top + r < JB.n; r++) {
+        int i = JB.top + r;
+        float y = box.y + 22 + r * 44;
+        cJSON *m = cJSON_GetObjectItem(data_get("music"), JB.key[i]);
+        if (i == JB.sel) DrawRectangleRounded((Rectangle){ box.x + 12, y - 4, box.width - 24, 40 }, 0.3f, 4, Fade(rgb(VUI_GOLD, 1), 0.25f));
+        Color c = JB.open[i] ? (i == JB.sel ? YELLOW : WHITE) : rgb(0x8a8494, 1);
+        text_at(i == JB.playing ? ">" : TextFormat("%02d", i + 1), box.x + 40, y + 16, 20, 0.5f, 0.5f, i == JB.playing ? YELLOW : rgb(0xb8b0a4, 1));
+        const char *t = JB.open[i] ? str(m, "title") : "???", *s = JB.open[i] ? TextFormat("%s - %s", str(m, "source") ? str(m, "source") : "", str(m, "author") ? str(m, "author") : "")
+                                                                               : port_tr("jb_locked");
+        text_at(t, box.x + 70, y + 8, fit_size(t, 22, 400), 0, 0.5f, c);
+        text_at(s, box.x + box.width - 24, y + 22, fit_size(s, 16, 420), 1, 0.5f, rgb(0xb8b0a4, 1));
+    }
+    if (JB.n > JB_ROWS) text_at(TextFormat("%d / %d", JB.sel + 1, JB.n), 0.5f * MENU_W, box.y + box.height - 14, 16, 0.5f, 0.5f, rgb(0xb8b0a4, 1));
+}
+static void SceneManager_Jukebox_FromMainMenu(void) {
+    Overlay_DestroyGrid();
+    MM.visible = 0, MM.awake = 0;
+    JukeboxScene_create();
+    TopBar_EnableBack(SceneManager_BackFromJukebox);
+}
+static void SceneManager_BackFromJukebox(void) {
+    Overlay_DestroyGrid();
+    JB.active = 0;
+    Sound_StopMusic();
+    MM.visible = 1, MM.awake = 1;
+    TopBar_EnableOptions(SceneManager_OptionsFromMainMenu);
+    TopBar_DisableBack();
+    IntroScene_MakeUIGrid(&MM.JukeboxButton);
+}
+
+static struct { int active; float t; } Warn;
 void menu_start(void) {
     memset(&SM, 0, sizeof(SM));
     SM.active = 1;
@@ -33631,7 +34206,11 @@ void menu_start(void) {
         return;
     }
     IntroScene_create();
+    static int warned;
+    if (!warned && !getenv("VS_MENU")) Warn.active = 1;
+    warned = 1;
     static int skipped;  // sviluppo: VS_MENU=main|chars|stages salta l'intro (una volta)
+    if (getenv("VS_NETPEER")) Warn.active = 0, IN.t = 0x3e8, IN.introEnded = 1, Lobby_open();  // sviluppo: subito in lobby
     if (getenv("VS_MENU") && !skipped) skipped = 1, IN.t = 0x3e8, IN.introEnded = 1, IntroScene_OnFirstInput(), IN.firstInputAt -= 0x1e, menu_skip = getenv("VS_MENU");
 }
 // 1 quando parte la partita (game_start gia' fatto), -1 per uscire dal gioco
@@ -33723,9 +34302,190 @@ const char *menu_dbg(void) {  // sviluppo: lo stato dell'input del menu per pad.
     return TextFormat("nKeyQ=%d keydown=%d intro=%d/%d/%d grid=%d/%d blk=%d sel=%p cur=%d,%d td4=%.0f", nKeyQ, kd, IN.introEnded, IN.isInitialized, IN.anyHeld,
                       UIGrid.on, IN.gridMade, OV.blockInput, (void *)OV.UI_selected, UIGrid.cx, UIGrid.cy, OV.timeDown[4]);
 }
+// Intro anime dopo l'avviso, a ogni avvio (Federico, 2026-11-05). Nel VPK: video muto senza logo + musica originale (ElevenLabs,
+// intro.ogg, gia' a tempo col video: vs_video non suona). Il logo viene dalla copia dell'utente, come il resto del gioco.
+// Tempi dal montaggio (trailer/intro_src/edit3.py). Qualsiasi tasto o tocco la salta. Chiude il decoder prima che la home apra il suo.
+#define INTRO_LOGO_AT 19.413f
+#define INTRO_LEN 20.945f
+static struct { int active, music; VsVideo *v; Music m; float t, vt; } IV;
+static void IntroVid_stop(void) {
+    if (IV.music == 1) au_music_stop(&IV.m), Music_close(&IV.m);
+    vs_video_close(IV.v);
+    memset(&IV, 0, sizeof(IV));
+}
+static void IntroVid_start(void) {
+    IV.v = vs_video_open(vs_asset("intro.mp4"), MENU_W, MENU_H);
+    IV.active = IV.v != NULL;
+}
+static void IntroVid_update(float delta) {
+    IV.t += delta;
+    if (!vs_video_update(IV.v, delta)) { IntroVid_stop(); return; }
+    if (vs_video_ready(IV.v)) IV.vt += delta / 1000;
+    if (!IV.music && vs_video_ready(IV.v) && IsAudioDeviceReady()) {
+        IV.music = -1;  // un tentativo solo
+        Music_open(&IV.m, vs_asset("intro.ogg"));
+        if (IV.m.frameCount) IV.m.looping = 0, au_music_volume(&IV.m, MusicVolume), PlayMusicStream(IV.m), au_music_add(&IV.m), IV.music = 1;
+    }
+    if (IV.music == 1 && IV.vt > INTRO_LEN - 1.2f) au_music_volume(&IV.m, MusicVolume * fmaxf(0, (INTRO_LEN - IV.vt) / 1.2f));
+    if (IV.t < 300) return;  // la pressione che ha chiuso l'avviso non salta anche l'intro
+    int any = ptr_pressed() || GetKeyPressed();
+    for (int b = 1; b <= 17 && !any && IsGamepadAvailable(0); b++) any = IsGamepadButtonPressed(0, b);
+    if (any) IntroVid_stop();
+}
+static void IntroVid_draw(void) {
+    if (!vs_video_ready(IV.v)) return;
+    Texture2D v = vs_video_texture(IV.v);
+    DrawTexturePro(v, (Rectangle){ 0, 0, v.width, v.height }, (Rectangle){ 0, 0, MENU_W, MENU_H }, (Vector2){ 0, 0 }, 0, WHITE);
+    if (IV.vt < INTRO_LOGO_AT) return;
+    if (!IN_title.id) IN_title = LoadTexture(vs_path("img/title.png"));
+    if (!IN_title.id) return;
+    float k = 1 + 0.6f * fmaxf(0, 1 - (IV.vt - INTRO_LOGO_AT) / 0.18f), w = 570 * k, h = w * IN_title.height / IN_title.width;  // sbatte e si posa in 0,18 s
+    float a = fminf(1, (INTRO_LEN - IV.vt) / 0.6f);
+    DrawTexturePro(IN_title, (Rectangle){ 0, 0, IN_title.width, IN_title.height }, (Rectangle){ 0.5f * (MENU_W - w), 0.5f * (MENU_H - h) - 22, w, h }, (Vector2){ 0, 0 }, 0, Fade(WHITE, fmaxf(0, a)));
+}
+// Avviso di fotosensibilita' all'accensione, come nelle altre versioni del gioco (proposta di Wolff), con i crediti del port
+static void Warn_update(float delta) {
+    Warn.t += delta;
+    if (Warn.t < 400) return;
+    int any = ptr_pressed() || GetKeyPressed() || getenv("VS_AUTOPICK");
+    for (int b = 1; b <= 17 && !any && IsGamepadAvailable(0); b++) any = IsGamepadButtonPressed(0, b);
+    if (any) Warn.active = 0, IntroVid_start();
+}
+static void Warn_draw(void) {
+    float W = MENU_W, x = 90, w = W - 2 * x;
+    const char *title = tr("preload_warning_title");
+    text_at(title, 0.5f * W, 96, fit_size(title, 36, w), 0.5f, 0.5f, rgb(0xff3b3b, 1));
+    ui_wrap_text(tr("preload_warning_text"), x, 160, 22, w, 210, WHITE, 1);
+    if (fmodf(Warn.t, 1000) < 650) text_at(tr("intro_start"), 0.5f * W, 420, fit_size(tr("intro_start"), 26, w), 0.5f, 0.5f, WHITE);
+}
+// --- Lobby del gioco a due: chi ospita sceglie personaggio e stage come sempre, chi si unisce sceglie il suo personaggio e aspetta
+enum { LB_CHOOSE, LB_HOST_WAIT, LB_JOIN_FIND, LB_JOIN_READY, LB_FAILED };
+static struct { int active, mode, sel, hosting; float t; double goAt; char hello[1024], peer[1200]; const char *failed; } LB;
+static void Lobby_hello(void) {  // personaggio e potenziamenti di questa console
+    cJSON *h = cJSON_CreateObject(), *levels = cJSON_AddObjectToObject(h, "levels"), *pw;
+    cJSON_AddStringToObject(h, "char", po_str("SelectedCharacter"));
+    cJSON_ArrayForEach(pw, data_get("powerups")) cJSON_AddNumberToObject(levels, pw->string, num(cJSON_GetArrayItem(pw, 0), "level", 0));
+    char *t = cJSON_PrintUnformatted(h);
+    snprintf(LB.hello, sizeof(LB.hello), "%s", t);
+    cJSON_free(t), cJSON_Delete(h);
+}
+static void Lobby_open(void) { memset(&LB, 0, sizeof(LB)); LB.active = 1; }
+static void Lobby_close(void) { net_close(); LB.active = 0, LB.hosting = 0; }
+static void Lobby_join_cycleCharacter(int d);
+static void Lobby_begin(int host) {
+    if (!net_lobby_start(host)) { LB.mode = LB_FAILED, LB.failed = port_tr("lb_nonet"); return; }
+    LB.mode = host ? LB_HOST_WAIT : LB_JOIN_FIND;
+    if (!host) Lobby_join_cycleCharacter(0);  // un SelectedCharacter mai comprato (solo evidenziato) diventa il primo giocabile
+    Lobby_hello();
+}
+static void Lobby_join_cycleCharacter(int d) {  // i personaggi giocabili come nella CharSelectionScene: isBought nei dati (iniziali + comprati)
+    const char *u[256];  // UnlockedCharacters sono solo quelli trovati: con un salvataggio nuovo e' vuoto e non si sceglieva niente
+    int n = 0, at = 0;
+    cJSON *c;
+    cJSON_ArrayForEach(c, data_get("characters"))
+        if (n < 256 && cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetArrayItem(c, 0), "isBought"))) u[n++] = c->string;
+    if (n < 1) return;
+    for (int i = 0; i < n; i++) if (po_str("SelectedCharacter") && !strcmp(u[i], po_str("SelectedCharacter"))) at = i;
+    po_sets("SelectedCharacter", u[(at + d + n) % n]);
+    Lobby_hello();
+}
+static void Lobby_startAsClient(unsigned seed, char *hostSave) {  // la partita usa il salvataggio dell'ospite; i volumi e la lingua restano i propri
+    double sv = po_num("SoundsVolume"), mv = po_num("MusicVolume");
+    char lang[16];
+    snprintf(lang, sizeof(lang), "%s", po_str("Language") ? po_str("Language") : "");
+    cJSON_Delete(Net_second);
+    char *sep = strchr(hostSave, '\x01');  // "<il mio hello come l'ha visto l'ospite>\x01<salvataggio>": le due console usano lo stesso
+    if (sep) *sep = 0;
+    Net_second = cJSON_Parse(sep ? hostSave : LB.hello);
+    if (sep) memmove(hostSave, sep + 1, strlen(sep + 1) + 1);
+    SaveSystem_ApplyLoadedSave(hostSave);
+    vs_free(hostSave);  // viene da net.c: non e' memoria di partita
+    po_set("SoundsVolume", sv), po_set("MusicVolume", mv);
+    if (*lang) po_sets("Language", lang);
+    det_begin(seed);
+    net_begin();
+    LB.active = 0;
+    SM.launch = 1;
+}
+static void Lobby_update(float delta) {
+    LB.t += delta;
+    int dx = 0, dy = 0;
+    in_dir_pressed(&dx, &dy);
+    if (getenv("VS_NETPEER") && LB.mode == LB_CHOOSE) Lobby_begin(getenv("VS_NETHOST") != NULL);  // sviluppo
+    if (LB.mode == LB_CHOOSE) {
+        if (dy) LB.sel = !LB.sel;
+        if (in_confirm()) Lobby_begin(LB.sel == 0);
+        else if (in_cancel()) LB.active = 0;
+    } else if (LB.mode == LB_HOST_WAIT) {
+        if (net_lobby_poll(LB.hello, LB.peer, sizeof(LB.peer))) {
+            cJSON_Delete(Net_second);
+            Net_second = cJSON_Parse(LB.peer);
+            LB.active = 0, LB.hosting = 1;
+            if (getenv("VS_NETHOST")) LB.goAt = GetTime() + atof(getenv("VS_NETHOST"));  // sviluppo: senza scelte, il via dopo N secondi
+            else MM_onStart(NULL);  // personaggio e stage come sempre; il via parte con SM.launch
+            return;
+        }
+        if (in_cancel()) Lobby_close();
+    } else {
+        if (LB.mode == LB_JOIN_FIND && net_lobby_poll(LB.hello, LB.peer, sizeof(LB.peer))) LB.mode = LB_JOIN_READY;
+        if (LB.mode == LB_JOIN_READY) {
+            static int devCycled;  // sviluppo: VS_LBCYCLE=n scorre il personaggio di n appena collegato
+            if (getenv("VS_LBCYCLE") && !devCycled) devCycled = 1, dx = atoi(getenv("VS_LBCYCLE"));
+            if (dx) Lobby_join_cycleCharacter(dx);
+            static int rs;
+            if (dx || ++rs % 15 == 0) net_lobby_resend(LB.hello);  // l'ospite tiene l'ultimo e lo rimanda col via
+            unsigned seed;
+            char *save;
+            if (net_lobby_wait_go(&seed, &save)) { Lobby_startAsClient(seed, save); return; }
+        }
+        if (in_cancel()) Lobby_close();
+    }
+    if (LB.mode == LB_FAILED && (in_cancel() || in_confirm())) LB.mode = LB_CHOOSE;
+}
+static void Lobby_draw(void) {
+    DrawRectangle(0, 0, MENU_W, MENU_H, (Color){ 10, 4, 8, 200 });
+    float cx = 0.5f * MENU_W;
+    text_at("CO-OP", cx, 60, 44, 0.5f, 0.5f, rgb(VUI_GOLD, 1));
+    if (LB.mode == LB_CHOOSE) {
+        const char *o[2] = { port_tr("lb_host"), port_tr("lb_join") };
+        for (int i = 0; i < 2; i++) {
+            text_at(o[i], cx, 220 + i * 60, 30, 0.5f, 0.5f, LB.sel == i ? YELLOW : WHITE);
+            if (LB.sel == i) ui_arrows(cx, 220 + i * 60, 0.5f * MeasureTextEx(vs_font, o[i], 30, 0).x + 12, LB.t);
+        }
+        text_at(port_tr("lb_wifi"), cx, 390, 20, 0.5f, 0.5f, rgb(0xb8b0a4, 1));
+    } else if (LB.mode == LB_HOST_WAIT) {
+        text_at(port_tr("lb_waiting"), cx, 250, 30, 0.5f, 0.5f, WHITE);
+    } else if (LB.mode == LB_JOIN_FIND) {
+        text_at(port_tr("lb_looking"), cx, 250, 30, 0.5f, 0.5f, WHITE);
+    } else if (LB.mode == LB_JOIN_READY) {
+        text_at(port_tr("lb_yourchar"), cx, 210, 26, 0.5f, 0.5f, rgb(VUI_GOLD, 1));
+        text_at(TextFormat("<   %s   >", char_text(po_str("SelectedCharacter"), "charName")), cx, 260, 32, 0.5f, 0.5f, WHITE);
+        text_at(port_tr("lb_hoststage"), cx, 330, 22, 0.5f, 0.5f, rgb(0xb8b0a4, 1));
+    } else text_at(LB.failed, cx, 250, 28, 0.5f, 0.5f, rgb(0xff6b6b, 1));
+}
+// Fine partita a due: chi si e' unito torna al proprio salvataggio e tiene le monete guadagnate
+void game_net_end(void) {
+    double coins = Core.RunCoins;
+    int joined = net_role == 1;
+    net_close();
+    det_end();
+    if (joined) {
+        SaveSystem_Load();
+        po_add("Coins", coins), po_add("LifetimeCoins", coins), po_add("TotalCoins", coins);
+        PlayerOptions_Save();
+    }
+}
 int menu_update(float dt) {
     float delta = dt * 1000;
     ptr_update();
+    if (Warn.active) { Warn_update(delta); return 0; }
+    if (IV.active) { IntroVid_update(delta); return 0; }
+    if (LB.active) {
+        KeyQ_poll();
+        Sound_Update(delta);
+        Lobby_update(delta);
+        if (!SM.launch) return 0;
+    }
     if (ptr_pressed() && vui_prompt_touch(menu_pointer())) PT.prev = PT.down;  // il tocco sulla barra dei tasti non arriva alla scena
     KeyQ_poll();
     Sound_Update(delta);
@@ -33740,6 +34500,7 @@ int menu_update(float dt) {
         else if (!strcmp(menu_skip, "collection")) MM_onCollection(NULL);
         else if (!strcmp(menu_skip, "achievements")) MM_onAchievement(NULL);
         else if (!strcmp(menu_skip, "bestiary")) SceneManager_BestiaryFromMainMenu();
+        else if (!strcmp(menu_skip, "jukebox")) SceneManager_Jukebox_FromMainMenu();
         else if (!strcmp(menu_skip, "options")) MM_onOptionsKey();
         else if (!strcmp(menu_skip, "recovery")) MM_onOptionsKey(), SceneManager_RecoveryFromOptions();
         else if (!strcmp(menu_skip, "credits")) MM_onCredits(NULL);
@@ -33763,12 +34524,38 @@ int menu_update(float dt) {
     else if (OP.active) Options_update(delta);
     else if (RC.active) RecoveryScene_update(delta);
     else if (CR.active) CreditsScene_update(delta);
+    else if (JB.active) JukeboxScene_update(delta);
     MainMenu_update();
     TopBar_update();
     if (menu_quit) return -1;
+    if (LB.goAt > 0 && GetTime() >= LB.goAt) LB.goAt = 0, SM.launch = 1;
     if (SM.launch) {
         SM.launch = 0, SM.active = 0;
         Overlay_DestroyGrid();
+        if (LB.hosting) {  // chi ospita da' il via: seme e salvataggio all'altra console
+            unsigned seed = (unsigned)time(NULL);
+            SaveSystem_UpdateChecksum();
+            net_lobby_poll(LB.hello, LB.peer, sizeof(LB.peer));  // l'ultima scelta di chi si e' unito (la rimanda ogni 15 frame)
+            cJSON_Delete(Net_second);
+            Net_second = cJSON_Parse(LB.peer);
+            const char *pc = cJSON_GetStringValue(cJSON_GetObjectItem(Net_second, "char"));
+            if (Net_second && (!pc || !tbl0("characters", pc))) {  // un CUSTOM che qui non c'e': Antonio, e lo sa anche l'altra console
+                cJSON_DeleteItemFromObject(Net_second, "char");
+                cJSON_AddStringToObject(Net_second, "char", "ANTONIO");
+                char *t = cJSON_PrintUnformatted(Net_second);
+                snprintf(LB.peer, sizeof(LB.peer), "%s", t);
+                cJSON_free(t);
+            }
+            char *save = cJSON_PrintUnformatted(PlayerOptions);
+            size_t gn = strlen(LB.peer) + strlen(save) + 2;
+            char *go = malloc(gn);
+            snprintf(go, gn, "%s\x01%s", LB.peer, save);
+            int ok = net_lobby_send_go(seed, go);
+            cJSON_free(save), free(go);
+            LB.hosting = 0;
+            if (ok) det_begin(seed), net_begin();
+            else net_close();  // l'altra console e' sparita: si gioca da soli
+        }
         menu_launching = 1;
         game_start(po_str("SelectedCharacter"));
         menu_launching = 0;
@@ -33789,6 +34576,7 @@ static void menu_draw_all(void) {
     if (OP.active) Options_draw();
     if (RC.active) RecoveryScene_draw();
     if (CR.active) CreditsScene_draw();
+    if (JB.active) JukeboxScene_draw();
     TopBar_draw();
     vui_prompt_bar();
     Overlay_draw();
@@ -33796,6 +34584,22 @@ static void menu_draw_all(void) {
 void menu_draw(void) {
     float ms = menu_scale(), mw = MENU_W * ms, x0 = (SCREEN_W - mw) / 2;
     ClearBackground(BLACK);
+    if (Warn.active) {
+        rlPushMatrix();
+        rlTranslatef(x0, 0, 0);
+        rlScalef(ms, ms, 1);
+        Warn_draw();
+        rlPopMatrix();
+        return;
+    }
+    if (IV.active) {
+        rlPushMatrix();
+        rlTranslatef(x0, 0, 0);
+        rlScalef(ms, ms, 1);
+        IntroVid_draw();
+        rlPopMatrix();
+        return;
+    }
     if (FE.active || CE.active) {  // finali a tutto schermo
         BeginScissorMode((int)x0, 0, (int)mw, SCREEN_H);
         rlPushMatrix();
@@ -33816,11 +34620,14 @@ void menu_draw(void) {
     rlTranslatef(x0, 0, 0);
     rlScalef(ms, ms, 1);
     menu_draw_all();
+    if (LB.active) Lobby_draw();
     rlPopMatrix();
     EndScissorMode();
 }
 
 void game_start(const char *character) {
+    HomeVideo_close();  // un solo decoder: la partita puo' averne bisogno
+    TapMove.on = 0;
     char chbuf[64];  // spesso e' po_str("SelectedCharacter"): il po_sets qui sotto libererebbe la stringa
     snprintf(chbuf, sizeof(chbuf), "%s", character);
     character = chbuf;
@@ -33830,7 +34637,7 @@ void game_start(const char *character) {
     camera_followOffsetX = 0, FrameFreeze_ms = 0;
     Lights.on = 0, Lights.n = 0;  // le luci di candela si assegnano solo dopo Lights_Init dello stage nuovo
     FishEye.on = 0, FishEye.intensity = 0;
-    if (LoopSfx.on) UnloadMusicStream(LoopSfx.m), LoopSfx.on = 0;  // fancyBG.OnDestroy: StopSound(Wind)
+    if (LoopSfx.on) Music_close(&LoopSfx.m), LoopSfx.on = 0;  // fancyBG.OnDestroy: StopSound(Wind)
     time_reset();
     tweens_reset();
     physics_reset();
@@ -33853,11 +34660,12 @@ void game_start(const char *character) {
     gmem_reset();     // dopo i reset di timer, tween, fisica e lista di disegno: nessuno punta piu' alla partita vecchia
     LU.gems = NULL;   // il ParticleManager del level-up era della partita precedente
     memset(&DamagePool, 0, sizeof(DamagePool));  // i numeri vivono nella scena: si ricreano a ogni partita
-    memset(&LUF, 0, sizeof(LUF));
-    laurel = NULL;
+    memset(LUF_of, 0, sizeof(LUF_of));
+    memset(laurel_of, 0, sizeof(laurel_of));
     n_TweenAngles = 0;
+    EnemyBlock = calloc(ENEMY_BLOCK, sizeof(Enemy)), EnemyBlock_used = 0;  // dopo gmem_reset: valgono per questa partita
+    memset(EnemyData_table, 0, sizeof(EnemyData_table));
     run_ms = 0;
-    _lastVelocity = (Vector2){ 0, 0 };
     // CharacterSelection: SelectedCharacter e l'arma di partenza vista (la scelta dello stage arriva con F3.1; sviluppo: VS_STAGE=LIBRARY)
     po_sets("SelectedCharacter", character);
     if (getenv("VS_STAGE")) po_sets("SelectedStage", getenv("VS_STAGE"));
@@ -33910,6 +34718,7 @@ void game_start(const char *character) {
 #endif
         fill_shader = LoadShaderFromMemory(FILL_VS, FILL_FS);
     }
+    if (net_on) Players_addSecond(character);
     PlayerOptions_Save();  // MainScene.create
 }
 
@@ -33921,6 +34730,7 @@ const char *game_prof(void) {
     return b;
 }
 int game_update(float dt) {
+    if (Players_n > 1) game_context_set(Scene_owner), net_input_player = Scene_owner;  // una scena aperta (level-up, forziere) lavora per chi ci e' entrato
     ptr_update();
     KeyQ_poll();
     MainScene_combos();
@@ -34001,7 +34811,7 @@ int game_update(float dt) {
         static const char *const N[8] = { "pre", "updateList", "particelle", "clock", "tween", "fisica", "scena", "post" };
         if (o) {
             extern int phys_runs;
-            fprintf(o, "LOGPROF nemici %d gemme %d tween %d passi/frame %.2f fisica/passo %.2f ms |", Core.Enemies.n, Core.PickupGroup.n, tweens_used(),
+            fprintf(o, "LOGPROF fps %d 3d %d nemici %d gemme %d tween %d passi/frame %.2f fisica/passo %.2f ms |", GetFPS(), scene_view3d, Core.Enemies.n, Core.PickupGroup.n, tweens_used(),
                     (double)phys_runs / lpn, phys_runs ? lt[5] * 1000 / phys_runs : 0);
             phys_runs = 0;
             for (int i = 0; i < 8; i++) fprintf(o, " %s %.2f", N[i], lt[i] * 1000 / lpn);
@@ -34048,10 +34858,12 @@ static void Player_draw(Sprite *s) {
 }
 
 double draw_prof[8];  // VS_LOGPROF: 0 ordinamento, 1 tessere, 2 particelle, 3 custom, 4 sprite (scene_render), 6 tutto game_draw
+static float View_zoom(void) { float z = getenv("VS_ZOOM") ? (float)atof(getenv("VS_ZOOM")) : (float)po_num("ViewZoom"); return z > 0 ? z : 1; }  // Opzioni: avvicina o allontana il mondo, il HUD resta fermo
 void game_draw(void) {
     double gd_t0 = GetTime();
     // Camera.preRender (startFollow): la camera segue la posizione dello sprite dopo la fisica
-    camera_follow(CamPan_target());  // il giocatore, o la camera verso l'Ender che muore
+    if (Players_n > 1) PlayerUI_Update();  // l'esperienza cresce anche con le gemme dell'altro
+    camera_follow(Players_n > 1 && net_role == 1 ? &Slots[1].player->s : CamPan_target());  // il giocatore, o la camera verso l'Ender che muore
     // Vita: tre viste di gioco a turno, lo schermo mostra quella del frame prima: la GPU non aspetta la vista appena disegnata
     // e non la riscrive mentre lo schermo la legge. Misurato 2026-11-01 con l'attesa prima dello scambio (vs_finish_mode):
     // 17,5 ms a frame invece di 19,5 con una vista sola.
@@ -34072,6 +34884,16 @@ void game_draw(void) {
     if (nofill < 0) nofill = getenv("VS_NOFILL") != NULL;
     int zoomOut = camera_zoom < 1;  // zoom indietro (fase 5 della Machine): tutta la scena scalata attorno al centro, HUD compreso come in Phaser
     if (zoomOut) rlPushMatrix(), rlTranslatef(0.5f * game_width, 0.5f * game_height, 0), rlScalef(camera_zoom, camera_zoom, 1), rlTranslatef(-0.5f * game_width, -0.5f * game_height, 0);
+    scene_world_zoom = View_zoom(), scene_ui_depth = ZInGameUI - 0x10, scene_zoom_out = camera_zoom;
+    static int devGlasses;  // sviluppo: VS_GLASSES=secondi come se avessi appena preso gli occhiali
+    if (getenv("VS_GLASSES") && !devGlasses) devGlasses = 1, Glasses_fx = 1, Glasses_left = (float)atof(getenv("VS_GLASSES"));
+    // Glasses_fx finisce appena sotto zero, mai esattamente a 0: con !Glasses_fx il conto non partiva e il 3D restava per sempre
+    static int glassesOut;  // allo scadere: un solo fisheye di uscita, col 3D ancora acceso finche' dura
+    if (Glasses_left > 0 && Glasses_fx <= 0 && (Glasses_left -= GetFrameTime()) <= 0) Glasses_left = 0, Glasses_fx = 1, glassesOut = 1;  // tempo reale
+    if (glassesOut && Glasses_fx <= 0) glassesOut = 0;
+    scene_view3d = getenv("VS_3D") && *getenv("VS_3D") ? atoi(getenv("VS_3D")) : po_is("View3D") || Glasses_left > 0 || glassesOut;  // Opzioni > Vista 2D | 3D
+    if (getenv("VS_3DDIST")) view3d_dist = (float)atof(getenv("VS_3DDIST"));
+    if (getenv("VS_3DPITCH")) view3d_pitch = (float)atof(getenv("VS_3DPITCH"));
     scene_render(nofill ? (Shader){ 0 } : fill_shader);  // la mappa (TilingTileset) e' nella lista di disegno, depth -2000..1995
     if (zoomOut) rlPopMatrix();
     if (getenv("VS_BODIES")) {
@@ -34106,6 +34928,10 @@ void game_draw(void) {
     if (vs_finish_mode() & 1) vs_gl_finish();  // VS_FINISH=rt|both: la GPU finisce la vista di gioco prima che lo schermo la legga (diagnosi del lampo nero)
     // Scale.FIT: la vista di gioco (altezza 456) riempie l'altezza dello schermo
     float sc = (float)SCREEN_H / game_height, w = game_width * sc, zw = game_width / fmaxf(camera_zoom, 1), zh = game_height / fmaxf(camera_zoom, 1);  // zoom avanti: ritaglio attorno al centro
+    if (Glasses_fx > 0) {  // occhiali buffi: il mondo si gonfia e torna in 1,6 s (anche sotto la scena della reliquia trovata)
+        Glasses_fx -= GetFrameTime() / 1.6f;
+        FishEye.on = Glasses_fx > 0, FishEye.mode = 1, FishEye.radius = 0.25f * game_height, FishEye.intensity = sinf(PI * fmaxf(0, Glasses_fx));
+    }
     int fish = FishEye.on && FishEye.intensity > 0;  // rexFishEyePostFx sulla camera principale (Moongolow)
     if (fish) FishEye_Begin();
     Texture2D shown = drawn >= NRT ? rts[(cur + NRT - 1) % NRT].texture : rt.texture;  // all'avvio la sola appena disegnata
@@ -34173,4 +34999,45 @@ void game_draw(void) {
         DrawTexturePro(src, sr, (Rectangle){ (SCREEN_W - mw) / 2, 0, mw, SCREEN_H }, (Vector2){ 0, 0 }, 0, WHITE);
     }
     draw_prof[6] += GetTime() - gd_t0;
+}
+
+// VS_DET: hash dello stato di gioco alla fine di ogni frame
+void det_game_hash(unsigned *enemies, unsigned *player) {
+    game_context_set(0);
+    unsigned h = 2166136261u, v;
+#define DH(x) do { float f_ = (float)(x); memcpy(&v, &f_, 4); h = (h ^ v) * 16777619u; } while (0)
+    DH(Core.Enemies.n);
+    for (int i = 0; i < Core.Enemies.n; i++) { Enemy *e = Core.Enemies.items[i]->owner; DH(e->hp); DH(e->s.x); DH(e->s.y); }
+    *enemies = h;
+    h = 2166136261u;
+    if (Core.Player) { DH(Core.Player->s.x); DH(Core.Player->s.y); DH(Core.Player->level); DH(Core.Player->xp); }
+    DH(Core.RunCoins); DH(Core.n_weapons);
+    if (Players_n > 1) {
+        Player *o = Slots[1].player;
+        DH(o->isDead); DH(o->s.x); DH(o->s.y); DH(o->level); DH(o->xp); DH(o->hp); DH(Slots[1].n_weapons);
+    }
+    *player = h;
+#undef DH
+}
+
+// Lockstep: l'input locale per il frame futuro
+void game_net_submit(void) {
+    Vector2 v = Core.Player ? Player_localMove(Slots[net_role].player ? Slots[net_role].player : Core.Player, 1) : (Vector2){ 0, 0 };
+    NetMove m = { (signed char)roundf(v.x * 127), (signed char)roundf(v.y * 127), 0 };
+    for (int b = 1; b <= 17; b++) if (IsGamepadAvailable(0) && IsGamepadButtonDown(0, b)) m.buttons |= 1u << b;
+    if (IsKeyDown(KEY_ENTER) || IsKeyDown(KEY_SPACE)) m.buttons |= 1u << GAMEPAD_BUTTON_RIGHT_FACE_DOWN;  // la tastiera sul desktop
+    if (IsKeyDown(KEY_BACKSPACE)) m.buttons |= 1u << GAMEPAD_BUTTON_RIGHT_FACE_RIGHT;
+    if (IsKeyDown(KEY_ESCAPE)) m.buttons |= 1u << GAMEPAD_BUTTON_MIDDLE_RIGHT;
+    if (IsKeyDown(KEY_LEFT)) m.buttons |= 1u << GAMEPAD_BUTTON_LEFT_FACE_LEFT;
+    if (IsKeyDown(KEY_RIGHT)) m.buttons |= 1u << GAMEPAD_BUTTON_LEFT_FACE_RIGHT;
+    if (IsKeyDown(KEY_UP)) m.buttons |= 1u << GAMEPAD_BUTTON_LEFT_FACE_UP;
+    if (IsKeyDown(KEY_DOWN)) m.buttons |= 1u << GAMEPAD_BUTTON_LEFT_FACE_DOWN;
+    const char *press = getenv("VS_NETPRESS");  // sviluppo: VS_NETPRESS=frame:tasto,frame:tasto (premuto per 4 frame)
+    for (const char *c = press; c && *c;) {
+        unsigned f = 0; int b = 0;
+        if (sscanf(c, "%u:%d", &f, &b) == 2 && det_frame + 4 >= f && det_frame + 4 < f + 4) m.buttons |= 1u << b;
+        c = strchr(c, ',');
+        if (c) c++;
+    }
+    net_submit(m);
 }

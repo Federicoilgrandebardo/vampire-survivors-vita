@@ -75,7 +75,7 @@ Timer time_addEvent(float delay, int loop, int repeat, Callback cb, void *ctx) {
         TimerEvent *e = &timers[i];
         if (e->active) continue;
         unsigned g = e->gen + 1;
-        *e = (TimerEvent){ .delay = delay, .timeScale = 1, .callback = cb, .ctx = ctx, .active = 1, .gen = g };
+        *e = (TimerEvent){ .delay = delay, .timeScale = 1, .callback = cb, .ctx = ctx, .active = 1, .gen = g, .context = game_context };
         e->repeatCount = (repeat == -1 || loop) ? 999999999999.0 : repeat;
         pending_ins[n_ins++] = i;
         return (Timer){ i, g };
@@ -124,7 +124,10 @@ void clock_update(float delta) {
             unsigned g = e->gen;
             if (!e->hasDispatched && e->callback) {
                 e->hasDispatched = 1;
+                int was = game_context;
+                game_context_set(e->context);
                 e->callback(e->ctx);
+                game_context_set(was);
             }
             if (e->gen != g || !e->active) continue;  // distrutto nel callback
             if (e->repeatCount > 0) {
@@ -206,7 +209,7 @@ TweenRef tweens_add(TweenConfig c) {
         if (t->used) continue;
         unsigned g = t->gen + 1;
         if (t->data && t->data != t->inl) free(t->data);
-        *t = (Tween){ .used = 1, .gen = g, .timeScale = 1, .onComplete = c.onComplete, .onRepeat = c.onRepeat, .onYoyo = c.onYoyo, .onStart = c.onStart, .onUpdate = c.onUpdate, .ctx = c.ctx, .paused = c.paused, .persist = c.persist };
+        *t = (Tween){ .used = 1, .gen = g, .timeScale = 1, .onComplete = c.onComplete, .onRepeat = c.onRepeat, .onYoyo = c.onYoyo, .onStart = c.onStart, .onUpdate = c.onUpdate, .ctx = c.ctx, .paused = c.paused, .persist = c.persist, .context = game_context };
         const TweenProp *props = c.many ? c.many : c.props;
         t->totalData = c.many ? c.nmany : c.nprops;
         t->data = t->totalData > TWEEN_DATA ? malloc(t->totalData * sizeof(TweenData)) : t->inl;
@@ -332,7 +335,12 @@ static void nextState(Tween *t) {
         t->state = TS_ACTIVE;
     } else {
         t->state = TS_PENDING_REMOVE;
-        if (t->onComplete) t->onComplete(t->ctx);
+        if (t->onComplete) {
+            int was = game_context;
+            game_context_set(t->context);
+            t->onComplete(t->ctx);
+            game_context_set(was);
+        }
     }
 }
 
@@ -481,8 +489,10 @@ void tweens_preUpdate(void) {
 void tweens_update(float delta) {
     for (int i = 0; i < n_tactive; i++) {
         int idx = t_active[i];
+        game_context_set(tweens[idx].context);
         if (tween_update(&tweens[idx], delta)) t_destroy[n_tdestroy++] = idx;
     }
+    game_context_set(0);
 }
 
 // ============================================================================
@@ -534,7 +544,12 @@ static void anim_nextFrame(Sprite *s) {  // Animation.nextFrame
             st->nextTick = a->msPerFrame;
         } else {  // complete
             st->isPlaying = 0;
-            if (s->onAnimationComplete) s->onAnimationComplete(s->owner);
+            if (s->onAnimationComplete) {
+                int was = game_context;
+                game_context_set(s->context);
+                s->onAnimationComplete(s->owner);
+                game_context_set(was);
+            }
         }
     } else {
         st->index++;
@@ -572,6 +587,7 @@ void sprite_setFrame(Sprite *s, const Frame *f) {  // Sprite.setFrame -> setSize
 void sprite_init(Sprite *s, const Frame *f, float x, float y) {
     *s = (Sprite){ .x = x, .y = y, .scaleX = 1, .scaleY = 1, .originX = 0.5f, .originY = 0.5f, .alpha = 1,
                    .visible = 1, .active = 1, .tint = 0xffffff };
+    s->context = game_context;
     s->anims.timeScale = 1;
     sprite_setFrame(s, f);
 }
@@ -819,6 +835,49 @@ cJSON *tilemap_getObjectLayerObjects(Tilemap *m, const char *name) {
 
 static void tilemapLayer_draw(Sprite *s);
 static unsigned tiles_ver = 1;  // cresce a ogni tessera tolta: tilemapLayer_draw ricalcola le sue righe
+#define V3_FOLD 64.0f  // lato davanti dei muri fisso a 2 tessere; per stage o per tessera se qualche muro viene male
+#define V3_TALL 4      // un pezzo di muro piu' alto di 4 tessere e' una parete (in piedi intera), sotto e' un mobile (piegato)
+static int layer_stand_kind(const char *name);
+static int kind_at(const Tilemap *m, int kind, int c) {  // qualche layer di quel tipo ha una tessera nella cella c
+    for (int i = 0; i < m->n_layers; i++)
+        if (layer_stand_kind(m->layerName[i]) == kind && m->layerData[i][c].index >= 0) return 1;
+    return 0;
+}
+// Pezzi in piedi: le celle di muri/ostacoli/chiome/decals collegate (4 vicini) sono un pezzo solo, con la base alla sua riga piu'
+// bassa: il pianoforte (mobile in Walls, tasti in Obstacle) non si spezza in colonne a profondita' diverse. Un pezzo di sole
+// decals (tappeti, ossa) resta a terra; le decals su un muro (tende, scale) salgono con lui.
+static void v3_build_feet(Tilemap *m) {
+    if (m->v3foot && m->v3ver == tiles_ver) return;
+    int W = m->width, N = W * m->height, *stack = malloc(N * sizeof(int)), *list = malloc(N * sizeof(int));
+    unsigned char *mask = calloc(N, 1), *seen = calloc(N, 1);
+    if (!m->v3foot) m->v3foot = calloc(N, sizeof(short)), m->v3top = calloc(N, sizeof(short)), m->v3solid = calloc(N, 1);
+    for (int i = 0; i < m->n_layers; i++) {
+        int k = layer_stand_kind(m->layerName[i]);
+        if (k) for (int c = 0; c < N; c++) if (m->layerData[i][c].index >= 0) mask[c] |= k == 3 ? 2 : 1;
+    }
+    for (int c0 = 0; c0 < N; c0++) {
+        if (!mask[c0] || seen[c0]) continue;
+        int sp = 0, n = 0, bottom = 0, top = m->height, solid = 0;
+        stack[sp++] = c0, seen[c0] = 1;
+        while (sp) {
+            int c = stack[--sp], x = c % W, y = c / W;
+            list[n++] = c, bottom = y > bottom ? y : bottom, top = y < top ? y : top, solid |= mask[c] & 1;
+            int nb[4] = { x > 0 ? c - 1 : -1, x < W - 1 ? c + 1 : -1, c - W, c + W };
+            for (int j = 0; j < 4; j++) if (nb[j] >= 0 && nb[j] < N && mask[nb[j]] && !seen[nb[j]]) seen[nb[j]] = 1, stack[sp++] = nb[j];
+        }
+        for (int j = 0; j < n; j++) m->v3foot[list[j]] = (short)bottom, m->v3top[list[j]] = (short)top, m->v3solid[list[j]] = (unsigned char)solid;
+    }
+    free(stack), free(list), free(mask), free(seen);
+    m->v3ver = tiles_ver;
+}
+// Vista 3D, per nome (gli stessi in tutti gli stage). L'arte e' vista dall'alto: un muro ha il lato davanti in basso e il
+// piano superiore sopra, quindi si piega (2); ostacoli e chiome sono disegnati di lato e stanno in piedi interi (1).
+static int layer_stand_kind(const char *name) {
+    if (!name) return 0;
+    if (!strcmp(name, "Walls") || !strcmp(name, "FakeWalls") || !strcmp(name, "PlayerWall")) return 2;
+    if (!strcmp(name, "Decals")) return 3;  // in piedi solo attaccate a un muro o a un mobile (v3_build_feet)
+    return !strcmp(name, "Obstacle") || !strcmp(name, "Overlay1");
+}
 TilemapLayer *tilemap_createLayer(Tilemap *m, const char *name, double depth) {
     Tile *data = NULL;
     for (int i = 0; i < m->n_layers; i++) if (!strcmp(m->layerName[i], name)) data = m->layerData[i];
@@ -840,6 +899,7 @@ TilemapLayer *tilemap_createLayer(Tilemap *m, const char *name, double depth) {
     l->map = m;
     l->data = data;
     l->tint = 0xffffff;
+    l->stand = layer_stand_kind(name), l->v3hide = !strcmp(name, "Shadows");
     children_add(&l->s);
     return l;
 }
@@ -906,15 +966,31 @@ Tile *tilemapLayer_getTileAtWorldXY(TilemapLayer *l, float wx, float wy) {  // n
     return t->index < 0 ? NULL : t;
 }
 
+float scene_world_zoom = 1;
+double scene_ui_depth;  // double: il HUD sta vicino a 2^53
+// Vista 3D (idea della mod VS3D): il mondo 2D steso su un piano in prospettiva, gli sprite in piedi; la logica resta 2D.
+// Telecamera a imbardata fissa dietro al giocatore: i comandi non cambiano. Unita' = pixel della vista di gioco.
+int scene_view3d;
+float view3d_dist = 330, view3d_pitch = 30;  // distanza dal giocatore e inclinazione in gradi (VS_3DDIST / VS_3DPITCH)
+static int v3_on;  // dentro scene_render: il 3D e' aperto
+static void v3_stand_at(float fy);  // da qui a rlPopMatrix si disegna in piedi sui piedi a quota fy della vista
+// margini fissi della vista allargata; con distanze/inclinazioni molto diverse vanno ricavati dal frustum
+#define V3_SIDE 420.0f
+#define V3_FAR 700.0f
+#define V3_NEAR 60.0f
 // TilemapLayerWebGLRenderer: tile ritagliati dalla camera, ruotati e specchiati attorno al centro
 static void tilemapLayer_draw(Sprite *s) {
     TilemapLayer *l = s->owner;
-    if (!s->visible || s->alpha <= 0) return;
+    if (!s->visible || s->alpha <= 0 || (v3_on && l->v3hide)) return;
     Color lc = { (l->tint >> 16) & 255, (l->tint >> 8) & 255, l->tint & 255, (unsigned char)(255 * fminf(1, s->alpha)) };  // alpha: W_SoleSolution FadeOutLayers / RestoreLayers
     Tilemap *m = l->map;
     float tw = m->tileWidth, th = m->tileHeight;
-    int x0 = (int)floorf((camera_scrollX - l->x) / tw), y0 = (int)floorf((camera_scrollY - l->y) / th);
-    int x1 = (int)ceilf((camera_scrollX + game_width - l->x) / tw), y1 = (int)ceilf((camera_scrollY + game_height - l->y) / th);
+    float mx = 0, my = 0;  // allontanando il mondo si vede oltre la vista
+    if (scene_world_zoom < 1) mx = 0.5f * game_width * (1 / scene_world_zoom - 1), my = 0.5f * game_height * (1 / scene_world_zoom - 1);
+    float myTop = v3_on ? V3_FAR : my, myBot = v3_on ? V3_NEAR : my;
+    if (v3_on) mx = V3_SIDE;
+    int x0 = (int)floorf((camera_scrollX - mx - l->x) / tw), y0 = (int)floorf((camera_scrollY - myTop - l->y) / th);
+    int x1 = (int)ceilf((camera_scrollX + game_width + mx - l->x) / tw), y1 = (int)ceilf((camera_scrollY + game_height + myBot - l->y) / th);
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > m->width) x1 = m->width;
@@ -939,7 +1015,24 @@ static void tilemapLayer_draw(Sprite *s) {
             Rectangle src = { m->margin + (id % m->columns) * (tw + m->spacing), m->margin + (id / m->columns) * (th + m->spacing), tw, th };
             if (t->flipX) src.width = -src.width;
             Rectangle dst = { roundf(l->x + tx * tw + tw / 2 - camera_scrollX), roundf(l->y + ty * th + th / 2 - camera_scrollY), tw, th };
+            if (v3_on) dst.width += 1, dst.height += 1;  // in prospettiva i bordi non cadono sui pixel: 1 px di sovrapposizione, niente fessure nere
+            int k = v3_on ? l->stand : 0, c = ty * m->width + tx;
+            if (k) {
+                v3_build_feet(m);
+                if (!m->v3solid[c]) k = 0;                     // decals da sole: a terra
+                else if (k == 3) k = kind_at(m, 2, c) ? 2 : 1;  // decals su un muro si piegano con lui, su un mobile stanno in piedi
+                if (k == 2 && m->v3foot[c] - m->v3top[c] + 1 > V3_TALL) k = 1;  // pareti alte (scaffali della Biblioteca): tutto lato davanti, in piedi
+            }
+            int up = k != 0;
+            if (up) {  // la base e' quella del pezzo intero (v3_build_feet)
+                int by = m->v3foot[c];
+                if (k == 2 && ty <= by - (int)(V3_FOLD / th)) {  // sopra il lato davanti: piano superiore steso a quota FOLD, verso il fondo
+                    rlPushMatrix();
+                    rlTranslatef(0, V3_FOLD, -V3_FOLD);
+                } else v3_stand_at(l->y + (by + 1) * th - camera_scrollY);
+            }
             DrawTexturePro(m->tex, src, dst, (Vector2){ tw / 2, th / 2 }, t->rotation * RAD2DEG, lc);
+            if (up) rlPopMatrix();
         }
 }
 
@@ -1006,7 +1099,7 @@ static Collider *add_collider(SpriteList *a, SpriteList *b, ColliderKind k, Pair
         cap_colliders = cap;
     }
     Collider *c = colliders[n_colliders++];
-    *c = (Collider){ .object1 = a, .object2 = b, .kind = k, .collideCallback = cb, .ctx = ctx, .overlapOnly = overlapOnly, .active = 1 };
+    *c = (Collider){ .object1 = a, .object2 = b, .kind = k, .collideCallback = cb, .ctx = ctx, .overlapOnly = overlapOnly, .active = 1, .context = game_context };
     return c;
 }
 Collider *physics_addCollider(SpriteList *a, SpriteList *b, PairCallback cb, void *ctx) { return add_collider(a, b, COLLIDE_ARRAYS, cb, ctx, 0); }
@@ -1090,7 +1183,10 @@ static int intersects(Body *b1, Body *b2) {
     if (!b1->isCircle && !b2->isCircle)
         return !(body_right(b1) <= b2->position.x || body_bottom(b1) <= b2->position.y || b1->position.x >= body_right(b2) || b1->position.y >= body_bottom(b2));
     if (b1->isCircle) {
-        if (b2->isCircle) return dist(b1->center.x, b1->center.y, b2->center.x, b2->center.y) <= b1->halfWidth + b2->halfWidth;
+        if (b2->isCircle) {  // al quadrato: niente sqrtf per ogni coppia della folla (i due lati sono >= 0)
+            float dx = b1->center.x - b2->center.x, dy = b1->center.y - b2->center.y, r = b1->halfWidth + b2->halfWidth;
+            return dx * dx + dy * dy <= r * r;
+        }
         return circleBodyIntersects(b1, b2);
     }
     return circleBodyIntersects(b2, b1);
@@ -1325,6 +1421,86 @@ static void collideSpriteVsTilemapLayer(Sprite *s, TilemapLayer *l, Collider *c)
         }
 }
 
+// Griglia dei membri di una lista per i collider array contro array: ogni proiettile guarda solo i nemici vicini, non tutti.
+// Idea di DrakonPL. Un membro entra in ogni cella che tocca, cosi' vale per corpi di ogni misura; separate() decide comunque ogni coppia
+// e le coppie escono nell'ordine della lista. Vale per un passo di fisica: chi separa i corpi la rende vecchia (world_version).
+#define MEMBER_GRID_ENTRIES 32768
+#define MEMBER_GRID_MAX_CELLS 256  // un corpo piu' grande passa dal giro completo
+static struct {
+    const SpriteList *list;
+    unsigned version;
+    int head[GRID_BUCKETS], next[MEMBER_GRID_ENTRIES], member[MEMBER_GRID_ENTRIES], seen[MAX_BODIES], seenMark, count;
+    Sprite *sprites[MAX_BODIES];  // la lista quando la griglia e' nata: un callback puo' cambiarla
+} MG;
+static unsigned world_version;
+static int MG_cells(const Body *b, int *x0, int *y0, int *x1, int *y1) {
+    *x0 = cell_of(b->position.x), *y0 = cell_of(b->position.y), *x1 = cell_of(body_right(b)), *y1 = cell_of(body_bottom(b));
+    return (*x1 - *x0 + 1) * (*y1 - *y0 + 1) <= MEMBER_GRID_MAX_CELLS;
+}
+static int MG_build(SpriteList *l) {
+    if (MG.list == l && MG.version == world_version) return 1;
+    MG.list = NULL;
+    if (l->n > MAX_BODIES) return 0;
+    for (int i = 0; i < GRID_BUCKETS; i++) MG.head[i] = -1;
+    int used = 0;
+    for (int j = 0; j < l->n; j++) {
+        Sprite *s = MG.sprites[j] = l->items[j];
+        MG.seen[j] = 0;
+        if (!s->hasBody) continue;
+        int x0, y0, x1, y1;
+        if (!MG_cells(&s->body, &x0, &y0, &x1, &y1)) return 0;
+        for (int cy = y0; cy <= y1; cy++)
+            for (int cx = x0; cx <= x1; cx++) {
+                if (used == MEMBER_GRID_ENTRIES) return 0;
+                int k = bucket(cx, cy);
+                MG.member[used] = j, MG.next[used] = MG.head[k], MG.head[k] = used++;
+            }
+    }
+    MG.seenMark = 0, MG.count = l->n, MG.list = l, MG.version = world_version;
+    return 1;
+}
+// I membri con indice > after il cui rettangolo tocca quello di a, in ordine di lista. -1: a e' troppo grande
+static int MG_near(const Body *a, int after, int *out) {
+    int x0, y0, x1, y1, n = 0;
+    if (!MG_cells(a, &x0, &y0, &x1, &y1)) return -1;
+    MG.seenMark++;
+    for (int cy = y0; cy <= y1; cy++)
+        for (int cx = x0; cx <= x1; cx++)
+            for (int e = MG.head[bucket(cx, cy)]; e >= 0; e = MG.next[e]) {
+                int j = MG.member[e];
+                if (j <= after || MG.seen[j] == MG.seenMark) continue;
+                MG.seen[j] = MG.seenMark;
+                const Body *b = &MG.sprites[j]->body;
+                if (body_right(b) < a->position.x || b->position.x > body_right(a) || body_bottom(b) < a->position.y || b->position.y > body_bottom(a)) continue;
+                int k = n++;
+                while (k > 0 && out[k - 1] > j) out[k] = out[k - 1], k--;
+                out[k] = j;
+            }
+    return n;
+}
+static int collide_arrays_grid(Collider *c) {  // stesse coppie del giro completo in collider_update; 0 = usa quello
+    SpriteList *a = c->object1, *b = c->object2;
+    if (!c->overlapOnly || !b->bit || a->n < 2 || a->n * b->n < 128 || !MG_build(b)) return 0;
+    static int near[MAX_BODIES];
+    for (int i = 0; i < a->n; i++) {
+        int after = -1, again;
+        do {  // se un callback toglie il proiettile, quello che ne prende il posto prosegue dal nemico dopo, come nel giro completo
+            again = 0;
+            Sprite *s1 = a->items[i];
+            int n = s1->hasBody ? MG_near(&s1->body, after, near) : 0;
+            if (n < 0) { n = 0; for (int j = after + 1; j < MG.count; j++) near[n++] = j; }
+            for (int k = 0; k < n && !again; k++) {
+                Sprite *s2 = MG.sprites[near[k]];
+                if (!(s2->groups & b->bit) || !s2->hasBody) continue;  // uscito dalla lista in un callback
+                if (separate(&s1->body, &s2->body, 1) && c->collideCallback) c->collideCallback(c->ctx, s1, s2);
+                if (i >= a->n) return 1;
+                if (a->items[i] != s1) after = near[k], again = 1;
+            }
+        } while (again);
+    }
+    return 1;
+}
+
 // World.collideObjects: array contro array (Group senza physicsType = children.entries)
 static void collider_update(Collider *c) {
     if (c->kind == COLLIDE_TILEMAP) {  // collideGroupVsTilemapLayer / collideSpriteVsTilemapLayer
@@ -1338,9 +1514,11 @@ static void collider_update(Collider *c) {
     if (c->kind == COLLIDE_GROUP_SELF) {  // collideGroupVsGroup(g, g): ogni figlio contro il gruppo
         SpriteList *g = c->object1;
         if (g->n <= MAX_BODIES) { collideGroupSelfGrid(g, c); return; }
+        tree_load();  // solo questa strada legge la griglia di tutti i corpi
         for (int i = 0; i < g->n; i++) collideSpriteVsGroup(g->items[i], g, c);
         return;
     }
+    if (collide_arrays_grid(c)) return;
     SpriteList *a = c->object1, *b = c->object2;
     for (int i = 0; i < a->n; i++)
         for (int j = 0; j < b->n; j++) {
@@ -1352,22 +1530,23 @@ static void collider_update(Collider *c) {
 }
 
 #include <time.h>
-static double cp_t[64], cp_tree; static int cp_n, cp_na[64], cp_nb[64];
+static double cp_t[64]; static int cp_n, cp_na[64], cp_nb[64];
 static double cp_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
 int phys_runs;  // VS_LOGPROF: passaggi di run_colliders (uno per passo di fisica)
 static void run_colliders(void) {
     phys_runs++;
     static int on = -1; if (on < 0) on = getenv("VS_COLPROF") != NULL;
-    double t0 = on ? cp_now() : 0;
-    tree_load();
-    if (on) cp_tree += cp_now() - t0;
+    world_version++;  // i corpi si sono mossi
     for (int i = 0; i < n_colliders; i++)
         if (colliders[i]->active) {
             Collider *c = colliders[i];
             double t = on ? cp_now() : 0;
+            game_context_set(c->context);
             collider_update(c);
+            if (!c->overlapOnly || c->kind != COLLIDE_ARRAYS) world_version++;  // puo' aver separato dei corpi
             if (on && i < 64) cp_t[i] += cp_now() - t, cp_na[i] = c->object1 ? c->object1->n : 0, cp_nb[i] = c->object2 ? c->object2->n : 0;
         }
+    game_context_set(0);
     if (on && ++cp_n == 600) {
 #ifdef __vita__
         FILE *o = fopen("ux0:data/VampireSurvivors/colprof.txt", "a");
@@ -1375,10 +1554,9 @@ static void run_colliders(void) {
 #else
         FILE *o = stderr;
 #endif
-        fprintf(o, "COLPROF tree %.3f ms/chiamata\n", cp_tree / cp_n);
         for (int i = 0; i < n_colliders && i < 64; i++) if (cp_t[i] / cp_n > 0.002) fprintf(o, "COLPROF #%d kind %d %dx%d %.3f ms/chiamata\n", i, colliders[i]->kind, cp_na[i], cp_nb[i], cp_t[i] / cp_n);
         if (o != stderr) fclose(o);
-        memset(cp_t, 0, sizeof(cp_t)), cp_tree = 0, cp_n = 0;
+        memset(cp_t, 0, sizeof(cp_t)), cp_n = 0;
     }
 }
 
@@ -1447,10 +1625,22 @@ void list_free(SpriteList *l) { gmem_free(l->items); *l = (SpriteList){ 0 }; }
 
 static SpriteList children;  // scene.children + updateList
 int prof_children, prof_custom, prof_offscreen, prof_breaks, prof_tiles;  // VS_PROF, ultimo scene_render
-float game_view_w = 730, game_view_h = 456;  // per il conteggio fuori schermo
-void children_add(Sprite *s) { if (!s->onDisplayList) { list_add(&children, s); s->onDisplayList = 1; } }
+// Ordine di disegno: resta da un frame all'altro, cosi' l'insertion sort di scene_render parte da una lista quasi ordinata
+// (le depth dei nemici cambiano di poco). seq = ordine di inserimento: a parita' di depth vince il primo, come nell'originale.
+// Chi esce dalla scena resta qui fino alla compattazione del frame dopo; chi rientra ha un seq nuovo. Idea di DrakonPL.
+typedef struct { Sprite *s; unsigned seq; } DrawEntry;
+static DrawEntry *draw_order;
+static int draw_n, draw_cap;
+static unsigned draw_seq;
+void children_add(Sprite *s) {
+    if (s->onDisplayList) return;
+    list_add(&children, s);
+    s->onDisplayList = 1;
+    if (draw_n == draw_cap) draw_cap = draw_cap ? draw_cap * 2 : 1024, draw_order = realloc(draw_order, draw_cap * sizeof(DrawEntry));
+    draw_order[draw_n++] = (DrawEntry){ s, s->drawSeq = ++draw_seq };
+}
 void children_remove(Sprite *s) { if (s->onDisplayList) { list_remove(&children, s); s->onDisplayList = 0; } }
-void children_reset(void) { children = (SpriteList){ 0 }; }  // il buffer e' della partita: lo libera gmem_reset
+void children_reset(void) { children = (SpriteList){ 0 }; draw_n = 0; }  // il buffer e' della partita: lo libera gmem_reset
 
 // UpdateList.sceneUpdate -> Sprite.preUpdate -> anims.update
 void sprite_animsUpdate(Sprite *s, float delta) { anims_update(s, delta); }  // figli di un Container (fuori dalla lista)
@@ -1472,6 +1662,32 @@ void camera_follow(const Sprite *t) {  // Camera.preRender con follow
     camera_scrollY = t->y - game_height * 0.5f;
 }
 
+
+// Vista 3D: il piano della vista (x a destra, y in giu') diventa il suolo: (x, y) -> (x, 0, y), telecamera a sud del giocatore
+static void v3_begin(void) {
+    float px = 0.5f * game_width - camera_followOffsetX, pz = 0.5f * game_height, a = view3d_pitch * DEG2RAD;
+    Camera3D cam = { .position = { px, view3d_dist * sinf(a), pz + view3d_dist * cosf(a) }, .target = { px, 0, pz },
+                     .up = { 0, 1, 0 }, .fovy = 45, .projection = CAMERA_PERSPECTIVE };
+    BeginMode3D(cam);
+    rlDisableDepthTest(), rlDisableBackfaceCulling();  // l'ordine per depth del gioco basta (da dietro in avanti); i quad si vedono da ogni lato
+    rlPushMatrix();
+    rlRotatef(90, 1, 0, 0);
+    v3_on = 1;
+}
+static void v3_end(void) {
+    rlPopMatrix();
+    EndMode3D();
+    rlEnableBackfaceCulling();
+    v3_on = 0;
+}
+// in piedi attorno ai piedi: (x, y) -> (x, piedi, y - piedi) nel piano, cioe' alto (piedi - y) sopra il suolo, alla profondita' dei piedi
+static void v3_stand_begin(const Sprite *s) { v3_stand_at(s->y - camera_scrollY + (1 - s->originY) * s->height * fabsf(s->scaleY)); }
+static void v3_stand_at(float fy) {
+    rlPushMatrix();
+    rlTranslatef(0, fy, 0);
+    rlRotatef(90, 1, 0, 0);
+    rlTranslatef(0, -fy, 0);
+}
 
 // Pipeline multi di Phaser: quad del fotogramma ritagliato, origine, flip, scala, rotazione
 int scene_fillActive;  // scene_render: lo shader di riempimento e' quello attivo
@@ -1503,25 +1719,26 @@ void scene_render_one(Sprite *s, Shader fill) {
     if (own) EndShaderMode();
 }
 
+float scene_zoom_out = 1;  // zoom indietro della scena intera (fase 5 della Machine): anche lui mostra piu' mondo
+static Rectangle scene_view;
+static int scene_culling;  // manager_draw si taglia solo dentro scene_render
+static Rectangle scene_visible_area(void) {  // l'area visibile nelle coordinate della vista, con lo zoom indietro
+    if (scene_view3d) return (Rectangle){ -V3_SIDE, -V3_FAR, game_width + 2 * V3_SIDE, game_height + V3_FAR + V3_NEAR };
+    float z = fminf(scene_zoom_out, 1) * fminf(scene_world_zoom, 1), mx = 0.5f * game_width * (1 / z - 1), my = 0.5f * game_height * (1 / z - 1);
+    return (Rectangle){ -mx, -my, game_width + 2 * mx, game_height + 2 * my };
+}
 void scene_render(Shader fill) {
     double dp_start = GetTime();
-    static Sprite **sorted, **tmp;
-    static int cap;
-    if (children.n > cap) { cap = children.n * 2; sorted = realloc(sorted, cap * sizeof(Sprite *)), tmp = realloc(tmp, cap * sizeof(Sprite *)); }
-    // ordinamento stabile: a parita' di depth vale l'ordine di inserimento. Merge sort dal basso: si riparte ogni frame
-    // dall'ordine di inserimento, e l'insertion sort di prima con ~700 oggetti costava fino a 4,6 ms sulla Vita
-    for (int i = 0; i < children.n; i++) sorted[i] = children.items[i];
-    Sprite **src = sorted, **dst = tmp;
-    for (int w = 1; w < children.n; w *= 2) {
-        for (int lo = 0; lo < children.n; lo += 2 * w) {
-            int mid = lo + w < children.n ? lo + w : children.n, hi = lo + 2 * w < children.n ? lo + 2 * w : children.n, a = lo, b = mid, o = lo;
-            while (a < mid && b < hi) dst[o++] = src[b]->depth < src[a]->depth ? src[b++] : src[a++];  // a parita' vince il primo: stabile
-            while (a < mid) dst[o++] = src[a++];
-            while (b < hi) dst[o++] = src[b++];
-        }
-        Sprite **t = src; src = dst, dst = t;
+    int n = 0;
+    for (int i = 0; i < draw_n; i++)  // compattazione: fuori chi ha lasciato la scena
+        if (draw_order[i].s->onDisplayList && draw_order[i].s->drawSeq == draw_order[i].seq) draw_order[n++] = draw_order[i];
+    draw_n = n;
+    for (int i = 1; i < n; i++) {
+        DrawEntry e = draw_order[i];
+        int j = i - 1;
+        while (j >= 0 && (draw_order[j].s->depth > e.s->depth || (draw_order[j].s->depth == e.s->depth && draw_order[j].seq > e.seq))) draw_order[j + 1] = draw_order[j], j--;
+        draw_order[j + 1] = e;
     }
-    if (src != sorted) memcpy(sorted, src, children.n * sizeof(Sprite *));
     static int skip_draw = -1;  // VS_SKIPDRAW=tiles,pfx,custom,sprites: categorie da non disegnare (misure sulla Vita)
     if (skip_draw < 0) {
         const char *e = getenv("VS_SKIPDRAW");
@@ -1539,13 +1756,28 @@ void scene_render(Shader fill) {
     int lastAdd = -1;
     prof_children = children.n, prof_custom = prof_offscreen = prof_breaks = prof_tiles = 0;
     if (fill.id) BeginShaderMode(fill), scene_fillActive = 1;  // senza segno (u < 2) e' lo shader di default
-    for (int i = 0; i < children.n; i++) {
-        Sprite *s = sorted[i];
+    scene_view = scene_visible_area();
+    const Rectangle view = scene_view;
+    scene_culling = 1;
+    int zoomed = 0;
+    for (int i = 0; i < n; i++) {
+        Sprite *s = draw_order[i].s;
+        int inWorld = !s->scrollFactor0 && s->depth < scene_ui_depth;
+        if (scene_view3d && inWorld != v3_on) { if (inWorld) v3_begin(); else v3_end(); lastTex = 0; }
+        int world = !scene_view3d && scene_world_zoom != 1 && inWorld;  // cio' che e' fissato allo schermo non scala
+        if (world != zoomed) {
+            if (world) rlPushMatrix(), rlTranslatef(0.5f * game_width, 0.5f * game_height, 0), rlScalef(scene_world_zoom, scene_world_zoom, 1), rlTranslatef(-0.5f * game_width, -0.5f * game_height, 0);
+            else rlPopMatrix();
+            zoomed = world;
+        }
         DP(s->draw ? (s->draw == tilemapLayer_draw ? 1 : s->draw == manager_draw ? 2 : 3) : 4);
         if (s->draw) {
             prof_custom++;
             if (skip_draw & (s->draw == tilemapLayer_draw ? 1 : s->draw == manager_draw ? 2 : 4)) continue;
+            int stand = v3_on && s->draw != tilemapLayer_draw && s->draw != manager_draw;  // tessere e particelle restano a terra
+            if (stand) v3_stand_begin(s);
             s->draw(s);
+            if (stand) rlPopMatrix();
             if (fill.id) BeginShaderMode(fill);  // chi ha chiuso il suo shader (o la texture ripetuta) torna qui; no-op se gia' attivo
             lastTex = 0;
             continue;
@@ -1554,13 +1786,18 @@ void scene_render(Shader fill) {
         if (s->frame && s->visible && s->alpha > 0) {  // VS_PROF: fuori schermo e interruzioni del batch (texture o miscela)
             const Frame *f = s->frame;
             float cx = s->scrollFactor0 ? 0 : camera_scrollX, cy = s->scrollFactor0 ? 0 : camera_scrollY, x = s->x - cx, y = s->y - cy,
-                  r = fmaxf(f->sw * fabsf(s->scaleX), f->sh * fabsf(s->scaleY));
-            if (x < -r || y < -r || x > game_view_w + r || y > game_view_h + r) prof_offscreen++;
+                  r = 1.5f * fmaxf(f->sw * fabsf(s->scaleX), f->sh * fabsf(s->scaleY));  // 1,5: la diagonale, se lo sprite e' ruotato
+            if (x < view.x - r || y < view.y - r || x > view.x + view.width + r || y > view.y + view.height + r) { prof_offscreen++; continue; }  // fuori vista: niente quad
             if (f->tex->id != lastTex || s->blendAdd != lastAdd || s->tintFill) prof_breaks++;
             lastTex = f->tex->id, lastAdd = s->blendAdd;
         }
+        if (v3_on) v3_stand_begin(s);
         scene_render_one(s, fill);
+        if (v3_on) rlPopMatrix();
     }
+    if (v3_on) v3_end();
+    if (zoomed) rlPopMatrix();
+    scene_culling = 0;
     if (fill.id) EndShaderMode(), scene_fillActive = 0;
     DP(5);  // chiude l'ultima categoria (5 resta vuota qui: in game_draw e' il resto del disegno)
 #undef DP
@@ -1569,8 +1806,9 @@ void scene_render(Shader fill) {
 // ============================================================================
 // src/gameobjects/particles (ParticleEmitterManager, ParticleEmitter, Particle)
 // ============================================================================
-static float op_emit(EmitterOp o) { return o.kind == 1 ? o.a + (o.b - o.a) * ((float)rand() / ((float)RAND_MAX + 1.0f)) : o.a; }
-static float frnd(void) { return (float)rand() / ((float)RAND_MAX + 1.0f); }
+extern int det_rand(void);
+static float op_emit(EmitterOp o) { return o.kind == 1 ? o.a + (o.b - o.a) * ((float)det_rand() / ((float)RAND_MAX + 1.0f)) : o.a; }
+static float frnd(void) { return (float)det_rand() / ((float)RAND_MAX + 1.0f); }
 
 static void manager_preUpdate(ParticleManager *m, float delta);
 static void manager_draw(Sprite *s);
@@ -1715,6 +1953,10 @@ static void manager_draw(Sprite *s) {
             Color c = { (p->tint >> 16) & 255, (p->tint >> 8) & 255, p->tint & 255, (unsigned char)(255 * fmaxf(0, fminf(1, p->alpha))) };
             float lx = -f->sw * 0.5f + f->ox, ly = -f->sh * 0.5f + f->oy;
             float sx = m->scrollFactor0 ? 0 : camera_scrollX, sy = m->scrollFactor0 ? 0 : camera_scrollY;
+            if (scene_culling) {  // come gli sprite: niente quad per una particella fuori vista
+                float vx = p->x - sx, vy = p->y - sy, r = 1.5f * fmaxf(f->sw * fabsf(p->scale), f->sh * fabsf(p->scaleY));
+                if (vx < scene_view.x - r || vy < scene_view.y - r || vx > scene_view.x + scene_view.width + r || vy > scene_view.y + scene_view.height + r) continue;
+            }
             Rectangle dst = { roundf(p->x - sx), roundf(p->y - sy), f->w * p->scale, f->h * p->scaleY };
             DrawTexturePro(*f->tex, (Rectangle){ f->x, f->y, f->w, f->h }, dst, (Vector2){ -lx * p->scale, -ly * p->scaleY }, p->angle, c);
         }
@@ -2041,4 +2283,16 @@ void shatter_draw(Sprite *s) {
     rlSetTexture(0);
     EndBlendMode();
     rlEnableBackfaceCulling();
+}
+
+// VS_DET: tutti i corpi del mondo, nell'ordine di inserimento
+unsigned physics_hash(void) {
+    unsigned h = 2166136261u;
+    for (int i = 0; i < n_bodies; i++) {
+        Body *b = &bodies[i]->body;
+        unsigned v[3] = { (unsigned)b->enable, 0, 0 };
+        memcpy(&v[1], &b->position.x, 4), memcpy(&v[2], &b->position.y, 4);
+        for (int k = 0; k < 3; k++) h = (h ^ v[k]) * 16777619u;
+    }
+    return h ^ (unsigned)n_bodies;
 }

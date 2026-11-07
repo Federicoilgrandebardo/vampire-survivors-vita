@@ -19,7 +19,12 @@ size_t gmem_count(void);
 typedef void (*Callback)(void *ctx);
 
 // --- Clock / TimerEvent (src/time) ------------------------------------------
+// Il giocatore per cui gira un pezzo di logica (in partita a due): timer, tween, collider e animazioni nascono nel contesto
+// corrente e ci tornano quando scattano. Con un giocatore solo e' sempre 0.
+extern int game_context;
+void game_context_set(int player);
 typedef struct TimerEvent {
+    int context;
     float delay, elapsed, timeScale;
     double repeatCount;
     int paused, hasDispatched, active, pendingRemoval;
@@ -53,6 +58,7 @@ typedef struct {
     void *o;
 } TweenData;
 typedef struct Tween {
+    int context;
     TweenData inl[TWEEN_DATA], *data;  // data = inl, o sul heap oltre TWEEN_DATA (targets: array di molti oggetti)
     int totalData, state, pausedState, paused, inAdd, inActive, inPending;
     double loop, loopCounter;
@@ -147,6 +153,8 @@ static inline float body_bottom(const Body *b) { return b->position.y + b->heigh
 struct Sprite {
     float x, y, scaleX, scaleY, angle, originX, originY, alpha;
     double depth;  // Number come in JS: ZInGameUI = MAX_SAFE_INTEGER - 1000 deve restare distinto
+    int context;  // game_context quando e' nato
+    unsigned drawSeq;  // scene_render: ordine di inserimento nella lista di disegno
     int flipX, flipY, visible, active, onDisplayList, scrollFactor0;  // scrollFactor0: setScrollFactor(0), coordinate di schermo
     int blendAdd;  // setBlendMode(ADD)
     unsigned tint;
@@ -204,6 +212,9 @@ typedef struct {  // Tilemap + Tileset (addTilesetImage con margin/spacing)
     Tile *layerData[16];  // LayerData per nome (createLayer): condivisi dalle copie della stessa mappa
     const char *layerName[16];
     int n_layers;
+    short *v3foot, *v3top;     // vista 3D: riga piu' bassa e piu' alta del pezzo in piedi (muro, mobile, albero) di ogni cella
+    unsigned char *v3solid;    // 1 se la cella e' di un pezzo con almeno una tessera di muro/ostacolo (le decals da sole restano a terra)
+    unsigned v3ver;            // tiles_ver con cui sono stati calcolati
 } Tilemap;
 typedef struct TilemapLayer {
     Sprite s;  // game object nella lista di disegno (depth, visible)
@@ -213,6 +224,8 @@ typedef struct TilemapLayer {
     unsigned tint;  // forEachTile(tile.tint = c): la stessa tinta su tutte le tile del layer
     short *rowMin, *rowMax;  // tilemapLayer_draw: prima e ultima colonna non vuota per riga (rowMin > rowMax: riga vuota)
     unsigned rowsVer;        // versione delle tessere con cui sono state calcolate (tiles_ver in phaser.c)
+    int stand;               // vista 3D: 0 a terra, 1 in piedi intero (ostacoli, chiome), 2 piegato a scatola (muri), 3 decals
+    int v3hide;              // vista 3D: non si disegna (Shadows: l'ombra finta del 2D coprirebbe le pareti in piedi)
 } TilemapLayer;
 Tilemap *make_tilemap(const char *jsonPath, const char *imagePath, int margin, int spacing);  // scene.make.tilemap + addTilesetImage
 TilemapLayer *tilemap_createLayer(Tilemap *m, const char *name, double depth);  // NULL se il layer manca
@@ -231,7 +244,7 @@ typedef struct {
     ColliderKind kind;
     PairCallback collideCallback;
     void *ctx;
-    int overlapOnly, active;
+    int overlapOnly, active, context;
 } Collider;
 
 Collider *physics_addCollider(SpriteList *a, SpriteList *b, PairCallback cb, void *ctx);
@@ -255,9 +268,13 @@ void camera_follow(const Sprite *target);
 void scene_update_list(float delta);  // UpdateList: preUpdate degli sprite (animazioni)
 void scene_render(Shader fill);
 extern int prof_children, prof_custom, prof_offscreen, prof_breaks, prof_tiles;
-extern float game_view_w, game_view_h;
+extern float scene_zoom_out;  // game_draw, prima di scene_render
 void scene_render_one(Sprite *s, Shader fill);
 extern int scene_fillActive;
+extern float scene_world_zoom;
+extern int scene_view3d;  // vista 3D: mondo su un piano in prospettiva, sprite in piedi (il HUD resta 2D)
+extern float view3d_dist, view3d_pitch;
+extern double scene_ui_depth;  // zoom del mondo attorno al centro della vista: lo sprite da scene_ui_depth in su (HUD) non scala
 void physics_drawDebug(void);  // World.drawDebug: corpi attivi  // un solo sprite con la pipeline normale
 
 

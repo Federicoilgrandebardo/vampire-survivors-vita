@@ -44,9 +44,20 @@ jobs:
 
       - name: Build
         run: |
-          SEP=":"; [ "$RUNNER_OS" = "Windows" ] && SEP=";"
-          pyinstaller --onefile --windowed --name ${{ matrix.name }} --icon sce_sys/icon0.png \
+          SEP=":"; ICON=sce_sys/icon0.png
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            SEP=";"; ICON=vs_setup.ico
+            python -c "from PIL import Image; Image.open('sce_sys/icon0.png').convert('RGBA').save('vs_setup.ico', sizes=[(128,128),(64,64),(48,48),(32,32),(16,16)])"
+          fi
+          pyinstaller --onefile --windowed --name ${{ matrix.name }} --icon "$ICON" \
             --add-data "tools/extract_core.js${SEP}." --collect-binaries imageio_ffmpeg --collect-all quickjs tools/vs_setup.py
+
+      # A zip with a README travels better than a bare .exe: browsers warn less and whoever gets it can find the repo.
+      - name: Package for Windows
+        if: runner.os == 'Windows'
+        run: |
+          cp tools/README-setup.txt dist/README.txt
+          cd dist && 7z a ${{ matrix.name }}.zip ${{ matrix.name }}.exe README.txt && rm ${{ matrix.name }}.exe README.txt
 
       - uses: actions/upload-artifact@v4
         with:

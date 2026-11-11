@@ -106,7 +106,7 @@ typedef struct {
 } Result;
 void game_start(const char *character);
 const char *game_prof(void);
-int vs_quality_mode(void);  // Opzioni: profilo Qualita' (attesa GPU, niente lampi) invece di Prestazioni (vs_game.c)
+int vs_quality_mode(void);  // Opzioni: profilo Grafica (effetti pieni) invece di Prestazioni (effetti ridotti) (vs_game.c)
 int vs_finish_mode(void);  // VS_FINISH: 1 = rt, 2 = swap, 3 = both (main.c)
 void vs_gl_finish(void);  // VS_PROF: conteggi della scena di gioco
 int game_update(float dt);  // 0 finche' la partita continua

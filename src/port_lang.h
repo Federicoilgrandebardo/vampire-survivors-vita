@@ -20,6 +20,8 @@ static const char *const PORT_TR[][13] = {
     { "vui_game_options", "Run options", "Options de partie", "Opzioni partita", "Rundenoptionen", "Opciones de partida", "Opções da partida", "Opcje rozgrywki", "Настройки забега", "Tur seçenekleri", "本局选项", "ラン設定", "판 옵션" },
     { "vui_zoom", "Zoom", "Zoom", "Zoom", "Zoom", "Zoom", "Zoom", "Powiększenie", "Масштаб", "Yakınlaştırma", "缩放", "ズーム", "확대" },
     { "vui_touchmove", "Tap to move", "Toucher pour bouger", "Muoviti col tocco", "Tippen zum Bewegen", "Tocar para moverse", "Tocar para mover", "Dotknij, by iść", "Касание для движения", "Dokunarak hareket", "点击移动", "タッチで移動", "터치로 이동" },
+    { "vui_fullscreen", "Fullscreen", "Plein écran", "Schermo intero", "Vollbild", "Pantalla completa", "Tela cheia", "Pełny ekran", "Весь экран", "Tam ekran", "全屏", "フルスクリーン", "전체 화면" },
+    { "vui_sidehud", "Side HUD", "HUD latéral", "HUD laterale", "Seitliches HUD", "HUD lateral", "HUD lateral", "HUD boczny", "Боковой HUD", "Yan HUD", "侧边界面", "サイドHUD", "측면 HUD" },
     { "vui_profile", "Profile", "Profil", "Profilo", "Profil", "Perfil", "Perfil", "Profil", "Профиль", "Profil", "模式", "モード", "모드" },
     { "vui_profile_perf", "Performance", "Performance", "Performance", "Leistung", "Rendimiento", "Desempenho", "Wydajność", "Производительность", "Performans", "性能", "パフォーマンス", "성능" },
     { "vui_profile_gfx", "Graphics", "Graphismes", "Grafica", "Grafik", "Gráficos", "Gráficos", "Grafika", "Графика", "Grafik", "画质", "グラフィック", "그래픽" },

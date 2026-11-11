@@ -11,7 +11,7 @@ include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "Vampire Survivors")
 set(VITA_TITLEID  "VSPH00001")
-set(VITA_VERSION  "01.10")
+set(VITA_VERSION  "01.20")
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O3 -fno-lto")

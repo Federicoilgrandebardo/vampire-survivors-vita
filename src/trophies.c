@@ -106,7 +106,10 @@ void trophies_unlock(const char *key) {
     q_head++;
     sceKernelSignalSema(sema, 1);
 }
+
+int trophies_active(void) { return sets[0].ready; }
 #else
+int trophies_active(void) { return 0; }
 void trophies_init(void) {}
 void trophies_unlock(const char *key) { int s; (void)trophy_find(key, &s); }
 #endif

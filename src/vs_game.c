@@ -657,7 +657,7 @@ typedef struct {  // 0x11804
     cJSON *enemies, *bosses, *data;
     StageModifiers StageModifiers;
     Rectangle rectOuter, rectInner;
-    EnemyPool *pools[32], *bossPools[16];
+    EnemyPool *pools[256], *bossPools[64];  // Green Acres accumula i tipi di cinque stage
     int n_bossPools, hasAttachedTreasure;
     cJSON *treasure, *arcanaTreasure;     // arcanaTreasure: il forziere dell'arcana del portatore (Randomazzo)
     const char *arcanaHolder;
@@ -1034,7 +1034,8 @@ static const char PlayerOptions_ctor[] =
     "\"SelectedCharacter\":\"ANTONIO\",\"SelectedStage\":\"FOREST\",\"SelectedHyper\":false,\"SelectedHurry\":false,\"SelectedMazzo\":true,"
     "\"SelectedLimitBreak\":false,\"SelectedInverse\":false,\"SelectedReapers\":false,\"SelectedGoldenEggs\":true,\"SelectedArcana\":0,"
     "\"SelectedRandomEvents\":false,\"SelectedBGMSave\":false,\"SelectedBGM\":\"BGM_Forest\",\"SelectedBGMMod\":\"Normal\",\"SelectedMaxWeapons\":6,"
-    "\"Fullscreen\":false,\"Version\":0,\"Coins\":0,\"RunCoins\":0,\"RunEnemies\":0,\"RunPickups\":[],\"RunPickups_Coins\":0,\"LifetimeCoins\":0,"
+    "\"Fullscreen\":false,\"FullScreenView\":false,\"SideHUD\":false,\"TouchMove\":false,\"QualityMode\":false,\"View3D\":false,\"ViewZoom\":1,"  // opzioni del port: senza la chiave qui il caricamento le scarta
+    "\"Version\":0,\"Coins\":0,\"RunCoins\":0,\"RunEnemies\":0,\"RunPickups\":[],\"RunPickups_Coins\":0,\"LifetimeCoins\":0,"
     "\"TotalCoins\":0,\"BeginnersLuck\":0,\"RunFever\":0,\"RunHunger\":0,\"LifetimeSurvived\":0,\"LifetimeHeal\":0,\"OwO\":0,\"CompletedHurries\":0,"
     "\"ReducePhysics\":true,\"ClassicMusic\":true,\"VisuallyInvertStages\":true,\"HideProgress\":false,\"SoundsEnabled\":true,\"MusicEnabled\":true,"
     "\"SoundsVolume\":0,\"MusicVolume\":0,\"FlashingVFXEnabled\":true,\"ScreenShakeEnabled\":true,\"JoystickVisible\":false,"
@@ -1051,7 +1052,7 @@ static const char PlayerOptions_ctor[] =
 static cJSON *po(const char *k) { return cJSON_GetObjectItemCaseSensitive(PlayerOptions, k); }
 static double po_num(const char *k) { cJSON *n = po(k); return cJSON_IsNumber(n) ? n->valuedouble : cJSON_IsTrue(n); }
 static int po_is(const char *k) { return po_num(k) != 0; }  // un booleano o un numero (SelectedRandomEvents di AsyncLoad e' 0)
-int vs_quality_mode(void) { return PlayerOptions && po_is("QualityMode"); }
+int vs_quality_mode(void) { return getenv("VS_QUALITY") ? atoi(getenv("VS_QUALITY")) : PlayerOptions && po_is("QualityMode"); }  // sviluppo: VS_QUALITY=1 profilo Grafica, 0 Prestazioni
 static const char *po_str(const char *k) { return cJSON_GetStringValue(po(k)); }
 static void po_put(const char *k, cJSON *v) {  // le chiavi del port (TouchMove, zoom...) non sono nei default: Replace da solo le perdeva
     if (po(k)) cJSON_ReplaceItemInObjectCaseSensitive(PlayerOptions, k, v);
@@ -1481,8 +1482,9 @@ static void Text_draw(Sprite *s) {
     float size = t->fontSize * HUD_TEXT_SCALE;
     Vector2 m = MeasureTextEx(vs_font, t->text, size, 0);
     Vector2 p = { roundf(s->x - s->originX * (m.x + 1)), roundf(s->y - s->originY * m.y) };
+    static const Vector2 O[4] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };  // bordo nero al posto del grassetto a +1 px, che scalato sullo schermo si sdoppiava
+    for (int i = 0; i < 4; i++) DrawTextEx(vs_font, t->text, (Vector2){ p.x + O[i].x, p.y + O[i].y }, size, 0, BLACK);
     DrawTextEx(vs_font, t->text, p, size, 0, WHITE);
-    DrawTextEx(vs_font, t->text, (Vector2){ p.x + 1, p.y }, size, 0, WHITE);
 }
 static void Text_setText(Text *t, const char *v) { snprintf(t->text, sizeof(t->text), "%s", v); }
 static void add_text(Text *t, float x, float y, const char *v, float fontSize, float ox, float oy) {  // scene.add.text(...).setScrollFactor(0).setOrigin(ox, oy)
@@ -1984,6 +1986,17 @@ static void TilingTileset_invertJSON(cJSON *j, const char *stageType) {
         }
     }
 }
+// Phaser ParseObjectLayers: x += offsetx + startx, y += offsety + starty per ogni oggetto, dopo l'eventuale capovolta.
+// Cappella (Scripts -96: bara nel vuoto a destra del pontile), Foresta (Scripts), Latteria (Destructibles)
+static void TilingTileset_offsetObjects(cJSON *j) {
+    cJSON *l, *o;
+    cJSON_ArrayForEach(l, cJSON_GetObjectItem(j, "layers")) {
+        float dx = num(l, "offsetx", 0) + num(l, "startx", 0), dy = num(l, "offsety", 0) + num(l, "starty", 0);
+        if (!dx && !dy) continue;
+        cJSON_ArrayForEach(o, cJSON_GetObjectItem(l, "objects"))
+            obj_set(o, "x", cJSON_CreateNumber(num(o, "x", 0) + dx)), obj_set(o, "y", cJSON_CreateNumber(num(o, "y", 0) + dy));
+    }
+}
 static TilingTileset *TilingTileset_new(const char *stageType, float sizeX, float sizeY) {
     TilingTileset *t = calloc(1, sizeof(TilingTileset));
     cJSON *sdata = cJSON_GetArrayItem(cJSON_GetObjectItem(data_get("stages"), stageType), 0), *ts = cJSON_GetObjectItem(sdata, "tileset");
@@ -2000,6 +2013,7 @@ static TilingTileset *TilingTileset_new(const char *stageType, float sizeX, floa
     if (!t->MainMap) {
         t->MainMap = make_tilemap(jp, ip, 1, 2);  // addTilesetImage(setKey, setKey, 32, 32, 1, 2)
         if (t->MainMap && visual) TilingTileset_invertJSON(t->MainMap->json, stageType);
+        if (t->MainMap) TilingTileset_offsetObjects(t->MainMap->json);
         for (int i = 0; i < 32; i++) if (!cacheKey[i]) { cacheKey[i] = stageType, cacheVisual[i] = visual, cache[i] = t->MainMap; break; }
     }
     if (!t->MainMap) { free(t); return NULL; }  // dati senza tilesets/: partita senza mappa
@@ -4792,6 +4806,7 @@ static const EnemyVT E_Dragon = { .OnRecycle = E_Dragon_OnRecycle, .GetDamaged =
 
 // --- XLDRAGON1_FLAG / XLDRAGON2_FLAG (0xe43d): il drago-stendardo, una Rope (RibbonTrail 0x7c1) di 120 punti che segue la testa -------
 static void Rope_drawH(const Vector2 *pts, int n, const Frame *f, float scale, float alpha, int add, int flipY);
+static int Rope_cull;  // solo per corde a punti fitti: un tratto lungo con gli estremi fuori puo' attraversare lo schermo
 typedef struct FlagTrail {
     Sprite s;              // la Rope nella lista di disegno (x = y = 0: i punti sono in coordinate del mondo)
     Vector2 points[0x78], positions[0x78];
@@ -4800,7 +4815,10 @@ typedef struct FlagTrail {
 } FlagTrail;
 static void FlagTrail_draw(Sprite *s) {
     FlagTrail *t = (FlagTrail *)s;
-    if (s->visible) Rope_drawH(t->points, 0x78, t->frame, 1, s->alpha, 0, s->flipY);
+    if (!s->visible) return;
+    Rope_cull = !scene_view3d;  // centinaia di draghi da 120 punti: fuori schermo non si calcola ne' si disegna nulla
+    Rope_drawH(t->points, 0x78, t->frame, 1, s->alpha, 0, s->flipY);
+    Rope_cull = 0;
 }
 static void FlagTrail_resetPoints(FlagTrail *t, float x, float y) { for (int i = 0; i < 0x78; i++) t->points[i] = (Vector2){ x, y }; }
 static void E_Flag_OnRecycle(Enemy *e) {
@@ -5081,6 +5099,7 @@ static void Enemy_TimeStop(Enemy *e) {
 }
 
 static EnemyPool *EnemyPool_new(const char *type) {
+    EnemyData_of(type);  // l'atlante del tipo si carica alla nascita del pool, non al primo nemico a partita in corso
     EnemyPool *p = calloc(1, sizeof(EnemyPool));
     p->enemyType = type;
     p->enabled = 1;
@@ -6826,6 +6845,10 @@ static void Rope_drawH(const Vector2 *pts, int n, const Frame *f, float scale, f
     Vector2 last = pts[0];
     for (int i = 0; i < n; i++) {
         Vector2 p = pts[i], nx = i < n - 1 ? pts[i + 1] : p;
+        if (Rope_cull) {
+            float sx = scale * p.x - camera_scrollX, sy = scale * p.y - camera_scrollY, m = 0x40 + half;
+            if (sx < -m || sx > game_width + m || sy < -m || sy > game_height + m) { ok[i] = 0, last = p; continue; }
+        }
         float px = nx.y - last.y, py = -(nx.x - last.x), l = sqrtf(px * px + py * py);
         ok[i] = l > 0;  // lunghezza 0: vertici NaN, WebGL non li disegna
         if (ok[i]) px = px / l * half, py = py / l * half;
@@ -9005,12 +9028,14 @@ static void W_Strom_OnStart(Weapon *w) {
     Sound_PlaySound("SpellStrom", 2, 1, 0, 0x190, 1);
     Weapon_ScreenShake(0xc);
 }
+// Performance: un terzo delle particelle (~1000 vive invece di ~3000, sulla Vita ~10 ms di disegno). Grafica: come l'originale
+static int Strom_n(int n) { return vs_quality_mode() ? n : (n + 2) / 3; }
 static void W_Strom_ExplodeUpdate(void *ctx) {
     Weapon *w = ctx;
     Rectangle r = { -0.5f * game_width * w->stormK, -5, game_width * w->stormK, 0xa };
     w->stormE1->c.zoneRect = w->stormE2->c.zoneRect = r;
-    emitter_emitParticleAt(w->stormE1, Core.Player->s.x, Core.Player->s.y, 0xa0);
-    emitter_emitParticleAt(w->stormE2, Core.Player->s.x, Core.Player->s.y, 0xa0);
+    emitter_emitParticleAt(w->stormE1, Core.Player->s.x, Core.Player->s.y, Strom_n(0xa0));
+    emitter_emitParticleAt(w->stormE2, Core.Player->s.x, Core.Player->s.y, Strom_n(0xa0));
 }
 static void W_Strom_ExplodeDone(void *ctx) { ((Weapon *)ctx)->skipEmitUpdate = 0; }
 static void W_Strom_ExplodeSingularity(void *ctx) {
@@ -9032,8 +9057,8 @@ static void W_Strom_restoreStart(void *ctx) {
 static void W_Strom_restoreUpdate(void *ctx) {
     Weapon *w = ctx;
     w->stormPfx->s.depth = game_height;
-    emitter_emitParticleAt(w->stormE1, Core.Player->s.x, Core.Player->s.y, 0x50);
-    emitter_emitParticleAt(w->stormE2, Core.Player->s.x, Core.Player->s.y, 0x50);
+    emitter_emitParticleAt(w->stormE1, Core.Player->s.x, Core.Player->s.y, Strom_n(0x50));
+    emitter_emitParticleAt(w->stormE2, Core.Player->s.x, Core.Player->s.y, Strom_n(0x50));
 }
 static void W_Strom_restoreDone(void *ctx) {
     Weapon *w = ctx;
@@ -9077,8 +9102,8 @@ static void W_Strom_Update(Weapon *w, float delta) {
         w->stormE1->c.blendAdd = w->stormE2->c.blendAdd = 0;
         w->stormE1->c.hasZone = w->stormE2->c.hasZone = 1;
         w->stormE1->c.hasZoneRect = w->stormE2->c.hasZoneRect = 0;
-        emitter_emitParticleAt(w->stormE1, px, py, 8);
-        emitter_emitParticleAt(w->stormE2, px, py, 8);
+        emitter_emitParticleAt(w->stormE1, px, py, Strom_n(8));
+        emitter_emitParticleAt(w->stormE2, px, py, Strom_n(8));
     }
 }
 static void noop_Fire(Weapon *w) { (void)w; }
@@ -15061,10 +15086,14 @@ static void DamageNumber_OnRecycle(DamageNumber *d, float x, float y, float amou
     d->duration = duration;
     d->tween1 = tweens_add((TweenConfig){ .props = { { &d->s.y, NULL, d->s.y - dy }, { &d->s.scaleX, &d->s.scaleY, 2 } }, .nprops = 2, .duration = duration, .onComplete = DamageNumber_tween1Done, .ctx = d });
 }
+// Profilo Prestazioni: con questo numero di danni gia' a schermo i nuovi non compaiono (le cure si'). A centinaia, ammucchiati,
+// non si leggono; sulla Vita costano, e ognuno resta poi per sempre nella lista di disegno con i suoi tween.
+#define DN_PERF_MAX 166
 static void DamagePool_SpawnAt(float x, float y, float amount) {
     float dur = 0x12c;
     if (amount > 0 && DamagePool.n_spawned > 0x1f4) dur = 0x96;
     else if (amount > 0 && DamagePool.n_spawned > 0x3e8) return;  // irraggiungibile, come nell'originale
+    if (amount > 0 && DamagePool.n_spawned >= DN_PERF_MAX && !vs_quality_mode()) return;
     if (DamagePool.n_spawned >= 2048) return;  // limite dell'array C
     DamageNumber *d = DamagePool.n_stored ? DamagePool.stored[--DamagePool.n_stored] : DamageNumber_new();
     DamagePool.items[DamagePool.n_spawned++] = d;
@@ -15491,7 +15520,7 @@ static void Stage_updateEnemyPools(Stage *st) {
         EnemyPool *found = NULL;
         for (int i = 0; i < st->n_pools; i++) if (!strcmp(st->pools[i]->enemyType, t)) { found = st->pools[i]; break; }
         if (found) found->enabled = 1;
-        else if (st->n_pools < 32) st->pools[st->n_pools++] = EnemyPool_new(t);
+        else if (st->n_pools < 256) st->pools[st->n_pools++] = EnemyPool_new(t);
     }
     for (int i = 0; i < st->n_bossPools; i++) st->bossPools[i]->enabled = 0;
     cJSON_ArrayForEach(e, st->bosses) {
@@ -15499,7 +15528,7 @@ static void Stage_updateEnemyPools(Stage *st) {
         EnemyPool *found = NULL;
         for (int i = 0; i < st->n_bossPools; i++) if (!strcmp(st->bossPools[i]->enemyType, t)) { found = st->bossPools[i]; break; }
         if (found) found->enabled = 1;
-        else if (st->n_bossPools < 16) st->bossPools[st->n_bossPools++] = EnemyPool_new(t);
+        else if (st->n_bossPools < 64) st->bossPools[st->n_bossPools++] = EnemyPool_new(t);
     }
     for (int i = 0; i < st->n_arcanaPools; i++) st->arcanaPools[i]->enabled = 0;
     if (st->arcanaHolder) {
@@ -16426,7 +16455,7 @@ static void Enemy_Disappear(Enemy *e) { if (e->vt && e->vt->Disappear) e->vt->Di
 static EnemyPool *StageEvent_pool(Stage *st, const char *type) {  // stage.pools.find || new + push, enabled = false
     EnemyPool *p = NULL;
     for (int i = 0; i < st->n_pools; i++) if (!strcmp(st->pools[i]->enemyType, type)) p = st->pools[i];
-    if (!p && st->n_pools < 32) p = st->pools[st->n_pools++] = EnemyPool_new(type);
+    if (!p && st->n_pools < 256) p = st->pools[st->n_pools++] = EnemyPool_new(type);
     if (p) p->enabled = 0;
     return p;
 }
@@ -16688,8 +16717,12 @@ static void ShootingStars_UpdatePool(typeof(Core.starPool) *p, float delta) {
 }
 static void ShootingStars_Update(float delta) { ShootingStars_UpdatePool(&Core.starPool, delta), ShootingStars_UpdatePool(&Core.starPool2, delta); }
 
-static void PlayDragonStreamEnd(void *ctx) { StageEvent_disappear(ctx); }  // 'dragonstream disappear'
 typedef struct { EventGroup *g; EnemyPool *pool; float y; int k, count; } DragonStream;
+static void PlayDragonStreamEnd(void *ctx) {  // 'dragonstream disappear'
+    DragonStream *s = ctx;
+    StageEvent_disappear(s->g);
+    s->g = NULL;  // le waves + 1 ondate finiscono dopo d: l'ultima arriva a gruppo gia' liberato
+}
 static void PlayDragonStream_wave(void *ctx) {  // da sinistra e da destra a turno, count draghi in colonna
     DragonStream *s = ctx;
     Stage *st = Core.Stage;
@@ -16698,7 +16731,7 @@ static void PlayDragonStream_wave(void *ctx) {  // da sinistra e da destra a tur
         Enemy *e = EnemyPool_SpawnAt(s->pool, Core.Player->s.x + side, s->y + 8 * (i - 0.5f * s->count));
         if (!e) continue;
         e->isCullable = 0, e->speed *= 1.5f;
-        s->g->list[s->g->n++] = e;
+        if (s->g) s->g->list[s->g->n++] = e;
         st->stageEventManager_spawned++;
     }
 }
@@ -16711,7 +16744,7 @@ static void PlayDragonStream(float d, int waves, const char *type, int count) {
     s->g = StageEvent_group((waves + 1) * count), s->pool = pool, s->count = count;
     s->y = Core.Player->s.y + (Core.Player->lastFacedDirection.y <= 0 ? st->rectOuter.y : st->rectOuter.y + st->rectOuter.height);  // dot(UP) >= 0
     time_addEvent(floorf(d / waves), 0, waves, PlayDragonStream_wave, s);  // repeat: waves + 1 ondate
-    time_addEvent(d, 0, 0, PlayDragonStreamEnd, s->g);
+    time_addEvent(d, 0, 0, PlayDragonStreamEnd, s);
 }
 static void PlayPolterRoulette(float d, int count, const char *type, int dest) {  // anello di poltergeist; dest posti a caso sono distruttibili
     Stage *st = Core.Stage;
@@ -16801,7 +16834,7 @@ static void Stage_updateNormalEnemyPoolsOnly(Stage *st) {
         EnemyPool *found = NULL;
         for (int i = 0; i < st->n_pools; i++) if (!strcmp(st->pools[i]->enemyType, t)) { found = st->pools[i]; break; }
         if (found) found->enabled = 1;
-        else if (st->n_pools < 32) st->pools[st->n_pools++] = EnemyPool_new(t);  // new EnemyPool: abilitato (sic)
+        else if (st->n_pools < 256) st->pools[st->n_pools++] = EnemyPool_new(t);  // new EnemyPool: abilitato (sic)
     }
 }
 static void fn_restoreSpawnType(void *ctx) { Core.Stage->spawnType = ctx; }
@@ -17024,7 +17057,7 @@ static void Stage_InitMappedPools(Stage *st) {  // poolsMapping[i].pool = pools.
         const char *type = str(m, "type");
         EnemyPool *p = NULL;
         for (int i = 0; i < st->n_pools; i++) if (!strcmp(st->pools[i]->enemyType, type)) p = st->pools[i];
-        if (!p && st->n_pools < 32) p = st->pools[st->n_pools++] = EnemyPool_new(type), p->enabled = 0;
+        if (!p && st->n_pools < 256) p = st->pools[st->n_pools++] = EnemyPool_new(type), p->enabled = 0;
         if (st->n_mappedPools < 32) st->mappedPools[st->n_mappedPools++] = p;
     }
 }
@@ -17434,6 +17467,30 @@ static void Tower_StopRune2(Enemy *e) {  // Leda battuta: torna la luce, Veranda
     if (Char_found("VERANDA", 0, 1)) Sound_PlaySound("ThingFound", 1, 0.5f, -0x3e8, 0, 0);  // (sic) il segreto l'ha gia' sbloccato
 }
 static void Tower_stopMusic(void *ctx) { (void)ctx; Sound_StopMusic(); }
+// I 13 strati grandi come lo schermo pesano tutti sulla GPU: le ultime tessere in basso non facevano in tempo (lampi neri anche a 60 fps).
+// Si compongono in una vista a un quarto della risoluzione, un frame si' e uno no, e la scena disegna solo quella.
+void scene_render_one(Sprite *s, Shader fill);
+static RenderTexture2D TowerBake;
+static Sprite TowerBakeS, *TowerLayers[13];
+static int TowerBake_on;
+static void TowerBake_draw(Sprite *s) {
+    (void)s;
+    DrawTexturePro(TowerBake.texture, (Rectangle){ 0, 0, TowerBake.texture.width, -TowerBake.texture.height }, (Rectangle){ 0, 0, game_width, game_height }, (Vector2){ 0, 0 }, 0, WHITE);
+}
+static void TowerBake_render(void) {
+    static unsigned n;
+    if (!TowerBake_on || n++ % 2) return;
+    int w = game_width / 4, h = game_height / 4;
+    if (TowerBake.id && TowerBake.texture.width != w) UnloadRenderTexture(TowerBake), TowerBake.id = 0;
+    if (!TowerBake.id) TowerBake = LoadRenderTexture(w, h), SetTextureFilter(TowerBake.texture, TEXTURE_FILTER_BILINEAR);
+    BeginTextureMode(TowerBake);
+    ClearBackground(BLACK);
+    rlPushMatrix();
+    rlScalef(0.25f, 0.25f, 1);
+    for (int i = 0; i < 13; i++) scene_render_one(TowerLayers[i], (Shader){ 0 });
+    rlPopMatrix();
+    EndTextureMode();
+}
 static void Tower_Create(void) {
     memset(&Tower, 0, sizeof(Tower));
     Tower.TowerTop = -0x3000, Tower.bot = 0x6000, Tower.bott = 0xc000;
@@ -17462,8 +17519,12 @@ static void Tower_Create(void) {
     for (int i = 0; i < 13; i++) {
         if (i < 12) sprite_setScale(all[i], W / 0x21c);
         all[i]->depth = -0x186a0;
-        children_add(all[i]);
+        TowerLayers[i] = all[i];
     }
+    sprite_init(&TowerBakeS, NULL, 0, 0);
+    TowerBakeS.draw = TowerBake_draw, TowerBakeS.scrollFactor0 = 1, TowerBakeS.depth = -0x186a0;
+    children_add(&TowerBakeS);
+    TowerBake_on = 1;
     if (po_is("SelectedInverse")) {  // sfondo capovolto (anche senza VisuallyInvertStages)
         for (int i = 0; i < 12; i++) {
             all[i]->flipY = 1;
@@ -18201,7 +18262,7 @@ static struct {
     Timer anforaTimer;
 } Moon;
 static int Moon_validCharacter(void) {  // StageX.GetValidCharacters: i 20 personaggi del gioco base senza segreti
-    static const char *const V[20] = { "ANTONIO", "IMELDA", "PASQUALINA", "GENNARO", "PAESANO", "ARCA", "PORTA", "LAMA", "CROCI", "CRISTINA",
+    static const char *const V[20] = { "ANTONIO", "IMELDA", "PASQUALINA", "GENNARO", "CAMILLO", "CIRO", "PORTA", "LAMA", "CROCI", "CRISTINA",
                                        "DOMMARIO", "GERMANA", "MORTACCIO", "CAVALLO", "TATANKA", "MARIA", "PUGNALA", "CONCETTA", "POPPEA", "GIOVANNA" };
     for (int i = 0; i < 20; i++) if (Player_is(Core.Player, V[i])) return 1;
     return 0;
@@ -18271,11 +18332,13 @@ static void Moon_Create(void) {  // costruttore + Create
         Pickup *eg = Core_MakeStagePickup(0x3f8, -0x410, "EGGMAN", NULL);
         if (eg) eg->s.flipX = 1;
     }
-    float W = game_width, H = game_height, k = W / 0x200, hurry = 1;  // SelectedHurry: F3
+    float W = game_width, H = game_height, k = W / 0x200, hurry = po_is("SelectedHurry") ? 0.5f : 1;
     sprite_init(&Moon.moonpresence, frame_get("backgroundW", "whiteDot.png"), 0.5f * W, 0.5f * H);
     sprite_setScale(&Moon.moonpresence, W), Moon.moonpresence.depth = -0x7b2, Moon.moonpresence.scrollFactor0 = 1, Moon.moonpresence.alpha = 0, Moon.moonpresence.blendAdd = 1, sprite_setTint(&Moon.moonpresence, 0xff0000);
-    sprite_init(&Moon.fader, frame_get("backgroundW", "blackDot.png"), 0.5f * W, 0.5f * H);
-    sprite_setScale(&Moon.fader, W), Moon.fader.depth = -0x7bc, Moon.fader.scrollFactor0 = 1, Moon.fader.alpha = 0;
+    // Vita: nero con alpha a e sopra rosso additivo con lo stesso alpha fanno bg * (1 - a) + rosso * a: un solo strato rosso, stessa immagine e meta' riempimento per la GPU
+    Moon.moonpresence.visible = 0;
+    sprite_init(&Moon.fader, frame_get("backgroundW", "whiteDot.png"), 0.5f * W, 0.5f * H);
+    sprite_setScale(&Moon.fader, W), Moon.fader.depth = -0x7bc, Moon.fader.scrollFactor0 = 1, Moon.fader.alpha = 0, sprite_setTint(&Moon.fader, 0xff0000);
     children_add(&Moon.moonpresence), children_add(&Moon.fader);
     sprite_init(&Moon.bgtile.s, NULL, 0.5f * W, 0.5f * H);
     Moon.bgtile.s.draw = TileSprite_draw, Moon.bgtile.s.scrollFactor0 = 1, Moon.bgtile.s.depth = -0x7c6, Moon.bgtile.s.blendAdd = 1, Moon.bgtile.s.alpha = 0.25f, Moon.bgtile.s.tint = 0xffffff;
@@ -18300,6 +18363,7 @@ static void Moon_Create(void) {  // costruttore + Create
 static void Moon_Update(float delta) {
     (void)delta;
     Moon.bgtile.tilePositionX = Core.Player->s.x, Moon.bgtile.tilePositionY = Core.Player->s.y;  // visible = FlashingVFXEnabled
+    Moon.bgtile.s.visible = vs_quality_mode();  // Vita: l'acqua a tutto schermo solo nel profilo Grafica; in Performance si risparmia la passata (era un rimedio ai lampi neri)
     if (Moon.waterBGM && BGM.playing) SetMusicPitch(BGM.music, Moon.rate * powf(2, Moon.detune / 1200));
 }
 static const FancyBG FB_Moon = { Moon_Create, Moon_Update, NULL, NULL };
@@ -19991,6 +20055,14 @@ static Stage *Stage_new(const char *stageType) {
 }
 
 static void Stage_Init(Stage *st) {
+    // I nemici di tutti i minuti si preparano ora: l'atlante caricato al primo nemico di un tipo nuovo fermava il gioco
+    // (Moongolow sulla Vita, 2026-11-11: 681 ms alle prime anfore, 523 ms al minuto 10). Con randomMinutes resta al primo uso.
+    cJSON *mi, *ty;
+    cJSON_ArrayForEach(mi, cJSON_GetObjectItem(data_get("stages"), st->stageType)) {
+        cJSON_ArrayForEach(ty, cJSON_GetObjectItem(mi, "enemies")) if (cJSON_IsString(ty)) EnemyData_of(ty->valuestring);
+        cJSON_ArrayForEach(ty, cJSON_GetObjectItem(mi, "bosses")) if (cJSON_IsString(ty)) EnemyData_of(ty->valuestring);
+        if (cJSON_IsString(cJSON_GetObjectItem(mi, "arcanaHolder"))) EnemyData_of(cJSON_GetObjectItem(mi, "arcanaHolder")->valuestring);
+    }
     StageModifiers_init(&st->StageModifiers);
     st->EnemyHealthMultiplier = st->EnemySpeedMultiplier = 1;
     st->dataMinute = 0;
@@ -21096,7 +21168,7 @@ static void Seal2_done(void *ctx) {
     Fosc2_OnSeal2Destroyed();
     Core.canInterrupt = 1, Core.canPause = 1;
     PlayerUI.hpBarBG.visible = PlayerUI.hpBar.visible = 1;
-    Core.tickerEvent = time_addEvent(0x3e8, 1, 0, Core_OnTickerEvent, NULL);  // RestoreTickerEvent
+    Core.tickerEvent = time_addEvent(po_is("SelectedHurry") ? 0x1f4 : 0x3e8, 1, 0, Core_OnTickerEvent, NULL);  // RestoreTickerEvent
     Stage_startTimers(Core.Stage);
 }
 static void Fosc2_FreeJeneviv(void *ctx);
@@ -22558,7 +22630,7 @@ static void Astral_descentUpdate(void *ctx) { (void)ctx; for (int i = 0; i < 0x4
 static void Core_OnTickerEvent(void *ctx);
 static void Astral_descentStart(void *ctx) {
     (void)ctx;
-    Core.tickerEvent = time_addEvent(0x3e8, 1, 0, Core_OnTickerEvent, NULL);  // RestoreTickerEvent
+    Core.tickerEvent = time_addEvent(po_is("SelectedHurry") ? 0x1f4 : 0x3e8, 1, 0, Core_OnTickerEvent, NULL);  // RestoreTickerEvent
     Stage_startTimers(Core.Stage);
     po_sets("SelectedBGM", "BGM_AstralStair"), po_sets("SelectedBGMMod", "Normal"), Sound_SetupAndPlayBGM_Banger(1);
     Astral_StartFlipBeats(NULL), Astral_StartBeatsLoop(), Astral_EnterHand();
@@ -23402,7 +23474,7 @@ static void Core_InitGame(const char *character) {
     Core.pickupColliderImmaterial = physics_addOverlap(&Core.playerGroup, &Core.PickupGroup, Core_onImmaterialPlayerOverlapsPickup, NULL);
     Core.pickupColliderImmaterial->active = 0;  // lo accende W_SoleSolution mentre il giocatore e' invisibile
     physics_addOverlap(&Core.MagnetGroup, &Core.PickupGroup, Core_onMagnetOverlapsPickup, NULL);
-    Core.tickerEvent = time_addEvent(0x3e8, 1, 0, Core_OnTickerEvent, NULL);
+    Core.tickerEvent = time_addEvent(po_is("SelectedHurry") ? 0x1f4 : 0x3e8, 1, 0, Core_OnTickerEvent, NULL);
     MainUI_new();
     MainUI_UpdateCoins();
     MainUI_UpdateKills();
@@ -23478,8 +23550,23 @@ static void Core_InitGame(const char *character) {
     if (getenv("VS_POS")) {  // sviluppo: VS_POS=x,y sposta il giocatore (in fondo a Gallo Tower: VS_POS=900,80000)
         const char *v = getenv("VS_POS"), *c = strchr(v, ',');
         Core.Player->s.x = atof(v), Core.Player->s.y = c ? atof(c + 1) : Core.Player->s.y;
+        if (Core.Stage->tilingTileset) TilingTileset_recenter(Core.Stage->tilingTileset);  // le copie della mappa attorno al giocatore
     }
     if (getenv("VS_SECONDS")) Core.SurvivedSeconds = atoi(getenv("VS_SECONDS"));  // sviluppo: VS_SECONDS=59 parte a un passo dal minuto 1
+    if (getenv("VS_CURSE")) Core.Player->curse += (float)atof(getenv("VS_CURSE"));  // sviluppo: 0.5 = Maledizione al massimo nel negozio
+    if (getenv("VS_GAFILL")) {  // sviluppo: i tipi di nemico che Green Acres accumula nei minuti saltati con VS_SECONDS
+        static const char *const V[5] = { "FOREST", "LIBRARY", "WAREHOUSE", "TOWER", "CHAPEL" };
+        for (int i = 0; i < 5; i++) if (!po_has("UnlockedStages", V[i])) po_push("UnlockedStages", V[i]);
+        Stage *st = Core.Stage;
+        cJSON *keep = st->enemies, *it;
+        for (int m = 1; m <= atoi(getenv("VS_GAFILL")); m++)
+            cJSON_ArrayForEach(it, cJSON_GetObjectItem(data_get("stages"), Stage_RandomMinuteStage(st)))
+                if ((int)num(it, "minute", -1) == m) {
+                    if (has(it, "enemies")) st->enemies = cJSON_GetObjectItem(it, "enemies"), Stage_updateEnemyPools(st);
+                    break;
+                }
+        st->enemies = keep, Stage_updateEnemyPools(st);
+    }
     const char *opn = getenv("VS_OPEN");  // sviluppo: VS_OPEN=shop|healer|arcana|item=<ARMA> apre subito quella scena
     if (opn && !strcmp(opn, "shop")) Core.StartShopScene = 1;
     if (opn && !strcmp(opn, "healer")) Core.StartHealerScene = 1;
@@ -26038,10 +26125,10 @@ static void AchievementManager_GetNewAchievementsEarnedOnThisRun(void) {
         if (secs >= 0x744 && stageIs("FOREST")) U("Survive31MinutesInForest");
         if (secs >= 0x744 && stageIs("LIBRARY")) U("Survive31MinutesInLibrary");
         if (secs >= 0x744 && stageIs("TOWER")) U("Survive31MinutesInTower");
-        static const char *const L99b[][2] = { { "LAMA", "ReachLV99WithLama" }, { "POPPEA", "ReachLV99WithPoppea" }, { "CONCETTA", "ReachLV99WithConcetta" }, { "ARCA", "ReachLV99WithArca" } };
+        static const char *const L99b[][2] = { { "LAMA", "ReachLV99WithLama" }, { "POPPEA", "ReachLV99WithPoppea" }, { "CONCETTA", "ReachLV99WithConcetta" }, { "CIRO", "ReachLV99WithArca" } };
         for (int i = 0; i < 4; i++) if (lvl >= 0x32 && charIs(L99b[i][0])) U(L99b[i][1]);
         if (secs >= 0x744 && stageIs("WAREHOUSE")) U("Survive31MinutesInDairyPlant");
-        if (lvl >= 0x32 && charIs("PAESANO")) U("ReachLV99WithPoe");
+        if (lvl >= 0x32 && charIs("CAMILLO")) U("ReachLV99WithPoe");
     }
     static const char *const L80[][2] = { { "MORTACCIO", "ReachLV100WithMortaccio" }, { "CAVALLO", "ReachLV100WithCavallo" }, { "MARIA", "ReachLV100WithRamba" },
         { "TATANKA", "ReachLV100WithOsole" }, { "AMBROGIO", "ReachLV100WithAmbrojoe" } };
@@ -26404,7 +26491,7 @@ static void PostGameScene_SaveResults(void) {
     AchievementManager_GetNewAchievementsEarnedOnThisRun();
     AchievementManager_GetNewSecretsEarnedOnThisRun();
     for (int i = 0; i < AM_nNew && PG_nAch < 512; i++) PG_achievements[PG_nAch++] = AM_NewAchievements[i];  // Integration.UnlockAchievements (Steam): niente
-    PG.isShowingAchievements = PG_nAch > 0;
+    PG.isShowingAchievements = PG_nAch > 0 && !trophies_active();  // con i trofei di sistema l'avviso c'e' gia': il tasto apre comunque l'elenco
     float cx = 0.5f * (520 + MENU_W - 20), by = 494 - 14;  // Vita: in fondo alla colonna destra, sopra la barra dei tasti (PG_R, PG_BOT)
     UIButton_set(&PG.QuitButton, "OptionsButton", cx, by, 0x60, 0x20, 1.5f, 0.5f, 1);
     if (PG_nAch > 0) {
@@ -29690,7 +29777,7 @@ static const struct { const char *name, *display, *def, *type, *icon; unsigned t
     { "tips", "--", "\"--\"", "text", "SkullToken.png", 0xffffff },
     { NULL, NULL, NULL, "newLine", NULL, 0 }, { NULL, NULL, NULL, "newLine", NULL, 0 },
 };
-static const char *const ValidCharacters[] = { "ANTONIO", "IMELDA", "PASQUALINA", "GENNARO", "PAESANO", "ARCA", "PORTA", "LAMA", "CROCI", "CRISTINA",
+static const char *const ValidCharacters[] = { "ANTONIO", "IMELDA", "PASQUALINA", "GENNARO", "CAMILLO", "CIRO", "PORTA", "LAMA", "CROCI", "CRISTINA",
                                                "DOMMARIO", "GERMANA", "MORTACCIO", "CAVALLO", "TATANKA", "MARIA", "PUGNALA", "CONCETTA", "POPPEA", "GIOVANNA" };
 static int GetValidCharacter(const char *c) {
     for (size_t i = 0; i < sizeof(ValidCharacters) / sizeof(*ValidCharacters); i++) if (c && !strcmp(c, ValidCharacters[i])) return 1;
@@ -32164,7 +32251,7 @@ static void SceneManager_EnterPause(void) { PauseScene_create(); }  // pausa del
 enum { OPT_SLIDER, OPT_TOGGLE, OPT_TEXT, OPT_BG, OPT_LANG, OPT_ZOOM, OPT_PROFILE };
 static const float OPT_ZOOMS[] = { 0.85f, 1, 1.15f, 1.3f, 1.5f };
 typedef struct { int kind; const char *label, *key; float value; UIButton box; } OptRow;
-#define OPT_MAX 12
+#define OPT_MAX 16  // menu principale: fino a 15 righe (occhiali 3D + Specchio)
 #define OPT_ROW_H 46
 #define OPT_SX0 330.0f  // il cursore: bounds da 330 a 490
 #define OPT_SW 160.0f
@@ -32258,6 +32345,7 @@ static void Opt_onQuit(void *c) {  // quitClicked
 static void Opt_cancelMenu(void) { if (TB.BackButton.onDown) TB.BackButton.onDown(TB.BackButton.ctx); }  // BackButton._events.pointerdown.fn()
 static void Opt_cancelPause(void) { Opt_onResume(NULL); }  // ResumeButton._events.pointerdown.fn()
 static void Opt_add(int kind, const char *label, const char *key, float value) {
+    if (OP.n >= OPT_MAX) return;  // oltre si scriveva su bg e pulsanti: crash aprendo le Opzioni
     OptRow *r = &OP.rows[OP.n];
     r->kind = kind, r->label = label, r->key = key, r->value = value;
     UIButton_set(&r->box, "", 24, 72 + OP.n * OPT_ROW_H, 552, OPT_ROW_H - 4, 1, 0, 0);
@@ -32302,6 +32390,8 @@ static void Options_create(int pause) {
     Opt_add(OPT_TOGGLE, "options_flashing_VFX", "FlashingVFXEnabled", po_is("FlashingVFXEnabled"));
     Opt_add(OPT_ZOOM, "vui_zoom", "ViewZoom", View_zoom());
     Opt_add(OPT_TOGGLE, "vui_touchmove", "TouchMove", po_is("TouchMove"));
+    Opt_add(OPT_TOGGLE, "vui_sidehud", "SideHUD", po_is("SideHUD"));
+    Opt_add(OPT_TOGGLE, "vui_fullscreen", "FullScreenView", po_is("FullScreenView"));  // vale dalla partita successiva
     Opt_add(OPT_PROFILE, "vui_profile", "QualityMode", po_is("QualityMode"));  // Performance (fps alti) / Grafica (attesa GPU, niente lampi)
     if (Collected("RELIC_3DGLASSES")) Opt_add(OPT_PROFILE, "vui_view", "View3D", po_is("View3D"));  // Vista 2D | 3D (beta): dopo gli occhiali buffi
     if (pause) {  // 0x38f1 + 0xdad8
@@ -34631,6 +34721,9 @@ void game_start(const char *character) {
     char chbuf[64];  // spesso e' po_str("SelectedCharacter"): il po_sets qui sotto libererebbe la stringa
     snprintf(chbuf, sizeof(chbuf), "%s", character);
     character = chbuf;
+    TowerBake_on = 0;
+    if (getenv("VS_HURRY")) po_setb("SelectedHurry", 1);  // sviluppo
+    game_width = (po_is("FullScreenView") || getenv("VS_FULLSCREEN")) && !net_on ? 805 : 730;  // 456 * 960 / 544: niente bande nere; in coop le due console devono vedere lo stesso mondo
     memset(&WhiteHand, 0, sizeof(WhiteHand)), camera_zoom = 1, HasHardBounds = 0, memset(&CamPan, 0, sizeof(CamPan)), WE.made = 0, Enemy_beatMode = 0;
     GOI.active = 0;
     FB_disableMovingBG = 0;
@@ -34722,11 +34815,46 @@ void game_start(const char *character) {
     PlayerOptions_Save();  // MainScene.create
 }
 
+// Opzioni > HUD laterale (idea e mockup di Wolff): armi, potenziamenti e barra dell'esperienza nelle bande nere ai lati della vista
+static int SideHUD_on(void) { return game_width == 730 && (getenv("VS_SIDEHUD") || po_is("SideHUD")); }  // a schermo intero non ci sono bande
+static void SideHUD_sync(void) {  // gli elementi classici restano nella scena: spenti finche' l'opzione e' attiva
+    int on = SideHUD_on();
+    MainUI.WeaponSlots.visible = PlayerUI.progressBox.visible = PlayerUI.progressBar.visible = MainUI.PlayerLevelText.s.visible = !on;
+    for (int i = 0; i < 5; i++) MainUI.BlockedWeaponSlots[i].alpha = on ? 0 : 0.5f;
+    for (int i = 0; i < MainUI.n_icons; i++) MainUI.icons[i].image.alpha = on ? 0 : 1;
+}
+static void SideHUD_slot(float x, float y, float sz, const Sprite *icon) {
+    DrawRectangleRec((Rectangle){ x, y, sz, sz }, (Color){ 0x14, 0x14, 0x22, 255 });
+    DrawRectangleLinesEx((Rectangle){ x, y, sz, sz }, 2, (Color){ 0xc8, 0xa0, 0x30, 255 });
+    if (!icon || !icon->frame) return;
+    const Frame *f = icon->frame;
+    float k = (sz - 6) / fmaxf(f->w, f->h), w = f->w * k, h = f->h * k;
+    DrawTexturePro(*f->tex, (Rectangle){ f->x, f->y, f->w, f->h }, (Rectangle){ x + 0.5f * (sz - w), y + 0.5f * (sz - h), w, h }, (Vector2){ 0, 0 }, 0, WHITE);
+}
+static void SideHUD_draw(float band) {
+    if (!SideHUD_on() || band < 30) return;
+    const float sz = 30, step = 34, x = 0.5f * (band - sz);
+    for (int i = 0; i < 6; i++) {  // armi dall'alto
+        const Sprite *ic = i < MainUI.n_WeaponIcons ? &MainUI.WeaponIcons[i]->image : i > 0 && MainUI.BlockedWeaponSlots[5 - i].visible ? &MainUI.BlockedWeaponSlots[5 - i] : NULL;
+        SideHUD_slot(x, 6 + step * i, sz, ic);
+    }
+    int np = MainUI.n_PowerUpIcons, nx = MainUI.n_ExtraIcons, rows = np + nx < 6 ? 6 : np + nx > 10 ? 10 : np + nx;
+    for (int i = 0; i < rows; i++) {  // potenziamenti dal basso, poi arcane e armi nascoste
+        const Sprite *ic = i < np ? &MainUI.PowerUpIcons[i]->image : i - np < nx ? &MainUI.ExtraIcons[i - np]->image : NULL;
+        SideHUD_slot(x, SCREEN_H - 6 - sz - step * i, sz, ic);
+    }
+    float rx = SCREEN_W - band, bx = rx + 0.5f * (band - 22), by = 30, bh = SCREEN_H - by - 6, full = game_width - 8;
+    ui_text(MainUI.PlayerLevelText.text, rx + 0.5f * band, 15, 1, band - 4, 0.5f, 0.5f, WHITE);
+    float v = full > 0 ? fminf(PlayerUI.progressW / full, 1) : 0;
+    DrawRectangleRec((Rectangle){ bx, by, 22, bh }, (Color){ 0x14, 0x14, 0x22, 255 });
+    DrawRectangleRec((Rectangle){ bx, by + bh * (1 - v), 22, bh * v }, (Color){ 0x22, 0x66, 0xdd, 255 });
+    DrawRectangleLinesEx((Rectangle){ bx, by, 22, bh }, 2, (Color){ 0xc8, 0xa0, 0x30, 255 });
+}
 const char *game_prof(void) {
-    static char b[200];
-    snprintf(b, sizeof(b), "oggetti %d fuori %d custom %d tile %d interruzioni %d nemici %d proiettili %d gemme %d particelle %d tween %d lv %d",
+    static char b[240];
+    snprintf(b, sizeof(b), "oggetti %d fuori %d custom %d tile %d interruzioni %d nemici %d proiettili %d gemme %d particelle %d tween %d lv %d tipi %d sec %d",
              prof_children, prof_offscreen, prof_custom, prof_tiles, prof_breaks, Core.Enemies.n, Core.BulletGroup.n, Core.PickupGroup.n, particles_alive(), tweens_used(),
-             Core.Player ? Core.Player->level : 0);
+             Core.Player ? Core.Player->level : 0, Core.Stage ? Core.Stage->n_pools : 0, Core.SurvivedSeconds);
     return b;
 }
 int game_update(float dt) {
@@ -34864,20 +34992,15 @@ void game_draw(void) {
     // Camera.preRender (startFollow): la camera segue la posizione dello sprite dopo la fisica
     if (Players_n > 1) PlayerUI_Update();  // l'esperienza cresce anche con le gemme dell'altro
     camera_follow(Players_n > 1 && net_role == 1 ? &Slots[1].player->s : CamPan_target());  // il giocatore, o la camera verso l'Ender che muore
-    // Vita: tre viste di gioco a turno, lo schermo mostra quella del frame prima: la GPU non aspetta la vista appena disegnata
-    // e non la riscrive mentre lo schermo la legge. Misurato 2026-11-01 con l'attesa prima dello scambio (vs_finish_mode):
-    // 17,5 ms a frame invece di 19,5 con una vista sola.
-#ifdef __vita__
-    enum { NRT = 3 };
-#else
-    enum { NRT = 1 };
-#endif
-    static RenderTexture2D rts[NRT];
-    static int cur, drawn;
-    cur = (cur + 1) % NRT;
-    RenderTexture2D *rtp = &rts[cur];
+    // Una vista di gioco sola, mostrata nel frame in cui e' disegnata. Dal 2026-11-01 all'11-11 la Vita ne alternava quattro e
+    // mostrava quella di due frame prima per i lampi neri: la causa era il vsync spento (vedi main), il ritardo costava 33 ms.
+    static RenderTexture2D view;
+    RenderTexture2D *rtp = &view;
+    if (rtp->id && rtp->texture.width != game_width) UnloadRenderTexture(*rtp), rtp->id = 0;  // Schermo intero cambiato fra una partita e l'altra
     if (!rtp->id) { *rtp = LoadRenderTexture(game_width, game_height); SetTextureFilter(rtp->texture, TEXTURE_FILTER_POINT); }
     RenderTexture2D rt = *rtp;
+    SideHUD_sync();
+    TowerBake_render();
     BeginTextureMode(rt);
     ClearBackground(BLACK);
     static int nofill = -1;  // VS_NOFILL=1: tintFill senza shader (diagnosi dei quad bianchi sulla Vita)
@@ -34934,11 +35057,10 @@ void game_draw(void) {
     }
     int fish = FishEye.on && FishEye.intensity > 0;  // rexFishEyePostFx sulla camera principale (Moongolow)
     if (fish) FishEye_Begin();
-    Texture2D shown = drawn >= NRT ? rts[(cur + NRT - 1) % NRT].texture : rt.texture;  // all'avvio la sola appena disegnata
-    if (drawn < NRT) drawn++;
-    DrawTexturePro(shown, (Rectangle){ (game_width - zw) / 2, (game_height - zh) / 2, zw, -zh }, (Rectangle){ (SCREEN_W - w) / 2, 0, w, SCREEN_H }, (Vector2){ 0, 0 }, 0, WHITE);
+    DrawTexturePro(rt.texture, (Rectangle){ (game_width - zw) / 2, (game_height - zh) / 2, zw, -zh }, (Rectangle){ (SCREEN_W - w) / 2, 0, w, SCREEN_H }, (Vector2){ 0, 0 }, 0, WHITE);
     if (fish) EndShaderMode();
-    if (M5.wantSnap) Machine_TakeSnapshot(rtp), drawn = 0;  // la vista vecchia e' diventata i cocci: si riparte dalla nuova
+    SideHUD_draw((SCREEN_W - w) / 2);
+    if (M5.wantSnap) Machine_TakeSnapshot(rtp);  // la vista e' diventata i cocci: si riparte da una nuova
     if (LU.active || TS.active || IF.active || WS.active || ARC.active || PS.active || CF.active || RF.active || SH.active || HE.active || DS.active || PN.active) {  // UI_levelUpScene / UI_treasureScene sopra la scena di gioco in pausa, alla risoluzione da menu
         // Disegno diretto con una scala (683 -> 544) invece di una texture intermedia: il testo viene
         // ricampionato una volta sola e resta leggibile; disposizione e colori sono quelli della scena.

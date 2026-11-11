@@ -80,6 +80,9 @@ int dlclose(void *h) { (void)h; return 0; }
 // Niente miniature periodiche: sulla Vita leggere lo schermo intero costa ~1,5 s.
 #ifdef __vita__
 #include <vitaGL.h>
+#include <psp2/gxm.h>
+extern SceGxmNotification query_fence;  // vitaGL: value = scene mandate alla GPU, *address = l'ultima finita
+extern uint32_t vsync_interval;         // vitaGL: 1 = la callback di display aspetta il vblank
 #else
 #define GL_SILENCE_DEPRECATION
 #include <OpenGL/gl.h>
@@ -92,8 +95,10 @@ int vs_finish_mode(void) {
     // 2026-11-05: spenta anche sulla Vita. Sei armi evolute e 300 nemici: da ~39 a ~56 fps, un lampo nero in 3 minuti
     // (prova di Federico). L'idea e' di DrakonPL. VS_FINISH=swap rimette l'attesa.
     // Bug 4 del test finale: profilo nelle Opzioni (vs_quality_mode): Prestazioni = 0 (di serie), Qualita' = 3 (niente lampi).
+    // 2026-11-11: i lampi erano il vsync spento (vedi main): con l'attesa del vblank non ne servono altre, 0 in tutti e due
+    // i profili. VS_FINISH resta per le prove.
     const char *e = getenv("VS_FINISH");
-    if (!e) return vs_quality_mode() ? 3 : 0;
+    if (!e) return 0;
     if (m < 0) m = !strcmp(e, "rt") ? 1 : !strcmp(e, "swap") ? 2 : !strcmp(e, "off") ? 0 : !strcmp(e, "ab") ? 4 : 3;
     if (m == 4) return ((int)(GetTime() / 10) & 1) ? 3 : 1;  // VS_FINISH=ab: rt e both a turno ogni 10 s (misura in una partita)
     return m;
@@ -211,6 +216,12 @@ int main(int argc, char **argv) {
         if (eq) *eq = 0, setenv(l, eq + 1, 1);
     }
     if (env) UnloadFileText(env);
+#ifdef __vita__
+    // raylib senza FLAG_VSYNC_HINT toglie a vitaGL l'attesa del vblank nella callback di display: GXM da' per libero il
+    // buffer che e' ancora a schermo e un frame successivo lo ripulisce a nero mentre lo schermo lo legge (lampo nero in
+    // basso). Con l'attesa il buffer torna libero solo quando lo schermo e' passato al nuovo. VS_VSYNC=0: senza (controllo).
+    vglWaitVblankStart(!getenv("VS_VSYNC") || atoi(getenv("VS_VSYNC")));
+#endif
     if (getenv("VS_DET")) det_on = 1, det_s = (unsigned)atoi(getenv("VS_DET")) | 1;
     if (getenv("VS_NET")) {  // sviluppo: VS_NET=host | <indirizzo>
         unsigned seed = getenv("VS_DET") ? (unsigned)atoi(getenv("VS_DET")) : 11;
@@ -299,14 +310,25 @@ int main(int argc, char **argv) {
         if (prof) {  // VS_PROF: medie e massimi ogni 60 frame (logica, disegno, frame intero = anche l'attesa della GPU)
             double t3 = GetTime(), up = t1 - t0, dr = t2 - t1, fr = t3 - t_prev;
             t_prev = t3;
+#ifdef __vita__
+            static unsigned g_sum, g_max, g_from;  // scene in coda alla GPU dopo lo scambio (0 = tiene il passo), scene per frame
+            unsigned g = query_fence.value - *query_fence.address;
+            if (!g_from) g_from = query_fence.value;
+            g_sum += g;
+            if (g > g_max) g_max = g;
+#endif
             p_up += up, p_dr += dr, p_fr += fr, p_n++;
             if (up > m_up) m_up = up;
             if (dr > m_dr) m_dr = dr;
             if (fr > m_fr) m_fr = fr;
             if (p_n == 60) {
-                char line[256];
-                snprintf(line, sizeof(line), "t=%.0f fin=%d logica %.1f/%.1f disegno %.1f/%.1f frame %.1f/%.1f ms | %s\n", run_t, vs_finish_mode(),
-                         1000 * p_up / 60, 1000 * m_up, 1000 * p_dr / 60, 1000 * m_dr, 1000 * p_fr / 60, 1000 * m_fr, game_prof());
+                char line[320], gpu[64] = "";
+#ifdef __vita__
+                snprintf(gpu, sizeof(gpu), " gpu coda %.1f/%u scene %.1f vsync %u", g_sum / 60.0, g_max, (query_fence.value - g_from) / 60.0, (unsigned)vsync_interval);
+                g_sum = g_max = 0, g_from = query_fence.value;
+#endif
+                snprintf(line, sizeof(line), "t=%.0f fin=%d logica %.1f/%.1f disegno %.1f/%.1f frame %.1f/%.1f ms%s | %s\n", run_t, vs_finish_mode(),
+                         1000 * p_up / 60, 1000 * m_up, 1000 * p_dr / 60, 1000 * m_dr, 1000 * p_fr / 60, 1000 * m_fr, gpu, game_prof());
                 fputs(line, stderr);
                 FILE *f = fopen(vs_path("prof.txt"), "a");
                 if (f) fputs(line, f), fclose(f);

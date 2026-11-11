@@ -15,22 +15,28 @@ import, custom characters, a Jukebox, and an experimental 3D view.
 
 ![Gameplay](screenshots/gameplay.gif)
 
-## What's New in v1.1
+## What's New in v1.2
 
-- **Local co-op**: two players, two Vitas, same Wi-Fi.
-- **Smoother heavy waves, thanks to Marcin ([DrakonPL](https://github.com/DrakonPL))**: around 56 fps where
-  v1.0 dropped to 39. His pull request found where the frame time was going
-  and brought the ideas behind it: no more waiting on the GPU every frame,
-  music and sound effects off the main thread, incremental sorting and
-  off-screen culling for the draw list, enemy templates for spawning, and a
-  grid for projectile hits. They are rewritten for this port, but the speed-up
-  is his.
-- **Startup intro**, animation from the Ode to Castlevania announcement trailer
-  set to original music.
-- **Custom characters**, a **Jukebox**, and the **Funny Glasses** (an
-  experimental 3D view, more of an easter egg than a feature).
-- **Wolff ([WolffsRoom](https://github.com/WolffsRoom))'s interface ideas**: photosensitivity warning, pixel button glyphs,
-  animated main menu, zoom and touch movement in the Options.
+- **No more black flashes**: the flicker at the bottom of the screen during
+  heavy waves is gone, in both profiles. The screen swap was not waiting for
+  the vertical blank, so a buffer still on screen could be wiped. Now it
+  waits, at no cost in frame rate.
+- **No more half-second freezes** the first time a new kind of enemy showed
+  up: each stage loads its enemy sheets when it starts.
+- **Snappier controls**: the game view is shown in the frame it is drawn.
+  v1.1 showed it two frames late to hide the flashes.
+- **Profiles that mean what they say**: *Performance*, the default, trims the
+  busiest effects (a third of SpellStrom's particles, no more than 166 damage
+  numbers on screen); *Graphics* keeps every effect as in the original and no
+  longer waits on the GPU every frame. In the heaviest test, around 290
+  enemies with six evolved weapons, they hold about 53 and 49 fps.
+- **Fullscreen** and **Side HUD** options, outlined HUD text, and system
+  trophy notifications instead of the achievements list popping up on the
+  results screen. Side HUD and trophy notifications are ideas from Wolff
+  ([WolffsRoom](https://github.com/WolffsRoom)).
+- **Fixes from your reports**: Hurry mode clock, enemies that stopped spawning
+  in Green Acres, the Gallo Tower crash, forgotten port options, Poe's and
+  Arca's level 50 achievements, the Cappella Magna coffin.
 
 Full history in the [Changelog](#changelog).
 
@@ -199,6 +205,14 @@ restart.
   Castlevania and so on).
 
 ## Changelog
+
+**v1.2** - no more black flashes or half-second freezes in heavy waves, the
+game view shown without delay, a Graphics profile that no longer waits on the
+GPU, fewer damage numbers in Performance, Fullscreen and Side HUD options,
+system trophy notifications, and fixes from the issue tracker: Hurry mode,
+Green Acres, Gallo Tower, forgotten port options, Poe and Arca achievements,
+the Cappella Magna coffin. Thanks to Benjih ([Benjih77](https://github.com/Benjih77))
+and Athos ([AthosSoster](https://github.com/AthosSoster)) for the reports.
 
 **v1.1** - local co-op for two Vitas on the same Wi-Fi, a startup intro, much
 smoother heavy waves (around 56 fps where v1.0 dropped to 39) from Marcin ([DrakonPL](https://github.com/DrakonPL))'s performance ideas, custom

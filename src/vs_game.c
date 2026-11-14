@@ -18285,14 +18285,37 @@ static void Moon_RemoveEclipse(void) {
                       *const M[3] = { "MOON_MASK1", "MOON_MASK2", "MOON_MASK3" };
     Moon_setMinute(0xc, 0xc8, G, 1, GB, 1), Moon_setMinute(0xd, 0xc8, GR, 2, GB, 1), Moon_setMinute(0xe, 0, R, 1, M, 3);
 }
+static void AchievementManager_GetNewSecretsEarnedOnThisRun(void);
+static void AchievementManager_GetNewAchievementsEarnedOnThisRun(void);
+static int SM_restart;
+static void Moon_HiddenGround_unlock(void *ctx) {  // onStart: Holy Forbidden sbloccato e salvato prima della transizione
+    (void)ctx;
+    if (!po_has("UnlockedStages", "STAGEX")) po_push("UnlockedStages", "STAGEX");
+    cJSON *t = tbl0("stages", "STAGEX");
+    if (t) obj_set(t, "unlocked", cJSON_CreateTrue()), obj_set(t, "hidden", cJSON_CreateFalse());
+    AchievementManager_GetNewSecretsEarnedOnThisRun();
+    AchievementManager_GetNewAchievementsEarnedOnThisRun();
+    PlayerOptions_Save();
+    PlayerOptions_SaveRunBackup();
+    Player_SetInvulForMilliSeconds(Core.Player, 0x7530);
+    Player_restoreTint(Core.Player);
+    time_addEvent(0x64, 0, 0, Player_restoreTint, Core.Player);
+}
+static void Moon_HiddenGround_go(void *ctx) {  // onComplete: la stessa partita riparte a Holy Forbidden (RestartMainScene)
+    (void)ctx;
+    Moon.sDarkness.visible = 1;
+    po_sets("SelectedStage", "STAGEX"), po_sets("SelectedBGM", "BGM_Chapet"), po_sets("SelectedBGMMod", "Normal");
+    po_setb("SelectedHurry", 0), po_setb("SelectedMazzo", 0);
+    SM_restart = 1;
+}
 static void Moon_SendToHiddenGround(Enemy *e) {  // la Trinacria lunare battuta: si va a Holy Forbidden
     (void)e;
     if (Collected("RELIC_YELLOW") || !Moon_validCharacter()) return;
     Core.canInterrupt = 0;
     Sound_FadeMusic(0, 0x1388);
     Sound_PlaySound("BGM_Intro", 0.7f, 1, -0x76c, 0, 0);
-    tweens_add((TweenConfig){ .props = { { &FishEye.radius, NULL, 1 }, { &FishEye.intensity, NULL, 0.2f } }, .nprops = 2, .ease = Ease_SineInOut, .duration = 0x2710 });  // Sine.easeIn
-    // onStart: UnlockedStages + STAGEX, Save; onComplete: SelectedStage = STAGEX, BGM_Chapet, RestartMainScene. Sblocchi e cambio scena: F3
+    tweens_add((TweenConfig){ .props = { { &FishEye.radius, NULL, FB_disableMovingBG ? FishEye.radius : 1 }, { &FishEye.intensity, NULL, FB_disableMovingBG ? 0 : 0.2f } }, .nprops = 2,
+        .ease = Ease_SineInOut, .duration = 0x2710, .onStart = Moon_HiddenGround_unlock, .onComplete = Moon_HiddenGround_go });  // Sine.easeIn
 }
 static void Moon_Cry(void *ctx) {
     (void)ctx;

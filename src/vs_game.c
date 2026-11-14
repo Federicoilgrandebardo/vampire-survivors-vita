@@ -2006,16 +2006,19 @@ static TilingTileset *TilingTileset_new(const char *stageType, float sizeX, floa
     char jp[96], ip[96];
     snprintf(jp, sizeof(jp), "tilesets/%s.json", str(ts, "mapKey"));
     snprintf(ip, sizeof(ip), "tilesets/%s.png", str(ts, "setKey"));
-    static Tilemap *cache[32];  // cache.tilemap: la mappa si carica una volta per stage (e per verso), non a ogni partita
-    static const char *cacheKey[32];
-    static int cacheVisual[32];
-    for (int i = 0; i < 32 && cacheKey[i]; i++) if (!strcmp(cacheKey[i], stageType) && cacheVisual[i] == visual) t->MainMap = cache[i];
-    if (!t->MainMap) {
-        t->MainMap = make_tilemap(jp, ip, 1, 2);  // addTilesetImage(setKey, setKey, 32, 32, 1, 2)
-        if (t->MainMap && visual) TilingTileset_invertJSON(t->MainMap->json, stageType);
-        if (t->MainMap) TilingTileset_offsetObjects(t->MainMap->json);
-        for (int i = 0; i < 32; i++) if (!cacheKey[i]) { cacheKey[i] = stageType, cacheVisual[i] = visual, cache[i] = t->MainMap; break; }
+    // cache.tilemap, ma di una sola mappa: le mappe 320x320 dei DLC pesano ~70 MiB l'una (cJSON + layer) su 128 di heap,
+    // tenerle tutte faceva finire la memoria al secondo stage grande (issue 14). Rigiocare lo stesso stage non riparsa.
+    static Tilemap *cache;
+    static char cacheKey[32];
+    static int cacheVisual;
+    if (cache && (strcmp(cacheKey, stageType) || cacheVisual != visual)) tilemap_free(cache), cache = NULL;
+    if (!cache) {
+        cache = make_tilemap(jp, ip, 1, 2);  // addTilesetImage(setKey, setKey, 32, 32, 1, 2)
+        if (cache && visual) TilingTileset_invertJSON(cache->json, stageType);
+        if (cache) TilingTileset_offsetObjects(cache->json);
+        snprintf(cacheKey, sizeof(cacheKey), "%s", stageType), cacheVisual = visual;
     }
+    t->MainMap = cache;
     if (!t->MainMap) { free(t); return NULL; }  // dati senza tilesets/: partita senza mappa
     tilemap_resetLayers(t->MainMap);  // la terrazza della Cappella e spianami tolgono tile: la partita dopo riparte intera
     t->mapsAmount = cJSON_IsTrue(cJSON_GetObjectItem(ts, "isTiling")) ? 4 : 1;
@@ -23945,10 +23948,10 @@ static PrizePair TS_MakePrizePair(const char *type, const char *fixed, int isLev
     } else if (!strcmp(type, "EXISTING_ANY")) {
         e = LevelUpFactory_PullExistingRemainingWeapon(1), pt = "EXISTING_ANY";
         if (!e) e = "COINBAG2", pt = "FILLER";
-    } else if (!strcmp(type, "ARCANA") && RandomazzoEnabled() && Arcanas.n < Arcanas.MaxArcanasPerRun && Arcanas.n < Arcana_unlockedCount()) {
+    } else if (!strcmp(type, "EVO_ARCANA") && RandomazzoEnabled() && Arcanas.n < Arcanas.MaxArcanasPerRun && Arcanas.n < Arcana_unlockedCount()) {
         e = "RELIC_RANDOMAZZO", pt = "ARCANA";  // alla fine della scena: GiveDraftArcana
         TS.hasArcana = 1;
-    } else if (!strcmp(type, "EVOLUTION") || !strcmp(type, "ARCANA")) {  // ARCANA senza Randomazzo, o arcane al completo: EVOLUTION
+    } else if (!strcmp(type, "EVOLUTION") || !strcmp(type, "EVO_ARCANA")) {  // ARCANA senza Randomazzo, o arcane al completo: EVOLUTION
         e = LevelUpFactory_PullEvolution(), pt = "EVOLUTION";
         if (!e) { e = LevelUpFactory_PullExistingRemainingWeapon(1), pt = "EXISTING_ANY"; if (!e) e = "COINBAG2", pt = "FILLER"; }
     } else if (!strcmp(type, "FIXED") && fixed) {
@@ -34276,6 +34279,32 @@ static void SceneManager_BackFromJukebox(void) {
 }
 
 static struct { int active; float t; } Warn;
+// Avvio animato (frame di Wolff): il primo fotogramma e' sce_sys/pic0.png, quello che la Vita mostra durante il caricamento,
+// e da li' il volto sfuma nel nero; poi l'avviso. Finche' il decoder non ha il primo fotogramma resta il pic0: nessuno stacco.
+static struct { int active; VsVideo *v; Texture2D pic; float t; } BV;
+static void BootVid_stop(void) {
+    vs_video_close(BV.v);
+    if (BV.pic.id) UnloadTexture(BV.pic);
+    memset(&BV, 0, sizeof(BV));
+    Warn.active = 1;
+}
+static void BootVid_start(void) {
+    BV.v = vs_video_open(vs_asset("boot.mp4"), MENU_W, MENU_H);
+    BV.pic = LoadTexture(vs_boot_pic());
+    BV.active = 1;
+    if (!BV.v) BootVid_stop();
+}
+static void BootVid_update(float delta) {
+    BV.t += delta;
+    if (!vs_video_update(BV.v, delta)) { BootVid_stop(); return; }
+    int any = ptr_pressed() || GetKeyPressed();
+    for (int b = 1; b <= 17 && !any && IsGamepadAvailable(0); b++) any = IsGamepadButtonPressed(0, b);
+    if (any) BootVid_stop();
+}
+static void BootVid_draw(void) {
+    Texture2D v = vs_video_ready(BV.v) ? vs_video_texture(BV.v) : BV.pic;
+    if (v.id) DrawTexturePro(v, (Rectangle){ 0, 0, v.width, v.height }, (Rectangle){ 0, 0, MENU_W, MENU_H }, (Vector2){ 0, 0 }, 0, WHITE);
+}
 void menu_start(void) {
     memset(&SM, 0, sizeof(SM));
     SM.active = 1;
@@ -34297,10 +34326,10 @@ void menu_start(void) {
     }
     IntroScene_create();
     static int warned;
-    if (!warned && !getenv("VS_MENU")) Warn.active = 1;
+    if (!warned && !getenv("VS_MENU")) BootVid_start();
     warned = 1;
     static int skipped;  // sviluppo: VS_MENU=main|chars|stages salta l'intro (una volta)
-    if (getenv("VS_NETPEER")) Warn.active = 0, IN.t = 0x3e8, IN.introEnded = 1, Lobby_open();  // sviluppo: subito in lobby
+    if (getenv("VS_NETPEER")) BootVid_stop(), Warn.active = 0, IN.t = 0x3e8, IN.introEnded = 1, Lobby_open();  // sviluppo: subito in lobby
     if (getenv("VS_MENU") && !skipped) skipped = 1, IN.t = 0x3e8, IN.introEnded = 1, IntroScene_OnFirstInput(), IN.firstInputAt -= 0x1e, menu_skip = getenv("VS_MENU");
 }
 // 1 quando parte la partita (game_start gia' fatto), -1 per uscire dal gioco
@@ -34568,6 +34597,7 @@ void game_net_end(void) {
 int menu_update(float dt) {
     float delta = dt * 1000;
     ptr_update();
+    if (BV.active) { BootVid_update(delta); return 0; }
     if (Warn.active) { Warn_update(delta); return 0; }
     if (IV.active) { IntroVid_update(delta); return 0; }
     if (LB.active) {
@@ -34674,6 +34704,14 @@ static void menu_draw_all(void) {
 void menu_draw(void) {
     float ms = menu_scale(), mw = MENU_W * ms, x0 = (SCREEN_W - mw) / 2;
     ClearBackground(BLACK);
+    if (BV.active) {
+        rlPushMatrix();
+        rlTranslatef(x0, 0, 0);
+        rlScalef(ms, ms, 1);
+        BootVid_draw();
+        rlPopMatrix();
+        return;
+    }
     if (Warn.active) {
         rlPushMatrix();
         rlTranslatef(x0, 0, 0);

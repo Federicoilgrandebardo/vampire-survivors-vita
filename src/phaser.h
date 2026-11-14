@@ -230,6 +230,7 @@ typedef struct TilemapLayer {
 Tilemap *make_tilemap(const char *jsonPath, const char *imagePath, int margin, int spacing);  // scene.make.tilemap + addTilesetImage
 TilemapLayer *tilemap_createLayer(Tilemap *m, const char *name, double depth);  // NULL se il layer manca
 void tilemap_resetLayers(Tilemap *m);  // a ogni partita: i layer si ricreano dal JSON
+void tilemap_free(Tilemap *m);
 void tilemap_removeTilesWithin(Tilemap *m, const char *except, int x, int y, int w, int h);
 cJSON *tilemap_getObjectLayerObjects(Tilemap *m, const char *name);
 void tilemapLayer_setCollisionByProperty(TilemapLayer *l, const char *prop);  // { prop: true } + CalculateFacesWithin

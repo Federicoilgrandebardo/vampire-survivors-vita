@@ -35,9 +35,25 @@ static void av_reserve(void) {
     for (int i = 0; i < 2; i++) if (mb[i] > 0) av_res[i] = sceKernelAllocMemBlock("avres", T[i], mb[i] << 20, NULL);
 }
 static void av_release(void) { for (int i = 0; i < 2; i++) if (av_res[i] >= 0) sceKernelFreeMemBlock(av_res[i]); }
+#include <psp2/display.h>
+// Dal pic0 della LiveArea al primo fotogramma di vitaGL passano ~3,5 s di InitWindow: il pic0 si scrive a mano nel
+// framebuffer del display, nella riserva di CDRAM dei video, che si libera solo quando vitaGL mostra i suoi fotogrammi.
+static void boot_pic_raw(void) {
+    void *base = NULL;
+    if (av_res[1] < 0 || sceKernelGetMemBlockBase(av_res[1], &base) < 0) return;
+    Image im = LoadImage(vs_boot_pic());
+    if (im.data && im.width == SCREEN_W && im.height == SCREEN_H) {
+        ImageFormat(&im, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+        memcpy(base, im.data, SCREEN_W * SCREEN_H * 4);
+        SceDisplayFrameBuf fb = { sizeof(fb), base, SCREEN_W, SCE_DISPLAY_PIXELFORMAT_A8B8G8R8, SCREEN_W, SCREEN_H };
+        sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
+    }
+    UnloadImage(im);
+}
 #else
 static void av_reserve(void) {}
 static void av_release(void) {}
+static void boot_pic_raw(void) {}
 #include <unistd.h>
 void vs_reload(void) {  // stesso eseguibile; senza gli agganci di navigazione, se no la prova si ripeterebbe all'infinito
     unsetenv("VS_MENU"), unsetenv("VS_AUTOPICK");
@@ -199,11 +215,21 @@ static void det_log(void) {
 }
 void game_net_submit(void);
 void game_net_end(void);
+static Texture2D boot_pic;
+static void boot_pic_draw(void) {  // anche nel dialogo dei trofei, che fa lo scambio da se'
+    BeginDrawing();
+    ClearBackground(BLACK);
+    DrawTexturePro(boot_pic, (Rectangle){ 0, 0, boot_pic.width, boot_pic.height }, (Rectangle){ 0, 0, SCREEN_W, SCREEN_H }, (Vector2){ 0, 0 }, 0, WHITE);
+    rlDrawRenderBatchActive();
+}
 int main(int argc, char **argv) {
     (void)argc;
     main_argv = argv;
     av_reserve();
+    boot_pic_raw();
     InitWindow(SCREEN_W, SCREEN_H, "Vampire Survivors");
+    boot_pic = LoadTexture(vs_boot_pic());  // a schermo per tutti i caricamenti dell'avvio, poi l'avvio animato riparte da li'
+    for (int i = 0; i < 3 && boot_pic.id; i++) boot_pic_draw(), EndDrawing();  // in tutti i buffer dello scambio
     av_release();
     srand((unsigned)time(NULL));  // Math.random: un seme diverso a ogni accensione (menu compreso)
     SetTargetFPS(60);
@@ -245,7 +271,8 @@ int main(int argc, char **argv) {
     SaveSystem_Load();  // PreloadScene: salvataggio (o i default) applicato alle tabelle, poi la lingua
     Lang_init();
     vs_load_font();
-    trophies_init();
+    trophies_init(boot_pic.id ? boot_pic_draw : NULL);
+    UnloadTexture(boot_pic);
     Trophies_sync();
 
     // Prova automatica sul desktop: VS_SCENE=game (partita diretta), VS_MENU=main|chars|stages (salta l'intro), VS_SHOT=secondi -> shot.png ed esce.

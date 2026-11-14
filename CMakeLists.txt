@@ -11,7 +11,7 @@ include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "Vampire Survivors")
 set(VITA_TITLEID  "VSPH00001")
-set(VITA_VERSION  "01.20")
+set(VITA_VERSION  "01.21")
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O3 -fno-lto")
@@ -39,6 +39,7 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
     NAME ${VITA_APP_NAME}
     FILE sce_sys/trophy/VSPH00001_00/TROPHY.TRP  sce_sys/trophy/VSPH00001_00/TROPHY.TRP
     FILE sce_sys/trophy/VSPH00001_01/TROPHY.TRP  sce_sys/trophy/VSPH00001_01/TROPHY.TRP
+    FILE assets/boot.mp4                         assets/boot.mp4
     FILE assets/home.mp4                         assets/home.mp4
     FILE assets/intro.mp4                        assets/intro.mp4
     FILE assets/intro.ogg                        assets/intro.ogg

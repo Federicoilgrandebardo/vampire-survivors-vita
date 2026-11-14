@@ -821,6 +821,13 @@ void tilemap_resetLayers(Tilemap *m) {  // make.tilemap: LayerData nuove dalla c
     for (int i = 0; i < m->n_layers; i++) free(m->layerData[i]);
     m->n_layers = 0;
 }
+void tilemap_free(Tilemap *m) {  // la texture resta: e' nella texCache di make_tilemap
+    if (!m) return;
+    tilemap_resetLayers(m);
+    free(m->v3foot), free(m->v3top), free(m->v3solid);
+    cJSON_Delete(m->json);
+    free(m);
+}
 
 static cJSON *tilemap_layerJSON(Tilemap *m, const char *name) {
     cJSON *l;

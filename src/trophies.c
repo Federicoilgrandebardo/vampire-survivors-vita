@@ -58,7 +58,7 @@ static int unlocker(SceSize args, void *argp) {
     return 0;
 }
 
-static int set_open(int s) {
+static int set_open(int s, void (*frame)(void)) {
     // SceNpCommunicationId: the 9-character id, a NUL, the set number, a reserved byte
     char comm_id[12] = "VSPH00001";
     static char signature[160] = { 0xb9, 0xdd, 0xe1, 0x3b, 0x01, 0x00 };
@@ -71,7 +71,8 @@ static int set_open(int s) {
     p.context = sets[s].ctx;
     if (sceNpTrophySetupDialogInit(&p) < 0) return 0;
     while (sceNpTrophySetupDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_RUNNING) {
-        glClear(GL_COLOR_BUFFER_BIT);
+        if (frame) frame();
+        else glClear(GL_COLOR_BUFFER_BIT);
         vglSwapBuffers(GL_TRUE);  // GL_TRUE: this is what makes the system dialog advance
     }
     sceNpTrophySetupDialogTerm();
@@ -85,11 +86,11 @@ static int set_open(int s) {
     return 1;
 }
 
-void trophies_init(void) {
+void trophies_init(void (*frame)(void)) {
     sceSysmoduleLoadModule(SCE_SYSMODULE_NP_TROPHY);
     sceNpTrophyInit(NULL);
     for (int s = 0; s < SETS; s++)
-        if (!set_open(s)) break;
+        if (!set_open(s, frame)) break;
     if (!sets[0].ready) return;
     sema = sceKernelCreateSema("trophies", 0, 0, 256, NULL);
     SceUID t = sceKernelCreateThread("trophies", unlocker, 0x10000100, 0x10000, 0, 0, NULL);
@@ -110,6 +111,6 @@ void trophies_unlock(const char *key) {
 int trophies_active(void) { return sets[0].ready; }
 #else
 int trophies_active(void) { return 0; }
-void trophies_init(void) {}
+void trophies_init(void (*frame)(void)) { (void)frame; }
 void trophies_unlock(const char *key) { int s; (void)trophy_find(key, &s); }
 #endif

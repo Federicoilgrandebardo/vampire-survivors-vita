@@ -46,6 +46,7 @@ Texture2D vs_video_texture(const VsVideo *v);
 void vs_video_loop(VsVideo *v);        // ricomincia da solo alla fine
 int vs_video_ready(const VsVideo *v);  // 1 quando c'e' almeno un fotogramma
 const char *vs_asset(const char *rel); // file nel VPK (arte fatta per il port): app0:assets/ sulla Vita, accanto all'eseguibile sul desktop
+const char *vs_boot_pic(void);         // sce_sys/pic0.png: l'immagine che la Vita mostra durante il caricamento
 void vs_video_close(VsVideo *v);
 
 // --- Atlanti (TexturePacker di Phaser: img/<nome>.json + png) ------------------

@@ -88,6 +88,13 @@ const char *vs_asset(const char *rel) {
 #endif
     return b;
 }
+const char *vs_boot_pic(void) {
+#ifdef __vita__
+    return "app0:sce_sys/pic0.png";
+#else
+    return TextFormat("%ssce_sys/pic0.png", GetApplicationDirectory());
+#endif
+}
 const char *vs_path(const char *rel) {
     static char buf[8][600];
     static int i;
